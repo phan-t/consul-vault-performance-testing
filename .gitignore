@@ -1,0 +1,33 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Licenses - never commit
+*.hclic
+
+# Perf results
+perf/results/
+
+# Plan files can contain sensitive values
+*.tfplan
+
+# Local credentials dump (scripts/get-credentials.sh)
+credentials.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Downloaded campaign results (scripts/run-campaign.sh finish)
+results/

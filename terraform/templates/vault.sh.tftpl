@@ -1,0 +1,236 @@
+#!/bin/bash
+# Vault Enterprise node: ${node_name} (${voter ? "voter" : "non-voter"})
+export AWS_DEFAULT_REGION="${region}"
+ARCH="${arch}"
+NODE_EXPORTER_URL="${node_exporter_url}"
+SCANNER_PATTERN="${scanner_pattern}"
+SCANNER_ACTIVE_CPU="${scanner_active_cpu}"
+
+${common}
+
+tune_os
+install_hashicorp_repo
+install_node_exporter
+install_pkg vault-enterprise "${vault_version}"
+service_nofile vault
+
+mount_data_volume /opt/vault/data vault
+mkdir -p /opt/vault/tls /var/log/vault
+
+CFG=$(retry get_secret "${config_secret_id}")
+echo "$CFG" | jq -r .license > /etc/vault.d/vault.hclic
+echo "$CFG" | jq -r .ca      > /opt/vault/tls/ca.crt
+echo "$CFG" | jq -r .cert    > /opt/vault/tls/vault.crt
+echo "$CFG" | jq -r .key     > /opt/vault/tls/vault.key
+unset CFG
+trust_ca /opt/vault/tls/ca.crt ${name}-ca
+
+cat > /etc/vault.d/vault.hcl <<EOF
+ui            = true
+cluster_name  = "${name}"
+api_addr      = "https://$PRIVATE_IP:8200"
+cluster_addr  = "https://$PRIVATE_IP:8201"
+disable_mlock = true
+license_path  = "/etc/vault.d/vault.hclic"
+log_level     = "info"
+
+listener "tcp" {
+  address         = "0.0.0.0:8200"
+  cluster_address = "0.0.0.0:8201"
+  tls_cert_file   = "/opt/vault/tls/vault.crt"
+  tls_key_file    = "/opt/vault/tls/vault.key"
+  tls_min_version = "tls12"
+
+  telemetry {
+    unauthenticated_metrics_access = true
+  }
+}
+
+storage "raft" {
+  path    = "/opt/vault/data"
+  node_id = "${node_name}"
+
+  # Enterprise: permanent non-voter. Replicates data and serves as a
+  # performance standby without affecting quorum.
+  retry_join_as_non_voter = ${voter ? "false" : "true"}
+
+  retry_join {
+    auto_join             = "provider=aws region=${region} tag_key=VaultCluster tag_value=${join_tag} addr_type=private_v4"
+    auto_join_scheme      = "https"
+    leader_tls_servername = "${vault_fqdn}"
+    leader_ca_cert_file   = "/opt/vault/tls/ca.crt"
+  }
+}
+
+seal "awskms" {
+  region     = "${region}"
+  kms_key_id = "${kms_key_id}"
+}
+
+telemetry {
+  prometheus_retention_time = "30s"
+  disable_hostname          = true
+}
+EOF
+
+# Audit log rotation (every 5 minutes, size based) so load tests can't fill the disk.
+# copytruncate, not postrotate `systemctl reload vault`: a reload (SIGHUP) hung
+# the active node's HTTP API (Vault 2.1.1), so the log is never reopened.
+cat > /etc/logrotate.d/vault-audit <<'EOF'
+/var/log/vault/audit.log {
+  size 1G
+  rotate 3
+  missingok
+  notifempty
+  nocompress
+  copytruncate
+}
+EOF
+cat > /etc/systemd/system/vault-audit-rotate.service <<'EOF'
+[Unit]
+Description=Rotate Vault audit log
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/vault-audit
+EOF
+cat > /etc/systemd/system/vault-audit-rotate.timer <<'EOF'
+[Unit]
+Description=Rotate Vault audit log every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+chown -R vault:vault /opt/vault /var/log/vault /etc/vault.d
+chmod 0600 /opt/vault/tls/vault.key /etc/vault.d/vault.hclic
+
+cat > /etc/profile.d/vault.sh <<'EOF'
+export VAULT_ADDR=https://127.0.0.1:8200
+export VAULT_CACERT=/opt/vault/tls/ca.crt
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vault-audit-rotate.timer
+%{ if start_vault ~}
+systemctl enable --now vault
+%{ else ~}
+# Held non-voter: configured but not started, so it doesn't join the cluster or
+# take NLB traffic until needed (run-plan.sh starts it for T9-V with
+# `systemctl enable --now vault`).
+systemctl disable vault 2>/dev/null || true
+echo "vault held (vault_non_voters_start = false)"
+%{ endif ~}
+
+%{ if bootstrap ~}
+# ---------------------------------------------------------------------------
+# Cluster bootstrap (vault-0 only): init, then configure for Consul Connect CA
+# ---------------------------------------------------------------------------
+export VAULT_ADDR=https://127.0.0.1:8200
+export VAULT_CACERT=/opt/vault/tls/ca.crt
+
+until [ "$(http_code --cacert $VAULT_CACERT $VAULT_ADDR/v1/sys/health)" != "000" ]; do sleep 5; done
+
+# Never re-init a live cluster: once the bootstrap flag is "complete" this node
+# is a replacement and must simply join. A fresh build resets the flag to
+# "pending" (replace aws_ssm_parameter.vault_bootstrap); the init secret is then
+# overwritten with a new version rather than recreated.
+if [ "$(aws ssm get-parameter --name "${bootstrap_param}" --query Parameter.Value --output text)" = "complete" ]; then
+  echo "cluster already bootstrapped; skipping operator init"
+elif [ "$(curl -s --cacert $VAULT_CACERT $VAULT_ADDR/v1/sys/init | jq -r .initialized)" = "false" ]; then
+  umask 077
+  vault operator init -recovery-shares=1 -recovery-threshold=1 -format=json > /root/vault-init.json
+  retry aws secretsmanager put-secret-value --secret-id "${init_secret_id}" --secret-string file:///root/vault-init.json
+  shred -u /root/vault-init.json
+fi
+
+STATUS=$(aws ssm get-parameter --name "${bootstrap_param}" --query Parameter.Value --output text)
+if [ "$STATUS" != "complete" ]; then
+  VAULT_TOKEN=$(retry get_secret "${init_secret_id}" | jq -r .root_token)
+  export VAULT_TOKEN
+
+  until [ "$(http_code --cacert $VAULT_CACERT "$VAULT_ADDR/v1/sys/health?standbyok=true&perfstandbyok=true")" = "200" ]; do sleep 5; done
+
+%{ if audit_enabled ~}
+  vault audit list 2>/dev/null | grep -q '^file/' || vault audit enable file file_path=/var/log/vault/audit.log
+%{ endif ~}
+
+  # AWS IAM auth for the Consul servers' Connect CA provider (no static tokens).
+  vault auth list | grep -q '^aws/' || vault auth enable aws
+  vault write auth/aws/config/client \
+    sts_endpoint="https://sts.${region}.amazonaws.com" \
+    sts_region="${region}"
+
+  # --- Mesh PKI: external (offline) root -> Vault intermediate -> Consul ----
+  # ${mesh_pki_path}: Vault-managed. Holds the mesh intermediate CA (signed by
+  #   the offline root, key imported from Terraform); Consul uses it as its
+  #   root_pki_path and may only read it and sign intermediates from it.
+  # ${inter_pki_path}: mounted here, managed by Consul (its signing CA + the
+  #   no_store "leaf-cert" role). Consul can tune it but not (re)mount it.
+  if ! vault secrets list -format=json | jq -e '."${mesh_pki_path}/"' >/dev/null; then
+    vault secrets enable -path=${mesh_pki_path} -description="Mesh intermediate CA (external root)" pki
+    vault secrets tune -max-lease-ttl=43800h ${mesh_pki_path}
+    umask 077
+    retry get_secret "${mesh_ca_secret_id}" | jq -r .pem_bundle > /root/mesh-ca-bundle.pem
+    vault write -format=json ${mesh_pki_path}/config/ca pem_bundle=@/root/mesh-ca-bundle.pem >/dev/null
+    shred -u /root/mesh-ca-bundle.pem
+    # The bundle imports two issuers (intermediate with key, root without);
+    # make the one that can sign the default.
+    for id in $(vault list -format=json ${mesh_pki_path}/issuers | jq -r '.[]'); do
+      if [ -n "$(vault read -format=json ${mesh_pki_path}/issuer/$id | jq -r '.data.key_id // empty')" ]; then
+        vault write ${mesh_pki_path}/config/issuers default=$id >/dev/null
+        echo "mesh intermediate issuer: $id"
+      fi
+    done
+  fi
+  if ! vault secrets list -format=json | jq -e '."${inter_pki_path}/"' >/dev/null; then
+    vault secrets enable -path=${inter_pki_path} -description="Consul Connect signing CA (managed by Consul)" pki
+    vault secrets tune -max-lease-ttl=8760h ${inter_pki_path}
+  fi
+
+  # Vault-managed PKI paths policy (per Consul docs): read-only on the mounts,
+  # sign-intermediate on the root path, full control inside the intermediate.
+  vault policy write consul-connect-ca - <<'EOF'
+path "/sys/mounts/${mesh_pki_path}" {
+  capabilities = ["read"]
+}
+path "/sys/mounts/${inter_pki_path}" {
+  capabilities = ["read"]
+}
+path "/sys/mounts/${inter_pki_path}/tune" {
+  capabilities = ["update"]
+}
+path "/${mesh_pki_path}/" {
+  capabilities = ["read"]
+}
+path "/${mesh_pki_path}/root/sign-intermediate" {
+  capabilities = ["update"]
+}
+path "/${inter_pki_path}/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+EOF
+
+  vault write auth/aws/role/consul-server \
+    auth_type=iam \
+    bound_iam_principal_arn="${consul_role_arn}" \
+    token_policies=consul-connect-ca \
+    token_period=1h \
+    token_type=service
+
+  retry aws ssm put-parameter --name "${bootstrap_param}" --value complete --overwrite
+  echo "vault bootstrap complete"
+fi
+%{ endif ~}
+
+echo "=== bootstrap done $(date -Is) ==="

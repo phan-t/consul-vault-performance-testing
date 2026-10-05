@@ -1,0 +1,4 @@
+tfc_organization    = "your-org"
+tfc_workspace_name  = "consul-vault-perf"
+vault_license_file  = "../vault.hclic"
+consul_license_file = "../consul.hclic"

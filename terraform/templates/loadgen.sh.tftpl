@@ -1,0 +1,122 @@
+#!/bin/bash
+# Load generator: ${node_name} (Consul client agent + k6 + vault-benchmark)
+export AWS_DEFAULT_REGION="${region}"
+ARCH="${arch}"
+NODE_EXPORTER_URL="${node_exporter_url}"
+SCANNER_PATTERN="${scanner_pattern}"
+SCANNER_ACTIVE_CPU="${scanner_active_cpu}"
+
+${common}
+
+tune_os
+install_hashicorp_repo
+install_node_exporter
+apt_install openssl git tmux htop sysstat
+install_pkg consul-enterprise "${consul_version}"
+# Vault CLI only; the server is never started here.
+install_pkg vault-enterprise "${vault_version}"
+systemctl disable --now vault 2>/dev/null || true
+service_nofile consul
+
+# vault-benchmark
+retry curl -sSL -o "$WORKDIR/vault-benchmark.zip" \
+  "https://releases.hashicorp.com/vault-benchmark/${vault_benchmark_version}/vault-benchmark_${vault_benchmark_version}_linux_${arch}.zip"
+unzip -o "$WORKDIR/vault-benchmark.zip" -d /usr/local/bin vault-benchmark
+chmod 0755 /usr/local/bin/vault-benchmark
+
+# k6
+retry curl -sSL -o "$WORKDIR/k6.tgz" \
+  "https://github.com/grafana/k6/releases/download/v${k6_version}/k6-v${k6_version}-linux-${arch}.tar.gz"
+tar -xzf "$WORKDIR/k6.tgz" -C "$WORKDIR"
+install -m 0755 "$WORKDIR/k6-v${k6_version}-linux-${arch}/k6" /usr/local/bin/k6
+
+# --- Consul client agent ---------------------------------------------------
+mkdir -p /opt/consul/data /etc/consul.d/tls
+C=$(retry get_secret "${client_secret_id}")
+echo "$C" | jq -r .license > /etc/consul.d/consul.hclic
+echo "$C" | jq -r .ca      > /etc/consul.d/tls/ca.crt
+GOSSIP_KEY=$(echo "$C" | jq -r .gossip_key)
+AGENT_TOKEN=$(echo "$C" | jq -r .agent_token)
+unset C
+trust_ca /etc/consul.d/tls/ca.crt ${name}-ca
+
+cat > /etc/consul.d/consul.hcl <<EOF
+datacenter     = "${datacenter}"
+node_name      = "${node_name}"
+data_dir       = "/opt/consul/data"
+log_level      = "INFO"
+license_path   = "/etc/consul.d/consul.hclic"
+
+server         = false
+bind_addr      = "$PRIVATE_IP"
+advertise_addr = "$PRIVATE_IP"
+client_addr    = "127.0.0.1"
+retry_join     = ["provider=aws region=${region} tag_key=ConsulCluster tag_value=${join_tag} addr_type=private_v4"]
+encrypt        = "$GOSSIP_KEY"
+
+ports {
+  http  = 8500
+  https = -1
+  grpc  = 8502
+}
+
+tls {
+  defaults {
+    ca_file         = "/etc/consul.d/tls/ca.crt"
+    verify_outgoing = true
+  }
+  internal_rpc {
+    verify_server_hostname = true
+  }
+}
+
+auto_encrypt {
+  tls = true
+}
+
+acl {
+  enabled                  = true
+  default_policy           = "deny"
+  enable_token_persistence = true
+  tokens {
+    agent = "$AGENT_TOKEN"
+  }
+}
+
+# k6 drives many concurrent connections from 127.0.0.1 (default cap is 200).
+limits {
+  http_max_conns_per_client = 50000
+}
+
+telemetry {
+  prometheus_retention_time = "60s"
+  disable_hostname          = true
+}
+EOF
+chown -R consul:consul /opt/consul /etc/consul.d
+chmod 0600 /etc/consul.d/consul.hclic /etc/consul.d/consul.hcl
+systemctl daemon-reload
+systemctl enable --now consul
+
+# --- Perf assets + environment ---------------------------------------------
+mkdir -p /opt/perf
+retry aws s3 sync "s3://${bucket}/assets/perf/" /opt/perf/
+find /opt/perf -name '*.sh' -exec chmod 0755 {} +
+mkdir -p /opt/perf/results
+chown -R ${login_user}:${login_user} /opt/perf
+
+cat > /etc/profile.d/perf.sh <<'EOF'
+export AWS_DEFAULT_REGION="${region}"
+export PERF_NAME="${name}"
+export PERF_BUCKET="${bucket}"
+export PERF_NODE="${node_name}"
+export PERF_VAULT_INIT_SECRET="${vault_init_secret_id}"
+export PERF_CONSUL_CLIENT_SECRET="${client_secret_id}"
+export CONSUL_DATACENTER="${datacenter}"
+export CONSUL_HTTP_ADDR=http://127.0.0.1:8500
+export VAULT_ADDR="https://${vault_fqdn}:8200"
+export VAULT_CACERT=/etc/consul.d/tls/ca.crt
+export PATH="$PATH:/opt/perf/scripts"
+EOF
+
+echo "=== bootstrap done $(date -Is) ==="

@@ -1,0 +1,89 @@
+#!/bin/bash
+# Monitoring: Prometheus (EC2 service discovery) + Grafana
+export AWS_DEFAULT_REGION="${region}"
+ARCH="${arch}"
+NODE_EXPORTER_URL="${node_exporter_url}"
+SCANNER_PATTERN="${scanner_pattern}"
+SCANNER_ACTIVE_CPU="${scanner_active_cpu}"
+
+${common}
+
+tune_os
+base_packages
+apt_install docker.io
+install_node_exporter
+systemctl enable --now docker
+
+M=$(retry get_secret "${monitoring_secret_id}")
+mkdir -p /etc/prometheus /var/lib/prometheus \
+  /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards \
+  /var/lib/grafana/dashboards
+echo "$M" | jq -r .ca                   > /etc/prometheus/ca.crt
+echo "$M" | jq -r .consul_metrics_token > /etc/prometheus/consul-token
+GRAFANA_PASSWORD=$(echo "$M" | jq -r .grafana_admin_password)
+RENDERER_TOKEN=$(echo "$M" | jq -r .renderer_token)
+unset M
+
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+${prometheus_yml}
+EOF
+
+cat > /etc/grafana/provisioning/datasources/prometheus.yml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 10s
+EOF
+
+cat > /etc/grafana/provisioning/dashboards/perf.yml <<'EOF'
+apiVersion: 1
+providers:
+  - name: perf
+    folder: Perf Testing
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+
+retry aws s3 cp "s3://${bucket}/assets/monitoring/consul-vault-perf.json" /var/lib/grafana/dashboards/consul-vault-perf.json
+
+chown -R 65534:65534 /etc/prometheus /var/lib/prometheus
+chown -R 472:0 /var/lib/grafana
+
+docker rm -f prometheus grafana renderer 2>/dev/null || true
+
+retry docker run -d --name prometheus --restart unless-stopped --network host \
+  -v /etc/prometheus:/etc/prometheus:ro \
+  -v /var/lib/prometheus:/prometheus \
+  "${prometheus_image}" \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.enable-lifecycle \
+  --web.enable-remote-write-receiver
+
+# Image renderer: lets the perf scripts export panels/dashboards as PNGs.
+docker rm -f renderer 2>/dev/null || true
+retry docker run -d --name renderer --restart unless-stopped --network host \
+  -e SERVER_ADDR=127.0.0.1:8081 \
+  -e AUTH_TOKEN="$RENDERER_TOKEN" \
+  "${renderer_image}"
+
+retry docker run -d --name grafana --restart unless-stopped --network host \
+  -e GF_SECURITY_ADMIN_PASSWORD="$GRAFANA_PASSWORD" \
+  -e GF_USERS_ALLOW_SIGN_UP=false \
+  -e GF_ANALYTICS_REPORTING_ENABLED=false \
+  -e GF_RENDERING_SERVER_URL=http://127.0.0.1:8081/render \
+  -e GF_RENDERING_CALLBACK_URL=http://127.0.0.1:3000/ \
+  -e GF_RENDERING_RENDERER_TOKEN="$RENDERER_TOKEN" \
+  -v /etc/grafana/provisioning:/etc/grafana/provisioning:ro \
+  -v /var/lib/grafana:/var/lib/grafana \
+  "${grafana_image}"
+
+echo "=== bootstrap done $(date -Is) ==="

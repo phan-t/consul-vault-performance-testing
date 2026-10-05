@@ -1,0 +1,11 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.hclic
+.git/
+perf/results/
+tfc-bootstrap/
+credentials.txt
+/scripts/
+__pycache__/
+*.pyc

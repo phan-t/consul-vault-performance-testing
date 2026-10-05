@@ -1,0 +1,243 @@
+#!/bin/bash
+# Consul Enterprise server: ${node_name} (${voter ? "voter" : "read replica"})
+export AWS_DEFAULT_REGION="${region}"
+ARCH="${arch}"
+NODE_EXPORTER_URL="${node_exporter_url}"
+SCANNER_PATTERN="${scanner_pattern}"
+SCANNER_ACTIVE_CPU="${scanner_active_cpu}"
+
+${common}
+
+tune_os
+install_hashicorp_repo
+install_node_exporter
+install_pkg consul-enterprise "${consul_version}"
+service_nofile consul
+
+mount_data_volume /opt/consul consul
+mkdir -p /opt/consul/data /etc/consul.d/tls
+
+S=$(retry get_secret "${server_secret_id}")
+echo "$S" | jq -r .license > /etc/consul.d/consul.hclic
+echo "$S" | jq -r .ca      > /etc/consul.d/tls/ca.crt
+echo "$S" | jq -r .cert    > /etc/consul.d/tls/server.crt
+echo "$S" | jq -r .key     > /etc/consul.d/tls/server.key
+GOSSIP_KEY=$(echo "$S" | jq -r .gossip_key)
+MGMT_TOKEN=$(echo "$S" | jq -r .tokens.management_secret)
+AGENT_TOKEN=$(echo "$S" | jq -r .tokens.agent_secret)
+TOKENS=$(echo "$S" | jq -c .tokens)
+unset S
+trust_ca /etc/consul.d/tls/ca.crt ${name}-ca
+
+cat > /etc/consul.d/consul.hcl <<EOF
+datacenter     = "${datacenter}"
+node_name      = "${node_name}"
+data_dir       = "/opt/consul/data"
+log_level      = "INFO"
+license_path   = "/etc/consul.d/consul.hclic"
+
+server         = true
+%{ if voter ~}
+bootstrap_expect = ${voter_count}
+%{ else ~}
+# Enterprise: non-voting server that only receives the replication stream.
+read_replica   = true
+%{ endif ~}
+
+bind_addr      = "$PRIVATE_IP"
+advertise_addr = "$PRIVATE_IP"
+client_addr    = "0.0.0.0"
+retry_join     = ["provider=aws region=${region} tag_key=ConsulCluster tag_value=${join_tag} addr_type=private_v4"]
+encrypt        = "$GOSSIP_KEY"
+
+addresses {
+  http = "127.0.0.1"
+}
+
+ports {
+  http     = 8500
+  https    = 8501
+  grpc_tls = 8503
+}
+
+ui_config {
+  enabled = true
+}
+
+tls {
+  defaults {
+    ca_file         = "/etc/consul.d/tls/ca.crt"
+    cert_file       = "/etc/consul.d/tls/server.crt"
+    key_file        = "/etc/consul.d/tls/server.key"
+    verify_incoming = true
+    verify_outgoing = true
+  }
+  internal_rpc {
+    verify_server_hostname = true
+  }
+  https {
+    verify_incoming = false
+  }
+  grpc {
+    verify_incoming = false
+  }
+}
+
+auto_encrypt {
+  allow_tls = true
+}
+
+acl {
+  enabled                  = true
+  default_policy           = "deny"
+  enable_token_persistence = true
+  tokens {
+    initial_management = "$MGMT_TOKEN"
+    agent              = "$AGENT_TOKEN"
+  }
+}
+
+limits {
+  http_max_conns_per_client = 10000
+%{ if rpc_handshake_timeout != "" ~}
+  # Workaround for hashicorp/consul#23923 (see var.consul_rpc_handshake_timeout).
+  rpc_handshake_timeout     = "${rpc_handshake_timeout}"
+%{ endif ~}
+}
+
+performance {
+  raft_multiplier = 1
+}
+
+telemetry {
+  prometheus_retention_time = "60s"
+  disable_hostname          = true
+}
+EOF
+
+# Connect CA -> Vault PKI, authenticated with the instance's IAM role.
+# JSON so the nested auth_method map decodes cleanly. Consul creates the
+# intermediate "leaf-cert" role with no_store=true. Only the Consul leader
+# signs CSRs, so only the leader holds an active Vault session for signing.
+cat > /etc/consul.d/connect.json <<'EOF'
+${connect_json}
+EOF
+
+chown -R consul:consul /opt/consul /etc/consul.d
+chmod 0600 /etc/consul.d/tls/server.key /etc/consul.d/consul.hclic /etc/consul.d/consul.hcl
+
+cat > /etc/profile.d/consul.sh <<'EOF'
+export CONSUL_HTTP_ADDR=http://127.0.0.1:8500
+EOF
+
+# Wait for Vault (initialised + AWS auth + policy) before starting, so the
+# first leader initialises the Vault CA provider rather than the built-in CA.
+for _ in $(seq 1 180); do
+  STATUS=$(aws ssm get-parameter --name "${bootstrap_param}" --query Parameter.Value --output text || true)
+  [ "$STATUS" = "complete" ] && break
+  echo "waiting for vault bootstrap (status=$STATUS)"
+  sleep 10
+done
+
+systemctl daemon-reload
+systemctl enable --now consul
+
+# perf_vault_connections: established TCP connections from this server to
+# Vault (:8200), via node_exporter's textfile collector. Shows directly how many
+# connections the leader's Vault CA provider uses.
+cat > /usr/local/bin/perf-vault-conns <<'EOF'
+#!/bin/sh
+d=/var/lib/node_exporter/textfile
+n=$(ss -Htn state established '( dport = :8200 )' | wc -l)
+printf '# HELP perf_vault_connections Established TCP connections to Vault (:8200).\n# TYPE perf_vault_connections gauge\nperf_vault_connections %s\n' "$n" > "$d/perf_vault.prom.tmp"
+mv "$d/perf_vault.prom.tmp" "$d/perf_vault.prom"
+EOF
+chmod 0755 /usr/local/bin/perf-vault-conns
+cat > /etc/systemd/system/perf-vault-conns.service <<'EOF'
+[Unit]
+Description=Publish connections to Vault for node_exporter
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/perf-vault-conns
+EOF
+cat > /etc/systemd/system/perf-vault-conns.timer <<'EOF'
+[Unit]
+Description=Publish connections to Vault every 5s
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now perf-vault-conns.timer
+
+%{ if bootstrap ~}
+# ---------------------------------------------------------------------------
+# ACL bootstrap (consul-0 only): tokens with pre-generated IDs from Terraform
+# ---------------------------------------------------------------------------
+export CONSUL_HTTP_ADDR=http://127.0.0.1:8500
+export CONSUL_HTTP_TOKEN="$MGMT_TOKEN"
+
+until consul operator raft list-peers >/dev/null 2>&1; do
+  echo "waiting for consul leader"
+  sleep 5
+done
+
+mkdir -p /etc/consul.d/policies
+cat > /etc/consul.d/policies/agent.hcl <<'EOF'
+node_prefix "" {
+  policy = "write"
+}
+service_prefix "" {
+  policy = "read"
+}
+EOF
+cat > /etc/consul.d/policies/perf.hcl <<'EOF'
+# Leaf certificate load tests: /v1/agent/connect/ca/leaf/perf-*
+service_prefix "perf-" {
+  policy = "write"
+}
+service_prefix "" {
+  policy = "read"
+}
+node_prefix "" {
+  policy = "read"
+}
+EOF
+cat > /etc/consul.d/policies/metrics.hcl <<'EOF'
+agent_prefix "" {
+  policy = "read"
+}
+node_prefix "" {
+  policy = "read"
+}
+service_prefix "" {
+  policy = "read"
+}
+EOF
+
+for p in agent perf metrics; do
+  consul acl policy read -name "$p" >/dev/null 2>&1 || \
+    retry consul acl policy create -name "$p" -rules "@/etc/consul.d/policies/$p.hcl"
+done
+
+create_token() {
+  local policy=$1 accessor=$2 secret=$3
+  consul acl token create -description "$policy (terraform-managed)" \
+    -accessor "$accessor" -secret "$secret" -policy-name "$policy" >/dev/null 2>&1 \
+    && echo "created $policy token" \
+    || echo "$policy token not created (already exists?)"
+}
+for p in agent perf metrics; do
+  create_token "$p" "$(echo "$TOKENS" | jq -r ".$${p}_accessor")" "$(echo "$TOKENS" | jq -r ".$${p}_secret")"
+done
+
+consul connect ca get-config || true
+%{ endif ~}
+
+echo "=== bootstrap done $(date -Is) ==="

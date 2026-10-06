@@ -9,16 +9,28 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T="$ROOT/terraform/templates"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
+# Values have realistic lengths (ARNs, URLs, the Consul connect config): EC2
+# checks the rendered size, and one-letter placeholders once hid vault-0's
+# user_data being over 16 KB. Rendered like terraform/*.tf: whole-line
+# comments removed (local.user_data_comments).
+ARN="arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:cvperf/vault/config-AbCdEf"
 cat > "$W/main.tf" <<TF
 locals {
-  b = { common = file("$T/common.sh"), name = "cvperf", region = "ap-southeast-2", node_exporter_url = "x", arch = "amd64",
+  b = { common = file("$T/common.sh"), name = "cvperf", region = "ap-southeast-2", arch = "amd64",
+        node_exporter_url = "https://github.com/prometheus/node_exporter/releases/download/v1.12.1/node_exporter-1.12.1.linux-amd64.tar.gz",
         scanner_pattern = "", scanner_active_cpu = 5 }
+  arn  = "$ARN"
+  # Stand-ins at least as long as the real connect config (~600 bytes of JSON)
+  # and Prometheus config (yamlencode in monitoring.tf).
+  pad700  = join("", [for i in range(70) : "xxxxxxxxxx"])
+  pad3000 = join("", [for i in range(300) : "xxxxxxxxxx"])
+  re   = "/(?m)^[ \\\\t]*#(?:[^!\\\\n][^\\\\n]*)?\\\\n/"
 }
-output "vault"   { value = templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-0", voter = true, permanent_non_voter = false, redundancy_zone = "zone-0", start_vault = true, bootstrap = true, vault_version = "2.1.1+ent", vault_fqdn = "v", join_tag = "t", kms_key_id = "k", config_secret_id = "c", init_secret_id = "i", bootstrap_param = "/p", audit_enabled = true, consul_role_arn = "arn", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = "m", inter_pki_path = "connect_dc1_inter" })) }
-output "vaultnv" { value = templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-nv-0", voter = false, permanent_non_voter = true, redundancy_zone = "", start_vault = false, bootstrap = false, vault_version = "", vault_fqdn = "v", join_tag = "t", kms_key_id = "k", config_secret_id = "c", init_secret_id = "i", bootstrap_param = "/p", audit_enabled = false, consul_role_arn = "arn", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = "m", inter_pki_path = "connect_dc1_inter" })) }
-output "consul"  { value = templatefile("$T/consul-server.sh.tftpl", merge(local.b, { node_name = "consul-0", voter = true, voter_count = 5, bootstrap = true, datacenter = "dc1", consul_version = "2.0.1+ent", join_tag = "t", server_secret_id = "s", bootstrap_param = "/p", connect_json = "{}", rpc_handshake_timeout = "" })) }
-output "loadgen" { value = templatefile("$T/loadgen.sh.tftpl", merge(local.b, { node_name = "loadgen-0", datacenter = "dc1", consul_version = "2.0.1+ent", vault_version = "2.1.1+ent", vault_benchmark_version = "0.3.0", k6_version = "2.3.0", vault_fqdn = "v", join_tag = "t", client_secret_id = "c", vault_init_secret_id = "i", bucket = "b", login_user = "ubuntu" })) }
-output "monitoring" { value = templatefile("$T/monitoring.sh.tftpl", merge(local.b, { monitoring_secret_id = "m", bucket = "b", prometheus_yml = "a: 1", prometheus_image = "p", grafana_image = "g", renderer_image = "r" })) }
+output "vault"   { value = replace(templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-0", voter = true, permanent_non_voter = false, redundancy_zone = "zone-0", start_vault = true, bootstrap = true, vault_version = "2.1.1+ent", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = true, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter" })), local.re, "") }
+output "vaultnv" { value = replace(templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-nv-0", voter = false, permanent_non_voter = true, redundancy_zone = "", start_vault = false, bootstrap = false, vault_version = "", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = false, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter" })), local.re, "") }
+output "consul"  { value = replace(templatefile("$T/consul-server.sh.tftpl", merge(local.b, { node_name = "consul-0", voter = true, voter_count = 5, bootstrap = true, datacenter = "dc1", consul_version = "2.0.1+ent", join_tag = "cvperf-consul", server_secret_id = local.arn, bootstrap_param = "/cvperf/consul/bootstrap-status", connect_json = local.pad700, rpc_handshake_timeout = "" })), local.re, "") }
+output "loadgen" { value = replace(templatefile("$T/loadgen.sh.tftpl", merge(local.b, { node_name = "loadgen-0", datacenter = "dc1", consul_version = "2.0.1+ent", vault_version = "2.1.1+ent", vault_benchmark_version = "0.3.0", k6_version = "2.3.0", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-consul", client_secret_id = local.arn, vault_init_secret_id = local.arn, bucket = "cvperf-perf-0123456789abcdef", login_user = "ubuntu" })), local.re, "") }
+output "monitoring" { value = replace(templatefile("$T/monitoring.sh.tftpl", merge(local.b, { monitoring_secret_id = local.arn, bucket = "cvperf-perf-0123456789abcdef", prometheus_yml = local.pad3000, prometheus_image = "p", grafana_image = "g", renderer_image = "r" })), local.re, "") }
 TF
 (cd "$W" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false >/dev/null)
 rc=0

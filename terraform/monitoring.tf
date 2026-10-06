@@ -78,7 +78,7 @@ resource "aws_instance" "monitoring" {
     encrypted   = true
   }
 
-  user_data = templatefile("${path.module}/templates/monitoring.sh.tftpl", {
+  user_data = replace(templatefile("${path.module}/templates/monitoring.sh.tftpl", {
     common               = file("${path.module}/templates/common.sh")
     region               = var.aws_region
     monitoring_secret_id = aws_secretsmanager_secret.monitoring.arn
@@ -91,7 +91,7 @@ resource "aws_instance" "monitoring" {
     scanner_pattern      = var.scanner_pattern
     scanner_active_cpu   = var.scanner_active_cpu
     arch                 = local.arch
-  })
+  }), local.user_data_comments, "")
 
   tags = {
     Name = "${var.name}-monitoring"

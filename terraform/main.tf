@@ -32,6 +32,11 @@ locals {
   vault_fqdn  = "vault.${var.private_domain}"
   consul_fqdn = "consul.${var.private_domain}"
 
+  # Whole-line comments in rendered user_data (not "#!" lines), removed to stay
+  # under EC2's 16 KB user_data limit: the templates keep their comments, the
+  # instances don't need them. vault-0's user_data exceeded it with real ARNs.
+  user_data_comments = "/(?m)^[ \\t]*#(?:[^!\\n][^\\n]*)?\\n/"
+
   # EC2 tags used by cloud auto-join (Vault retry_join, Consul retry_join).
   vault_join_tag  = "${var.name}-vault"
   consul_join_tag = "${var.name}-consul"

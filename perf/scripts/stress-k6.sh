@@ -58,8 +58,8 @@
 # busiest hosts' peak CPU over the hold, and sign requests per Vault node on
 # Consul's intermediate (does Consul's signing spread at high rates?), Vault
 # Raft commit time and applies/s (vault_raft), server-side latency (Vault's sign
-# route, every Vault request, the Consul leader's ConnectCA.Sign RPC: where the
-# client's time goes), Raft storage (log append with fsync, BoltDB writes, disk
+# route and every Vault request: with the client's p99, where the time goes;
+# Consul 2.0.1 has no sign-latency metric of its own), Raft storage (log append with fsync, BoltDB writes, disk
 # write latency, /opt/vault/data size and growth); then the last passing rate,
 # why it stopped, and the knee (the first step where p95 grew faster than the rate).
 . /opt/perf/scripts/lib.sh

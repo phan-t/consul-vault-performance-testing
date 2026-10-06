@@ -825,13 +825,14 @@ results_md() {
             + (if v($k).invalid_rate then ", **\(v($k).invalid_rate)/s invalid: load generator out of memory**" else "" end)
             + (if $k == "t5" then ", max Consul→Vault conns \(v("t5").max_consul_vault_connections // "-")" else "" end)
             + (v($k).at_last_pass.server_latency // null | if . then "; at last pass, server p99: Vault sign \(.vault_sign.p99_ms // "?") ms"
-                + (if $k == "t5" then ", Consul Sign RPC \(.consul_sign.p99_ms // "?") ms" else "" end) else "" end)
+                + (if $k == "t5" then " (client p99 \(v($k).at_last_pass.p99_ms // "?" | if type == "number" then . * 10 | round / 10 else . end) ms: the rest is Consul and the network)" else "" end) else "" end)
             + (v($k).at_last_pass.vault_storage // null | if . then ", Raft log append p99 \(.store_logs.p99_ms // "?") ms" else "" end)
          elif $k == "t3c" then "single \(v("t3c").single_max.rps // 0 | round)/s vs multi \(v("t3c").multi_max.rps // 0 | round)/s (ratio \(v("t3c").single_to_multi_ratio // "?"))"
          elif $k == "t6" then "expected behaviour: \(v("t6").expected_behaviour // "?"), node changed after idle: \(b(v("t6").busiest_node_changed_after_idle))"
          elif $k == "t3r" or $k == "t5r" then (if v($k).skipped then "skipped (no boundary)"
-            else "ceiling **\(v($k).confirmed // "below the stress test\u0027s last pass")–\(v($k).failed_at // "?")/s**"
-              + "\(if v($k).reproduced then "" else " (stress last pass not reproduced)" end); repeats: "
+            else (if v($k).confirmed then "ceiling **\(v($k).confirmed)–\(v($k).failed_at // "?")/s**"
+                  else "ceiling **< \(v($k).failed_at // "?")/s** (no repeated rate passed)" end)
+              + "\(if v($k).reproduced or (v($k).confirmed | not) then "" else " (stress last pass not reproduced)" end); repeats: "
               + (v($k).runs // [] | map("\(.rate) \(if .thresholds == "invalid" then "invalid" elif .pass then "✓" else "✗" end) (p99 \(.p99_ms // "?") ms, delivered \(.delivered // "?"), CPU \(.server_cpu_mean.cpu_pct // "?")%)") | join(", ")) end)
          elif $k == "settle" then "waited \(v("settle").scanner_wait_min // 0) min for scanners; quiet: \(b(v("settle").quiet.quiet)) (busiest CPU \(v("settle").quiet.busiest_cpu_pct // "?")%, elections \(v("settle").quiet.elections // "?"), \(v("settle").quiet.checks // "?") check(s)); apt: \(v("settle").apt.nodes // "-") nodes, locks free \(b(v("settle").apt.all_free))"
          elif $k == "t11smoke" then (v("t11smoke").checks // {}) as $c

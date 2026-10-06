@@ -19,7 +19,7 @@ resource "aws_instance" "loadgen" {
     encrypted   = true
   }
 
-  user_data = templatefile("${path.module}/templates/loadgen.sh.tftpl", {
+  user_data = replace(templatefile("${path.module}/templates/loadgen.sh.tftpl", {
     common                  = file("${path.module}/templates/common.sh")
     name                    = var.name
     node_name               = "loadgen-${count.index}"
@@ -39,7 +39,7 @@ resource "aws_instance" "loadgen" {
     scanner_active_cpu      = var.scanner_active_cpu
     arch                    = local.arch
     login_user              = local.login_user
-  })
+  }), local.user_data_comments, "")
 
   tags = {
     Name = "${var.name}-loadgen-${count.index}"

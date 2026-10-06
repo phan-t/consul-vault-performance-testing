@@ -181,9 +181,11 @@ Each test's windows, and why some differ:
 **Server-side metrics, per stress step** (in `stress.json`, and at the last
 passing rate in RESULTS.md), so the client's latency can be split without
 opening Grafana:
-- **`server_latency`:** Vault's sign route on Consul's intermediate, every
-  Vault request (`vault.core.handle_request`), and the Consul leader's
-  `ConnectCA.Sign` RPC, each as mean and p99;
+- **`server_latency`:** Vault's sign route on Consul's intermediate and every
+  Vault request (`vault.core.handle_request`), each as mean and p99. Consul
+  2.0.1 exports no sign latency of its own (`consul_rpc_server_call` is
+  absent), so for T5 the client's p99 minus Vault's sign p99 is Consul plus
+  the network;
 - **`vault_storage`:** Raft log appends including fsync
   (`vault.raft.boltdb.storeLogs`), BoltDB write transactions, the slowest
   Vault disk's write latency, and `/opt/vault/data` size and growth.

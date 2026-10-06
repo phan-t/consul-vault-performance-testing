@@ -62,7 +62,7 @@ resource "aws_instance" "consul" {
     delete_on_termination = true
   }
 
-  user_data = templatefile("${path.module}/templates/consul-server.sh.tftpl", {
+  user_data = replace(templatefile("${path.module}/templates/consul-server.sh.tftpl", {
     common                = file("${path.module}/templates/common.sh")
     name                  = var.name
     node_name             = each.key
@@ -81,7 +81,7 @@ resource "aws_instance" "consul" {
     scanner_pattern       = var.scanner_pattern
     scanner_active_cpu    = var.scanner_active_cpu
     arch                  = local.arch
-  })
+  }), local.user_data_comments, "")
 
   tags = {
     Name          = "${var.name}-${each.key}"

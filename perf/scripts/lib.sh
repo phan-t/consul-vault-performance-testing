@@ -198,14 +198,14 @@ summary_stats() {
 # server_latency <prom> <start s> <end s>: where the time goes, server side.
 #   vault_sign      Vault's route timer for signs on Consul's intermediate(s)
 #   vault_request   every Vault request (vault.core.handle_request)
-#   consul_sign     the Consul leader's ConnectCA.Sign RPC (consul.rpc.server.call)
+# Consul 2.0.1 exports no per-RPC or CA-sign timing (consul_rpc_server_call is
+# absent, README), so the Consul side is the client's latency minus vault_sign.
 server_latency() {
   local p=$1 s=$2 e=$3
   [ $((e - s)) -gt 0 ] || { echo null; return; }
   jq -n -c --argjson vs "$(summary_stats "$p" 'vault_route_update_connect_.+_inter_' '' "$s" "$e")" \
     --argjson vr "$(summary_stats "$p" 'vault_core_handle_request' '' "$s" "$e")" \
-    --argjson cs "$(summary_stats "$p" 'consul_rpc_server_call' 'method="ConnectCA.Sign"' "$s" "$e")" \
-    '{vault_sign: $vs, vault_request: $vr, consul_sign: $cs}'
+    '{vault_sign: $vs, vault_request: $vr}'
 }
 # vault_storage <prom> <start s> <end s>: Raft's storage on the Vault nodes.
 #   store_logs     appending to Raft's log, fsync included (vault.raft.boltdb.storeLogs)

@@ -3,7 +3,8 @@
 #
 #   run-plan.sh start [PLAN]    launch detached (systemd unit perf-plan-<PLAN>):
 #                               settle -> T1 -> T2 -> T3 -> T3c -> T5 -> T6 -> T3r
-#                               -> T5r -> T9-V
+#                               -> T5r -> T9-V -> Stage 4: t11grow -> t11smoke
+#                               -> t11v7 -> t11v5 -> t11v3
 #   run-plan.sh status [PLAN]   progress, key numbers, RESULTS.md
 #   run-plan.sh stop [PLAN]     stop (Consul CSR limits are restored)
 #   run-plan.sh t9v [PLAN]      run (or re-run) only T9-V
@@ -24,9 +25,14 @@
 # a quiet check also requires no scanner activity. Every test records which
 # hosts ran a scanner during it; RESULTS.md flags those tests.
 #
-# T11 (Vault Raft commit latency vs voter count: t11v7 t11v5 t11v3) is opt-in:
-# it only runs when PLAN_TESTS names it, on a build with vault_voter_count = 7
-# and no non-voters in Raft. Each size shrinks Vault in place first
+# Stage 4 runs T11 (Vault Raft commit latency vs voter count: t11v7 t11v5
+# t11v3) last, on the same build: t11grow turns T9-V's two non-voters into
+# voters (vault-raft-voters.sh convert: stop, remove-peer, wipe Raft data,
+# retry_join_as_non_voter = false, start), giving 7 voters spread 3/2/2, and
+# records each node's join and Autopilot promotion time. T11 also runs as its
+# own campaign on a vault_voter_count = 7 build (below). Either way it needs
+# no non-voters in Raft and a Vault license without the pki-only module (KV
+# mounts). Each size shrinks Vault in place first
 # (vault-raft-voters.sh: stop + remove-peer of 2 non-active voters, AZ spread
 # kept), then one chained timeline (one baseline, one cooldown, like T3/T5): a
 # KV v2 write stress over a fixed rate grid (vault-kv-write.js, T11_KV_RATES,
@@ -43,7 +49,8 @@
 #   PLAN_TESTS="settle t11smoke t11v7 t11v5 t11v3" run-plan.sh start raft-1
 # (scripts/run-campaign.sh start raft-1 --t11 builds and starts exactly this.)
 #
-# PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order).
+# PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order), e.g.
+# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v".
 #   run-plan.sh run [PLAN]      run in the foreground (what `start` launches)
 #
 # PLAN defaults to plan-<UTC date>. RUN_IDs are <PLAN>-t1, <PLAN>-t3, ...
@@ -109,8 +116,6 @@ T11_FAILOVER_REPEATS=${T11_FAILOVER_REPEATS:-3}
 # active node in the raft-1 run, so 60 s leaves ample room.
 T11_FREEZE=${T11_FREEZE:-60s}
 PLAN_TESTS=${PLAN_TESTS:-}
-# Run only when PLAN_TESTS names them (T11 shrinks Vault for good).
-OPT_IN_TESTS="t11smoke t11v7 t11v5 t11v3"
 
 # --- state helpers ------------------------------------------------------------
 sget() { jq -r "$1 // empty" "$STATE"; }
@@ -366,6 +371,9 @@ t11() { # t11 <voters> [id]
   if [ "$nv" -gt 0 ]; then
     log "$id: $nv Vault non-voter(s) in Raft would add replication load; T11 needs a build without them"; return 1
   fi
+  if [ "$(sget '.tests.t11grow.status')" = failed ]; then
+    log "$id: t11grow failed, so Vault doesn't have the 7 voters T11 needs; see run.log"; return 1
+  fi
   if [ "$id" != t11smoke ] && [ "$(sget '.tests.t11smoke.status')" = failed ]; then
     log "$id: t11smoke failed; fix the measurement it flagged (see RESULTS.md), then resume"; return 1
   fi
@@ -478,6 +486,24 @@ t11smoke() {
   log "t11smoke checks: $(sget '.values.t11smoke.checks | tojson')"
   [ "$(sget '[.values.t11smoke.checks.hard[]] | all')" = true ]
 }
+# t11grow (Stage 4): turn T9-V's non-voters into voters, so T11 can follow the
+# main plan on the same build. Records how long each took to join Raft and to be
+# promoted by Autopilot (server_stabilization_time after it's healthy).
+t11grow() {
+  local st out
+  st=$(vault-raft-voters.sh status)
+  if [ "$(jq -r .voters <<<"$st")" -ge 7 ] && [ "$(jq -r .non_voters <<<"$st")" -eq 0 ]; then
+    log "t11grow: Vault already has $(jq -r .voters <<<"$st") voters; nothing to convert"
+    sset '.values.t11grow' '{"skipped": true}'
+    return 0
+  fi
+  log "t11grow: $(jq -r '"\(.voters) voters, \(.non_voters) non-voter(s)"' <<<"$st"); converting the non-voters"
+  out=$(vault-raft-voters.sh convert 2> >(tee -a "$DIR/run.log" >&2)) || { log "t11grow: convert failed"; return 1; }
+  sset '.values.t11grow' "$out"
+  log "t11grow: $(jq -c '{nodes, voters: .cluster.voters, az_spread: .cluster.az_spread, failure_tolerance: .cluster.failure_tolerance}' <<<"$out")"
+  [ "$(jq -r .cluster.voters <<<"$out")" -ge 7 ] || { log "t11grow: only $(jq -r .cluster.voters <<<"$out") voters; T11 needs 7"; return 1; }
+  idle "t11grow settle" "$T11_RESIZE_SETTLE" # NLB health checks and Autopilot catch up
+}
 t11v7() { t11 7; }
 t11v5() { t11 5; }
 t11v3() { t11 3; }
@@ -527,6 +553,9 @@ results_md() {
             + "; warnings: " + ([$c.soft // {} | to_entries[] | select(.value | not) | .key] | if length == 0 then "none" else join(", ") end)
             + "; leader \($c.leader_kb_per_write // "?") KB/write at 200/s"
          elif ($k | startswith("t11v")) then "\(v($k).cluster.voters // "?") voters (AZ \(v($k).cluster.az_spread // {} | [.[]] | map(tostring) | join("/")), failure tolerance \(v($k).cluster.failure_tolerance // "?")): KV last pass \(v($k).kv.runs // [] | map(.last_pass // "-" | tostring) | join(", "))/s; leader \(v($k).cluster.leader // "?") (\(v($k).cluster.leader_az_peers // "?") same-AZ voters); failover: new active \(v($k).failover.new_active_s.median // "?") s, write gap \(v($k).failover.write_gap_s.median // "?") s (median)"
+         elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
+         elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
+            + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
          elif $k == "t9v" and v("t9v").skipped then "skipped (no non-voters)"
          elif $k == "t9v" then "T3 last pass \(v("t9v").t3.last_pass // "-")/s (was \(v("t3").last_pass // "-")); T3c multi \(v("t9v").t3c.multi_max.rps // 0 | round)/s, single \(v("t9v").t3c.single_max.rps // 0 | round)/s"
          else "" end) + " |"),
@@ -610,11 +639,11 @@ run)
     "t5:Consul leaf path, CSR limits removed (stress)" "t6:signing distribution" \
     "t3r:refinement near T3's ceiling" "t5r:refinement near T5's ceiling" \
     "t9v:Vault + non-voters: T3 from its last pass, then T3c" \
+    "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \
     "t11v7:Vault Raft latency, 7 voters" "t11v5:Vault Raft latency, 5 voters (shrinks Vault)" \
     "t11v3:Vault Raft latency, 3 voters (shrinks Vault)"; do
     if [ -n "$PLAN_TESTS" ] && ! grep -qw -- "${t%%:*}" <<<"$PLAN_TESTS"; then continue; fi
-    if [ -z "$PLAN_TESTS" ] && grep -qw -- "${t%%:*}" <<<"$OPT_IN_TESTS"; then continue; fi
     run_test "${t%%:*}" "${t#*:}"
   done
   log "plan $PLAN complete; results in $DIR/RESULTS.md. Remember: terraform destroy when done."

@@ -1,5 +1,27 @@
 # Test plan: Vault PKI for Consul service mesh leafs
 
+## Overview
+
+| Stage | Test | Question it answers | Time |
+|---|---|---|---|
+| 0 | Settle | Is the full-size cluster built, verified and quiet? | ~1–1.1 h |
+| 1: Vault ceiling | T1 | What's Vault's `no_store` signing ceiling and knee across all 5 nodes? | ~1 h |
+| | T2 | What does storing certificates cost compared with `no_store`? | ~0.4 h |
+| | T3 | What rate can Vault sustain on Consul's own mount and role? | ~0.9–1.3 h |
+| | T3c | What can one Consul-style connection carry, compared with many? | ~0.7 h |
+| 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~0.9–1.3 h |
+| | T6 | Where does signing land on Vault, directly, through Consul, and after an idle gap? | ~0.5 h |
+| | T3r / T5r | Where exactly is each ceiling, between the last passing and first failing rate? | ~0.5 h |
+| 3: Vault scale-out | T9-V | Do 2 non-voters (performance standbys) raise T3 and T3c? | ~1.6 h |
+| 4: Vault Raft | T11 grow | Convert T9-V's 2 non-voters to voters (7 voters); how long does each take to join and be promoted? | ~0.2 h |
+| | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~7.7–10.7 h |
+
+Stages 0–4 run as one campaign (`plan-1`, ~17–21 h). The T5 rerun (`plan-2`)
+repeats only T5 and T5r from 800/s. T11 can also run on its own (`raft-1`,
+`--t11`). Stage 4 needs a Vault license without the `pki-only` module.
+*Read-out* explains how to interpret the comparisons, and *Results* records
+the outcome of each test.
+
 ## Quick start
 
 Run everything from your workstation with `scripts/run-campaign.sh`:
@@ -9,12 +31,15 @@ Run everything from your workstation with `scripts/run-campaign.sh`:
 export TF_CLOUD_ORGANIZATION=<your-org>
 scripts/run-campaign.sh start plan-1       # Stage 0 rebuild (type "yes" at the plan), wait, verify, start the campaign
 scripts/run-campaign.sh status plan-1      # check progress any time (or: follow plan-1)
-# ~9-10 h later, with fresh credentials again:
+# ~17-21 h later, with fresh credentials again:
 scripts/run-campaign.sh finish plan-1      # download results to ./results/, then offer terraform destroy
 ```
 
-The separate T11 campaign (Vault Raft latency at 7, 5 and 3 voters) runs the
-same way with `--t11`: `scripts/run-campaign.sh start raft-1 --t11` (see T11).
+The campaign ends with Stage 4 (T11 at 7, 5 and 3 voters). To leave it out,
+which also allows a PKI-only Vault license, set
+`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v"` before `start`. T11 can
+also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --t11`
+(see T11).
 
 **What `start` does:**
 1. Runs the preflight checks.
@@ -25,7 +50,8 @@ same way with `--t11`: `scripts/run-campaign.sh start raft-1 --t11` (see T11).
    - 5 Vault voters, with the non-voters held;
    - 5 Consul voters;
    - leaf TTL 168h;
-   - root path `pki_mesh_int`.
+   - root path `pki_mesh_int`;
+   - when the run includes T11, that the Vault license allows KV mounts.
 5. Refreshes `credentials.txt`, and starts `run-plan.sh` on loadgen-0.
 
 **While it runs:** the campaign runs unattended on loadgen-0. Your laptop and
@@ -146,7 +172,7 @@ credentials: the runner uses the instances' own IAM roles.
 ```bash
 # 1. workstation: Stage 0 step 1 (full size + held non-voters), one apply
 # 2. loadgen-0, as ubuntu:
-run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → T9-V (~8–9 h)
+run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → T9-V → Stage 4 (~15.5–19.5 h)
 run-plan.sh status plan-1         # progress, last log lines, RESULTS.md
 run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
 # 3. workstation, when it's finished: terraform destroy (the runner can't)
@@ -169,6 +195,8 @@ run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
   settle for 5 minutes, then reruns T3 (from T3's last passing rate) and T3c.
   Without held non-voters, T9-V is skipped. `run-plan.sh t9v plan-1` reruns
   it alone.
+- **Stage 4** then converts those non-voters to voters (`t11grow`) and runs
+  T11. See *Stage 4*.
 - **It survives disconnects** and **resumes:** re-running `start plan-1` skips
   completed tests. From the workstation, `scripts/run-campaign.sh resume plan-1`
   uploads and syncs the latest scripts first (only once the plan has
@@ -518,9 +546,49 @@ measured. The question here is whether the ceiling moves up.
 - t9-t3c against t3c: `multi_max` should rise, and `single_max` should stay flat
   on one node.
 
-## Separate campaign: Vault Raft latency vs voter count
+## Stage 4: Vault Raft latency vs voter count
 
-### T11: Vault Raft commit time, leader cost and failover at 7, 5 and 3 voters (~9–11 h incl. Stage 0)
+### T11 grow: Convert the non-voters to voters (~0.2 h)
+
+T11 needs 7 voters and no non-voters. After T9-V, the main build has 5 voters
+and 2 non-voters, so `t11grow` turns the non-voters into voters with
+`vault-raft-voters.sh convert`. On `vault-nv-0` and `vault-nv-1`, over SSM, it:
+
+1. stops Vault (`systemctl disable --now vault`), then runs
+   `vault operator raft remove-peer`;
+2. empties the Raft data directory, `/opt/vault/data`;
+3. sets `retry_join_as_non_voter = false` in `/etc/vault.d/vault.hcl`;
+4. starts Vault. Each node rejoins Raft as a non-voter, and Autopilot
+   promotes it once it has been healthy for `server_stabilization_time`
+   (10 s by default);
+5. waits for Autopilot to report 7 healthy voters, failure tolerance 3, then
+   idles 2 minutes.
+
+Nodes are placed in subnets by index, so the 7 voters are spread 3/2/2 across
+the AZs, the same as a 7-voter build.
+
+**Promotion timing comes for free.** While the nodes start, `convert` polls
+`list-peers` every second and records, per node:
+- **joined:** time from the start command until the node appears in Raft;
+- **promoted:** time until it's a voter;
+- **join to promotion:** the difference, which is mostly Autopilot's
+  stabilization time.
+
+These go in `state.json` (`values.t11grow`) and the t11grow row of RESULTS.md.
+The times start before the SSM command, so they include its delivery and the
+data wipe, about 1–2 s.
+
+The EC2 `Voter` tag stays `false`. `shrink` removes the converted nodes first,
+so T11 at 5 voters runs on `vault-0`…`vault-4`, the same nodes as Stages 1–3.
+If `t11grow` fails, `t11smoke` and `t11v*` refuse to run, and the results from
+Stages 0–3 aren't affected.
+
+**Compared with a fresh 7-voter build** (`--t11`): these voters have run
+Stages 1–3 first. Every T11 size writes to its own new KV mount, and
+`t11smoke` runs before the long runs. Even so, compare commit times with
+raft-1's only with that difference in mind.
+
+### T11: Vault Raft commit time, leader cost and failover at 7, 5 and 3 voters (~7.7–10.7 h; ~9–11 h as its own campaign)
 
 Measures what each extra pair of voters costs on every Vault write. It looks
 at the mechanism as well as the end result:
@@ -597,8 +665,9 @@ it can get without crossing AZs), so you can see whether placement could explain
 a latency difference. Pinning the leader to one AZ wouldn't make the sizes
 equal anyway: it would share that AZ with 0, 1 or 2 other voters.
 
-**One build, shrunk in place.** T11 needs its own Stage 0 with
-**`vault_voter_count = 7`** (3/2/2 over the three AZs). Each size starts by
+**One build, shrunk in place.** T11 needs 7 voters (3/2/2 over the three AZs).
+In the main campaign, `t11grow` provides them. As its own campaign, T11
+needs a Stage 0 with **`vault_voter_count = 7`**. Each size starts by
 shrinking Vault with `vault-raft-voters.sh shrink <N>`, which:
 
 1. picks a voter from the AZ with the most voters, never the active node, so the
@@ -640,10 +709,11 @@ check, which elects new leaders on purpose. They expect failure tolerance
 (N−1)/2, so 3 voters passes at 1.
 
 The shrink is **one-way**: a removed node keeps its old Raft data. To go back
-to 7 voters, rebuild. Run T11 on its own build, never before other tests. It
-refuses to run with Vault non-voters in Raft, so don't combine it with T9-V.
+to 7 voters, rebuild. That's why T11 is the last stage, and nothing may run
+after it. It refuses to run with Vault non-voters in Raft, so in the main
+campaign it runs only after `t11grow` has converted them.
 
-**Run it like the main campaign,** from your workstation:
+**As its own campaign,** run it like the main campaign, from your workstation:
 
 ```bash
 # refresh AWS credentials locally and in the HCP Terraform workspace (README, step 2)
@@ -679,8 +749,9 @@ and one failover. Then it checks what T11 depends on:
 - **Soft checks**, recorded as warnings in RESULTS.md: the `vault_raft_apply`
   metric, the failover stages from the logs, and millisecond write-gap timing.
 
-T11 is opt-in: `run-plan.sh` only runs `t11smoke` and `t11v*` when `PLAN_TESTS`
-names them (`--t11` sets it). To
+`run-plan.sh` runs Stage 4 (`t11grow`, `t11smoke`, `t11v*`) by default, and
+`PLAN_TESTS` can leave it out. `--t11` sets `PLAN_TESTS` to
+`settle t11smoke t11v7 t11v5 t11v3`. To
 tune it, set `T11_KV_RATES`, `T11_KV_REPEATS`, `T11_PAYLOADS`,
 `T11_PAYLOAD_RATE`, `T11_RAMP`, `T11_HOLD`, `T11_KV_P99_MS`,
 `T11_RESIZE_SETTLE`, `T11_FAILOVER_REPEATS` and `T11_FREEZE`. Manual equivalent for one size, on loadgen-0:
@@ -754,6 +825,7 @@ targets. The report should also state the headroom above 200/s.
 | T6 distribution | t6 | expected_behaviour: | | |
 | T3 / T5 refined | t3r / t5r | | | |
 | T9-V Vault + 2 non-voters | t9-t3 / t9-t3c | | | |
+| T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
 
 ## Time and cost
@@ -764,10 +836,14 @@ targets. The report should also state the headroom above 200/s.
 | Stage 1: T1 sweep, T2, T3 (chained), T3c | ~3–3.4 h |
 | Stage 2: T5 (chained), T6 (short runs), refinement | ~1.9–2.3 h |
 | Stage 3: T9-V (T3 from its last pass, T3c) | ~1.6 h |
-| **Total** | **~7.7–8.7 h (~US$75–85 at ~US$9–10/h)** |
-| *Separate campaign* (`run-campaign.sh start raft-1 --t11`): Stage 0, T11 smoke check, T11 at 7, 5, 3 voters | *~9–11 h, plus 2 more Vault nodes until the shrink* |
+| Stage 4: T11 grow, T11 smoke check, T11 at 7, 5, 3 voters | ~7.7–10.7 h |
+| **Total** | **~15.4–19.4 h (~US$140–190 at ~US$9–10/h)** |
+| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~7.7–8.7 h (~US$75–85)* |
+| *T11 as its own campaign* (`run-campaign.sh start raft-1 --t11`): Stage 0, T11 smoke check, T11 at 7, 5, 3 voters | *~9–11 h* |
 
-That's about one long working day. Chaining the multi-step tests saves about
+Stage 4 needs no extra instances: it reuses T9-V's two nodes. The nodes it
+shrinks away keep running, and billing, until the destroy. With Stage 4, the run goes
+overnight. Chaining the multi-step tests saves about
 4 h compared with running every step with its own idle windows and export. No
 step loses warm-up or steady-state time.
 

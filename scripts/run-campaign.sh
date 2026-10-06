@@ -22,8 +22,13 @@
 # campaign (start, continue, resume), e.g. only T5 and T5r, from 800/s:
 #   PLAN_TESTS="settle t5 t5r" T5_START=800 scripts/run-campaign.sh start plan-2
 #
-# T11 (Vault Raft latency at 7, 5, 3 voters) is its own campaign on a 7-voter build,
-# run the same way (start, status/follow, finish):
+# The main campaign ends with Stage 4: T11 (Vault Raft latency at 7, 5, 3 voters)
+# after T9-V's non-voters are converted to voters (~17–21 h in all). It needs a
+# Vault license without the pki-only module; verify checks this. To leave
+# Stage 4 out: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v".
+#
+# T11 can also run as its own campaign on a 7-voter build, run the same way
+# (start, status/follow, finish):
 #   scripts/run-campaign.sh start raft-1 --t11     # settle -> t11smoke -> t11v7 -> t11v5 -> t11v3
 # --t11 writes terraform/raft.auto.tfvars (7 voters, no non-voters) and defaults
 # PLAN_TESTS to the T11 sequence; a start without --t11 removes that profile, and
@@ -161,6 +166,9 @@ want_voters() { # want_voters vault|consul
   echo "${v:-5}"
 }
 
+# Does this run include T11 (the default plan's Stage 4, or the --t11 campaign)?
+runs_t11() { [ -z "${PLAN_TESTS:-}" ] || grep -qE '(^| )t11' <<<"$PLAN_TESTS"; }
+
 verify() {
   say "Verifying the cluster"
   local out vv cv
@@ -170,11 +178,18 @@ nv=$(vault operator raft list-peers -format=json | jq "[.data.config.servers[] |
 c=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul operator raft list-peers | tail -n +2 | grep -c true)
 ttl=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul connect ca get-config | jq -r ".Config.LeafCertTTL // .Config.leaf_cert_ttl")
 root=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul connect ca get-config | jq -r ".Config.RootPKIPath // .Config.root_pki_path")
-echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$root"')
+# T11 writes to KV mounts, which a pki-only license refuses.
+kv=refused
+vault secrets enable -path=kv_license_probe kv >/dev/null 2>&1 && vault secrets disable kv_license_probe >/dev/null 2>&1 && kv=ok
+echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$root kv_mounts=$kv"')
   echo "  $out"
   vv=$(want_voters vault); cv=$(want_voters consul)
   grep -q "vault_voters=$vv vault_nonvoters=0 consul_voters=$cv leaf_ttl=168h root=pki_mesh_int" <<<"$out" ||
     die "unexpected cluster state (want $vv Vault voters, 0 non-voters (held), $cv Consul voters, leaf TTL 168h, root pki_mesh_int)"
+  if runs_t11 && ! grep -q "kv_mounts=ok" <<<"$out"; then
+    die "the Vault license refuses KV mounts (pki-only module), so T11 can't run. Use a full Vault Enterprise license and rebuild, or leave out Stage 4:
+  PLAN_TESTS=\"settle t1 t2 t3 t3c t5 t6 t3r t5r t9v\" scripts/run-campaign.sh continue $PLAN"
+  fi
   echo "  cluster OK: held non-voters not yet joined (T9-V starts them)"
 }
 
@@ -215,7 +230,7 @@ after_apply() {
   on_loadgen "/opt/perf/scripts/sync-assets.sh >/dev/null && cd /opt/perf && $(plan_env)run-plan.sh start $PLAN" 120
   cat <<EOF
 
-The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 … T5r → T9-V, ~9–10 h}).
+The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 … T5r → T9-V → Stage 4: T11 at 7, 5, 3 voters, ~17–21 h}).
   Progress:  scripts/run-campaign.sh status $PLAN    (or follow $PLAN)
   Grafana:   $(tfo '.grafana_url.value // empty')
   When done: refresh AWS credentials, then scripts/run-campaign.sh finish $PLAN

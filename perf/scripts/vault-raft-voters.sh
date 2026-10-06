@@ -3,6 +3,7 @@
 #   vault-raft-voters.sh status       voters, leader, AZ spread, failure tolerance (JSON)
 #   vault-raft-voters.sh shrink <N>   remove voters until N remain (N = 3 or 5)
 #   vault-raft-voters.sh wait-healthy <N>  wait for N healthy voters, failure tolerance (N-1)/2
+#   vault-raft-voters.sh convert      turn the vault-nv-* non-voters into voters (JSON timings)
 #
 # shrink removes one voter at a time, always from the AZ with the most voters
 # and never the active node, so the layout matches a fresh build of that size
@@ -13,6 +14,15 @@
 #
 # One-way: a removed node keeps its old Raft data and can't simply rejoin. To
 # get back to 7 voters, rebuild (terraform apply -replace).
+#
+# convert (Stage 4: T11 after T9-V on the main build) rejoins every Voter=false
+# instance as a voter: stop Vault, remove-peer (if it's in Raft), wipe its Raft
+# data, set retry_join_as_non_voter = false, start Vault. Each node rejoins as a
+# non-voter and Autopilot promotes it once it has been healthy for
+# server_stabilization_time, so convert records, per node, the time from start
+# to joining Raft and to promotion (polled every second). 5 voters + vault-nv-0
+# and vault-nv-1 give 7 voters spread 3/2/2, like a 7-voter build. The EC2
+# Voter tag stays "false"; shrink removes the converted nodes first.
 # Needs: root VAULT_TOKEN (env.sh), SSM Run Command on the Vault instances.
 . /opt/perf/scripts/lib.sh
 
@@ -47,13 +57,15 @@ status() {
 
 # Pick the next voter to remove: from the AZ with the most voters (ties: the
 # AZ name sorting last), the highest-numbered node that isn't the leader.
+# Converted vault-nv-* nodes sort above vault-*, so they go first and 5 voters
+# is vault-0..4 again.
 next_victim() {
   jq -r -n --argjson p "$(peers)" --argjson i "$(instances)" '
     ($i | map({(.node): .az}) | add // {}) as $az
     | [$p[] | select(.voter) | {node: .node_id, leader, az: ($az[.node_id] // "unknown")}] as $v
     | ($v | group_by(.az) | map({az: .[0].az, n: length}) | sort_by(.n, .az) | last.az) as $big
     | [$v[] | select(.az == $big and (.leader | not)) | .node]
-    | sort_by(capture("(?<n>[0-9]+)$").n | tonumber) | last // empty'
+    | sort_by([test("-nv-"), (capture("(?<n>[0-9]+)$").n | tonumber)]) | last // empty'
 }
 
 wait_healthy() { # wait_healthy <voters>
@@ -85,12 +97,69 @@ shrink() {
   echo "$(date -u +%H:%M:%S) $want voters: $(status)"
 }
 
+convert() {
+  local nv ids p have want t0 now out bg node i=0 timing='{}'
+  nv=$(aws ec2 describe-instances \
+    --filters "Name=tag:Project,Values=$PERF_NAME" "Name=tag:Role,Values=vault" "Name=tag:Voter,Values=false" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].{node: Tags[?Key==`Node`]|[0].Value, id: InstanceId}' --output json)
+  [ "$(jq length <<<"$nv")" -gt 0 ] || { echo "no Voter=false Vault instances to convert" >&2; return 1; }
+  ids=$(jq -r '.[].id' <<<"$nv")
+  p=$(peers)
+  have=$(jq '[.[] | select(.voter)] | length' <<<"$p")
+  want=$((have + $(jq length <<<"$nv")))
+  echo "$(date -u +%H:%M:%S) converting $(jq -r '[.[].node] | join(", ")' <<<"$nv") to voters ($have -> $want)" >&2
+  # Stop first, so a removed node can't keep calling for votes or rejoin with old data.
+  ssm_run 120 'systemctl disable --now vault && echo stopped' $ids >&2
+  for node in $(jq -r '.[].node' <<<"$nv"); do
+    if jq -e --arg n "$node" 'any(.[]; .node_id == $n)' <<<"$p" >/dev/null; then
+      vault_retry vault operator raft remove-peer "$node" >&2
+    fi
+  done
+  # Empty Raft data (keep lost+found on the data volume), flip the join mode,
+  # start. SSM runs in the background so polling starts with it: t0 includes
+  # SSM delivery and the wipe (a second or two), not the poll interval.
+  out=$(mktemp)
+  t0=$(now_ms)
+  ssm_run 300 'set -e
+find /opt/vault/data -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
+sed -i -E "s/^([[:space:]]*retry_join_as_non_voter[[:space:]]*=[[:space:]]*)true/\1false/" /etc/vault.d/vault.hcl
+grep -Eq "^[[:space:]]*retry_join_as_non_voter[[:space:]]*=[[:space:]]*false" /etc/vault.d/vault.hcl
+systemctl enable --now vault && echo converted' $ids > "$out" &
+  bg=$!
+  # Per node: when it first appears in Raft (as a non-voter) and when Autopilot promotes it.
+  until jq -e --argjson nv "$nv" '[$nv[].node] - [to_entries[] | select(.value.promoted_ms) | .key] | length == 0' <<<"$timing" >/dev/null; do
+    i=$((i + 1))
+    [ "$i" -gt 600 ] && { echo "not all converted nodes promoted after 10 minutes: $timing" >&2; cat "$out" >&2; return 1; }
+    if ! kill -0 "$bg" 2>/dev/null && [ "$(grep -c converted "$out")" -lt "$(jq length <<<"$nv")" ]; then
+      cat "$out" >&2; echo "convert failed on some nodes" >&2; return 1
+    fi
+    sleep 1
+    p=$(vault operator raft list-peers -format=json 2>/dev/null | jq -c '.data.config.servers') || continue
+    now=$(now_ms)
+    timing=$(jq -c --argjson p "$p" --argjson nv "$nv" --argjson now "$now" '. as $t
+      | reduce ($nv[].node) as $n ($t;
+          ([$p[] | select(.node_id == $n)] | first) as $s
+          | if $s == null then .
+            else .[$n].joined_ms //= $now | if $s.voter then .[$n].promoted_ms //= $now else . end end)' <<<"$timing")
+  done
+  wait "$bg" || true
+  cat "$out" >&2; rm -f "$out"
+  wait_healthy "$want" >/dev/null
+  jq -n -c --argjson t "$timing" --argjson t0 "$t0" --argjson s "$(status)" '{
+    nodes: [$t | to_entries[] | {node: .key,
+      joined_s: ((.value.joined_ms - $t0) / 1000),
+      promoted_s: ((.value.promoted_ms - $t0) / 1000),
+      join_to_promotion_s: ((.value.promoted_ms - .value.joined_ms) / 1000)}],
+    cluster: $s}'
+}
+
 case "${1:-}" in
 status) status ;;
 shrink) shrink "${2:-}" ;;
 wait-healthy) wait_healthy "${2:?usage: vault-raft-voters.sh wait-healthy <N>}" ;;
+convert) convert ;;
 *)
-  echo "usage: vault-raft-voters.sh status|shrink <N>|wait-healthy <N>" >&2
+  echo "usage: vault-raft-voters.sh status|shrink <N>|wait-healthy <N>|convert" >&2
   exit 1
   ;;
 esac

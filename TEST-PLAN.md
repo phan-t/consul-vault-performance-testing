@@ -12,11 +12,12 @@
 | 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~0.9–1.3 h |
 | | T6 | Where does signing land on Vault, directly, through Consul, and after an idle gap? | ~0.5 h |
 | | T3r / T5r | Where exactly is each ceiling, between the last passing and first failing rate? | ~0.5 h |
+| | Soak | Does the target rate hold for 2 h at ≥ 99.99% success, with no memory or file descriptor growth? | ~2.2 h |
 | 3: Vault scale-out | T9-V | Do 2 non-voters (performance standbys) raise T3 and T3c? | ~1.6 h |
 | 4: Vault Raft | T11 grow | Convert T9-V's 2 non-voters to voters (7 voters); how long does each take to join and be promoted? | ~0.2 h |
 | | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~7.7–10.7 h |
 
-Stages 0–4 run as one campaign (`plan-1`, ~17–21 h). The T5 rerun (`plan-2`)
+Stages 0–4 run as one campaign (`plan-1`, ~19–23 h). The T5 rerun (`plan-2`)
 repeats only T5 and T5r from 800/s. T11 can also run on its own (`raft-1`,
 `--t11`). Stage 4 needs a Vault license without the `pki-only` module.
 *Read-out* explains how to interpret the comparisons, and *Results* records
@@ -31,13 +32,13 @@ Run everything from your workstation with `scripts/run-campaign.sh`:
 export TF_CLOUD_ORGANIZATION=<your-org>
 scripts/run-campaign.sh start plan-1       # Stage 0 rebuild (type "yes" at the plan), wait, verify, start the campaign
 scripts/run-campaign.sh status plan-1      # check progress any time (or: follow plan-1)
-# ~17-21 h later, with fresh credentials again:
+# ~19-23 h later, with fresh credentials again:
 scripts/run-campaign.sh finish plan-1      # download results to ./results/, then offer terraform destroy
 ```
 
 The campaign ends with Stage 4 (T11 at 7, 5 and 3 voters). To leave it out,
 which also allows a PKI-only Vault license, set
-`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v"` before `start`. T11 can
+`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v"` before `start`. T11 can
 also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --t11`
 (see T11).
 
@@ -79,6 +80,8 @@ See README → *Targets* for how these were sized.
 | Leaf throughput through Consul | **≥ 200 leafs/s** sustained |
 | End-to-end leaf p99 at 200/s | **≤ 1 s**, errors < 0.1% |
 | Vault sign p99 on Consul's intermediate at 200/s | **≤ 100 ms**, errors < 0.1% |
+| Server CPU | Stress steps and refinements: mean CPU over the hold ≤ 90% on every Vault and Consul server. Soak: ≤ 80% |
+| Soak at 200/s for 2 h | ≥ 99.99% success, p99 ≤ 1 s; server memory, Go heap and file descriptors grow ≤ 10% (a warning, not a failure) |
 | Guardrails | 0 leader elections, Autopilot failure tolerance 2, Raft leader last contact p99 < 200 ms (T11: tolerance (N−1)/2, so 1 at 3 voters; its failover check is excluded) |
 
 ## Environment
@@ -172,7 +175,7 @@ credentials: the runner uses the instances' own IAM roles.
 ```bash
 # 1. workstation: Stage 0 step 1 (full size + held non-voters), one apply
 # 2. loadgen-0, as ubuntu:
-run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → T9-V → Stage 4 (~15.5–19.5 h)
+run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → soak → T9-V → Stage 4 (~17.7–21.7 h)
 run-plan.sh status plan-1         # progress, last log lines, RESULTS.md
 run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
 # 3. workstation, when it's finished: terraform destroy (the runner can't)
@@ -205,8 +208,8 @@ run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
   - T2 uses T1's knee, the last worker level that still added ≥ 10%
     throughput.
   - The refinements use the midpoint between each stress test's last pass and
-    first fail. They pass only if the thresholds pass and ≥ 95% was delivered,
-    and they're skipped if there's no boundary.
+    first fail. They pass only if the thresholds pass, ≥ 95% was delivered and
+    no server's mean CPU is over 90%. They're skipped if there's no boundary.
   - Consul's CSR limits are removed for T5 and T5r and always restored.
 - **After every test** it checks the guardrails (Consul and Vault leader
   elections, minimum Autopilot failure tolerance), runs `summarise.sh`,
@@ -379,7 +382,8 @@ commit time and active-node CPU.
 A stress test of `connect_dc1_inter/sign/leaf-cert`, the role Consul created.
 It uses many connections and a token with Consul's `consul-connect-ca` policy.
 The rate starts at 200/s and doubles each step until p99 exceeds 100 ms,
-errors exceed 0.1%, or less than 95% of the planned rate is delivered. The
+errors exceed 0.1%, less than 95% of the planned rate is delivered, or a Vault
+or Consul server's mean CPU over the hold exceeds 90% (`SERVER_CPU_MAX`). The
 steps are chained, at about 12 minutes each.
 
 ```bash
@@ -421,7 +425,8 @@ summarise.sh t3c
 
 Measures Consul's real ceiling on the path agent → Consul leader → Vault. The
 rate starts at 50/s and doubles each step (chained, about 12 minutes per step,
-plus the agent restart that clears its leaf cache). Each step records the Consul
+plus the agent restart that clears its leaf cache). It stops on the same
+criteria as T3, with p99 over 1 s instead of 100 ms. Each step records the Consul
 leader's connections to Vault (`consul_vault_connections_max`) and how signing
 is spread across Vault nodes.
 
@@ -509,6 +514,41 @@ consul-ca-limits.sh 0 0
 RUN_ID=t5r RATE=<between T5 pass/fail> run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh t5r
 consul-ca-limits.sh 50 0
 ```
+
+### Soak: the target rate for 2 hours (~2.2 h)
+
+The stress steps hold each rate for 10 minutes. That's long enough to find a
+ceiling, but too short to show slow memory growth or rare errors. The soak
+runs the **200/s target through Consul** (`consul-leaf.js`, CSR limits removed
+like T5) for **2 hours** on the 5 voters, before T9-V adds the non-voters.
+
+It **fails** on:
+- errors ≥ 0.01%, so success must be ≥ 99.99%;
+- p99 over 1 s;
+- less than 95% delivered;
+- a Vault or Consul server's mean CPU over 80%.
+
+It **warns** in RESULTS.md when, between the hold's first and last 15 minutes,
+any Vault or Consul server grows by more than 10%:
+- host memory used;
+- Go heap (`vault_runtime_alloc_bytes`, `consul_runtime_alloc_bytes`);
+- allocated file descriptors (`node_filefd_allocated`).
+
+These are warnings, not failures: a heap that grows and then levels off is
+normal, so read the Grafana memory panels before calling it a leak.
+
+The load generator's Consul agent caches every leaf it fetches: about 1.44
+million in 2 hours, fewer than T5's 3,200/s step. Its memory grows, but that's
+the load generator, which the drift check doesn't measure.
+
+```bash
+consul-ca-limits.sh 0 0
+RUN_ID=soak RATE=200 HOLD=2h MAX_ERROR_RATE=0.0001 run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh soak
+consul-ca-limits.sh 50 0
+```
+
+Change it with `SOAK_RATE`, `SOAK_HOLD`, `SOAK_MAX_ERROR_RATE`,
+`SOAK_CPU_MAX` and `SOAK_DRIFT_PCT`.
 
 ## Stage 3: Vault scale-out
 
@@ -824,6 +864,7 @@ targets. The report should also state the headroom above 200/s.
 | T5 Consul path | t5 | last pass: | | |
 | T6 distribution | t6 | expected_behaviour: | | |
 | T3 / T5 refined | t3r / t5r | | | |
+| Soak, 200/s for 2 h | soak | success: ; growth: | | |
 | T9-V Vault + 2 non-voters | t9-t3 / t9-t3c | | | |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
@@ -834,11 +875,11 @@ targets. The report should also state the headroom above 200/s.
 |---|---|
 | Stage 0 (incl. settle) | ~1–1.1 h |
 | Stage 1: T1 sweep, T2, T3 (chained), T3c | ~3–3.4 h |
-| Stage 2: T5 (chained), T6 (short runs), refinement | ~1.9–2.3 h |
+| Stage 2: T5 (chained), T6 (short runs), refinement, soak | ~4.1–4.5 h |
 | Stage 3: T9-V (T3 from its last pass, T3c) | ~1.6 h |
 | Stage 4: T11 grow, T11 smoke check, T11 at 7, 5, 3 voters | ~7.7–10.7 h |
-| **Total** | **~15.4–19.4 h (~US$140–190 at ~US$9–10/h)** |
-| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~7.7–8.7 h (~US$75–85)* |
+| **Total** | **~17.6–21.6 h (~US$160–215 at ~US$9–10/h)** |
+| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~9.9–10.9 h (~US$90–110)* |
 | *T11 as its own campaign* (`run-campaign.sh start raft-1 --t11`): Stage 0, T11 smoke check, T11 at 7, 5, 3 voters | *~9–11 h* |
 
 Stage 4 needs no extra instances: it reuses T9-V's two nodes. The nodes it

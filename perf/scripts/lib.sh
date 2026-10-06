@@ -153,6 +153,49 @@ prom_range() {
     --data-urlencode "start=$3" --data-urlencode "end=$4" --data-urlencode "step=$5" | jq -c .data.result
 }
 
+# server_cpu <prom> <start s> <end s>: the Vault or Consul server with the
+# highest mean CPU over a window, as {instance, cpu_pct} (null if unknown).
+# The mean, not the 10 s peak: one busy scrape shouldn't fail a step.
+server_cpu() {
+  local w=$(($3 - $2))
+  [ "$w" -gt 0 ] || { echo null; return; }
+  prom_query "$1" "max(avg_over_time((100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"(vault|consul)-.*\"}[1m]))))[${w}s:10s])) by (instance)" "$3" |
+    jq -c 'max_by(.value[1] | tonumber) // null | if . then {instance: .metric.instance, cpu_pct: (.value[1] | tonumber | . * 10 | round / 10)} else null end' 2>/dev/null || echo null
+}
+
+# soak_drift <prom> <start s> <end s> [edge s, default 900]: does anything on the
+# Vault and Consul servers grow over a long steady run? Per role, the server
+# with the largest growth between the window's first and last <edge> seconds
+# (means), for host memory used, the Go heap (runtime alloc_bytes) and
+# allocated file descriptors. Growth is in % of the first value.
+soak_drift() {
+  local p=$1 s=$2 e=$3 edge=${4:-900}
+  [ $((e - s)) -gt $((2 * edge)) ] || { echo null; return; }
+  # m <expr with a {SEL} placeholder for the instance selector> <role>
+  m() {
+    local sel="{instance=~\"$2-.*\"}" q a b
+    q=${1//\{SEL\}/$sel}
+    a=$(prom_query "$p" "avg_over_time(($q)[${edge}s:15s])" "$((s + edge))" 2>/dev/null)
+    b=$(prom_query "$p" "avg_over_time(($q)[${edge}s:15s])" "$e" 2>/dev/null)
+    jq -n -c --argjson a "${a:-[]}" --argjson b "${b:-[]}" '
+      [$a[] as $x | ($b[] | select(.metric.instance == $x.metric.instance)) as $y
+        | ($x.value[1] | tonumber) as $f | ($y.value[1] | tonumber) as $l
+        | select($f > 0)
+        | {instance: $x.metric.instance, first: ($f | . * 100 | round / 100), last: ($l | . * 100 | round / 100),
+           growth_pct: (($l - $f) / $f * 1000 | round / 10)}]
+      | max_by(.growth_pct) // null'
+  }
+  local r out='{}'
+  for r in vault consul; do
+    out=$(jq -c --arg r "$r" \
+      --argjson mem "$(m '100 * (1 - node_memory_MemAvailable_bytes{SEL} / node_memory_MemTotal_bytes{SEL})' "$r")" \
+      --argjson heap "$(m "${r}_runtime_alloc_bytes{SEL} / 1048576" "$r")" \
+      --argjson fds "$(m 'node_filefd_allocated{SEL}' "$r")" \
+      '.[$r] = {mem_used_pct: $mem, heap_mb: $heap, fds: $fds}' <<<"$out")
+  done
+  echo "$out"
+}
+
 # vault_raft_stats <prom> <start s> <end s>: Vault Raft commit time (ms) and
 # applies/s over a window, as JSON. commitTime is leader-only, so the mean comes
 # from the summary's _sum/_count across all nodes (exact, survives a leader

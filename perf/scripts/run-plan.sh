@@ -3,7 +3,7 @@
 #
 #   run-plan.sh start [PLAN]    launch detached (systemd unit perf-plan-<PLAN>):
 #                               settle -> T1 -> T2 -> T3 -> T3c -> T5 -> T6 -> T3r
-#                               -> T5r -> T9-V -> Stage 4: t11grow -> t11smoke
+#                               -> T5r -> soak -> T9-V -> Stage 4: t11grow -> t11smoke
 #                               -> t11v7 -> t11v5 -> t11v3
 #   run-plan.sh status [PLAN]   progress, key numbers, RESULTS.md
 #   run-plan.sh stop [PLAN]     stop (Consul CSR limits are restored)
@@ -50,7 +50,7 @@
 # (scripts/run-campaign.sh start raft-1 --t11 builds and starts exactly this.)
 #
 # PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order), e.g.
-# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v".
+# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v".
 #   run-plan.sh run [PLAN]      run in the foreground (what `start` launches)
 #
 # PLAN defaults to plan-<UTC date>. RUN_IDs are <PLAN>-t1, <PLAN>-t3, ...
@@ -59,6 +59,14 @@
 # tests are skipped. Decisions carried between tests:
 #   T1 knee (last worker level that still added >= 10% throughput) -> T2 WORKERS
 #   T3/T5 last pass / first fail -> refinement rate (midpoint) and T9-V START
+# A step, refinement or soak also fails when a Vault or Consul server's mean CPU
+# over its hold exceeds SERVER_CPU_MAX (90%; the soak: SOAK_CPU_MAX, 80%).
+#
+# soak: SOAK_RATE (200/s, the target) through Consul (consul-leaf.js, CSR limits
+# removed) for SOAK_HOLD (2h) on the 5 voters. Fails on errors >= 0.01%
+# (SOAK_MAX_ERROR_RATE), p99 > 1 s, < 95% delivered or server CPU over
+# SOAK_CPU_MAX; warns when server memory, Go heap or file descriptors grow more
+# than SOAK_DRIFT_PCT (10%) between the hold's first and last 15 minutes.
 # After every test the guardrails are checked over its window (Consul/Vault
 # leader elections, minimum Autopilot failure tolerance) and flagged in
 # RESULTS.md.
@@ -67,8 +75,8 @@
 # T3_START, T3_MAX, T5_START,
 # T5_MAX, T3C_CONCURRENCY, T3C_MULTI_CONNS, T3C_STEP, T6_RATE, T6_BASELINE,
 # T6_COOLDOWN, T6_RAMP, T6_HOLD, T6_IDLE, T11_KV_RATES, T11_KV_REPEATS, T11_PAYLOADS,
-# T11_PAYLOAD_RATE, T11_RAMP, T11_HOLD, T11_KV_P99_MS,
-#, T11_RESIZE_SETTLE, T11_FAILOVER_REPEATS, T11_FREEZE, plus the usual BASELINE, COOLDOWN, RAMP,
+# T11_PAYLOAD_RATE, T11_RAMP, T11_HOLD, T11_KV_P99_MS, SERVER_CPU_MAX, SOAK_RATE,
+# SOAK_HOLD, SOAK_MAX_ERROR_RATE, SOAK_CPU_MAX, SOAK_DRIFT_PCT, T11_RESIZE_SETTLE, T11_FAILOVER_REPEATS, T11_FREEZE, plus the usual BASELINE, COOLDOWN, RAMP,
 # HOLD, WARMUP, DURATION, EXPORT for every test.
 . /opt/perf/scripts/lib.sh
 
@@ -88,6 +96,13 @@ T3C_CONCURRENCY=${T3C_CONCURRENCY:-"1 8 32 64 128 256 512"}
 T3C_MULTI_CONNS=${T3C_MULTI_CONNS:-16}
 T3C_STEP=${T3C_STEP:-60s}
 T6_RATE=${T6_RATE:-100}
+SERVER_CPU_MAX=${SERVER_CPU_MAX:-90}
+export SERVER_CPU_MAX
+SOAK_RATE=${SOAK_RATE:-200}
+SOAK_HOLD=${SOAK_HOLD:-2h}
+SOAK_MAX_ERROR_RATE=${SOAK_MAX_ERROR_RATE:-0.0001}
+SOAK_CPU_MAX=${SOAK_CPU_MAX:-80}
+SOAK_DRIFT_PCT=${SOAK_DRIFT_PCT:-10}
 SETTLE_APT=${SETTLE_APT:-1}
 SETTLE_IDLE=${SETTLE_IDLE:-10m}
 SETTLE_MAX_CPU=${SETTLE_MAX_CPU:-15}
@@ -306,18 +321,62 @@ refine() { # refine <id> <source values key> <script> <limits: yes|no>
   set -e
   if [ "$lim" = yes ]; then limits_restore; trap - EXIT; fi
   dir="$RESULTS_DIR/$PLAN-$id-$PERF_NODE-k6-$(basename "$script" .js)"
-  # Same pass criterion as a stress step: thresholds pass AND >= MIN_ACHIEVED delivered.
-  sset ".values.$id" "$(jq -c --argjson rate "$rate" --argjson rc "$rc" --argjson min "${MIN_ACHIEVED:-0.95}" '.metrics as $m
+  # Same pass criterion as a stress step: thresholds pass, >= MIN_ACHIEVED delivered, server CPU <= SERVER_CPU_MAX.
+  sset ".values.$id" "$(jq -c --argjson rate "$rate" --argjson rc "$rc" --argjson min "${MIN_ACHIEVED:-0.95}" \
+    --argjson scpu "$(steady_server_cpu "$dir")" --argjson cmax "$SERVER_CPU_MAX" '.metrics as $m
     | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
     | ($m.iterations.values.count // 0) as $it | ($m.dropped_iterations.values.count // 0) as $dr
     | {rate: $rate, thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
        delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
        p99_ms: ($d["p(99)"] | . * 100 | round / 100)}
-    | .pass = (.thresholds == "pass" and .delivered >= $min)' "$dir/summary.json" |
+    | .server_cpu_mean = $scpu | .cpu_saturated = ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax)
+    | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_saturated | not))' "$dir/summary.json" |
     jq -c --argjson m "$(cat "$dir/loadgen-mem-min-pct" 2>/dev/null || echo null)" '. + {loadgen_min_mem_pct: $m}')"
+}
+# steady_server_cpu <run dir>: server_cpu over the run's steady phase (null if unknown).
+steady_server_cpu() {
+  local prom s e
+  prom=$(prom_url 2>/dev/null) && read -r s e < <(steady_window "$1") && server_cpu "$prom" "$s" "$e" || echo null
 }
 t3r() { refine t3r t3 /opt/perf/k6/vault-sign-consul-mount.js no; }
 t5r() { refine t5r t5 /opt/perf/k6/consul-leaf.js yes; }
+
+# soak: the target rate through Consul for hours on the 5 voters. Catches what a
+# 10-minute step can't: memory or file descriptor growth, and rare errors
+# (DBS: >= 99.99% success).
+soak() {
+  local dir rc prom s e drift
+  limits_remove; trap limits_restore EXIT
+  restart_consul_agent
+  set +e
+  RUN_ID="$PLAN-soak" RATE="$SOAK_RATE" HOLD="$SOAK_HOLD" MAX_ERROR_RATE="$SOAK_MAX_ERROR_RATE" run-k6.sh /opt/perf/k6/consul-leaf.js
+  rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  dir="$RESULTS_DIR/$PLAN-soak-$PERF_NODE-k6-consul-leaf"
+  drift=null
+  if prom=$(prom_url 2>/dev/null) && read -r s e < <(steady_window "$dir"); then
+    drift=$(soak_drift "$prom" "$s" "$e")
+  fi
+  sset '.values.soak' "$(jq -c --argjson rate "$SOAK_RATE" --arg hold "$SOAK_HOLD" --argjson rc "$rc" \
+    --argjson min "${MIN_ACHIEVED:-0.95}" --argjson scpu "$(steady_server_cpu "$dir")" --argjson cmax "$SOAK_CPU_MAX" \
+    --argjson drift "${drift:-null}" --argjson dmax "$SOAK_DRIFT_PCT" '.metrics as $m
+    | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
+    | ([$m | to_entries[] | select(.key | startswith("http_req_failed{name:"))][0].value.values) as $f
+    | ($m.iterations.values.count // 0) as $it | ($m.dropped_iterations.values.count // 0) as $dr
+    | {rate: $rate, hold: $hold,
+       thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
+       requests: $it, failed: ($f.passes // 0), success_pct: ((1 - ($f.rate // 0)) * 100 * 10000 | round / 10000),
+       delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
+       p95_ms: ($d["p(95)"] | . * 100 | round / 100), p99_ms: ($d["p(99)"] | . * 100 | round / 100),
+       server_cpu_mean: $scpu, cpu_over: ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax),
+       drift: $drift,
+       drift_warnings: [($drift // {}) | to_entries[] | .key as $r | .value | to_entries[]
+         | select((.value.growth_pct // 0) > $dmax) | "\($r) \(.key) +\(.value.growth_pct)% (\(.value.instance))"]}
+    | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_over | not))' "$dir/summary.json")"
+  log "soak: $(sget '.values.soak | {success_pct, p99_ms, server_cpu_mean, drift_warnings, pass} | tojson')"
+  [ "$(sget '.values.soak.pass')" = true ]
+}
 
 raft_nonvoters() { # count of Vault Raft non-voters
   vault operator raft list-peers -format=json 2>/dev/null | jq '[.data.config.servers[] | select(.voter | not)] | length' 2>/dev/null || echo 0
@@ -553,6 +612,10 @@ results_md() {
             + "; warnings: " + ([$c.soft // {} | to_entries[] | select(.value | not) | .key] | if length == 0 then "none" else join(", ") end)
             + "; leader \($c.leader_kb_per_write // "?") KB/write at 200/s"
          elif ($k | startswith("t11v")) then "\(v($k).cluster.voters // "?") voters (AZ \(v($k).cluster.az_spread // {} | [.[]] | map(tostring) | join("/")), failure tolerance \(v($k).cluster.failure_tolerance // "?")): KV last pass \(v($k).kv.runs // [] | map(.last_pass // "-" | tostring) | join(", "))/s; leader \(v($k).cluster.leader // "?") (\(v($k).cluster.leader_az_peers // "?") same-AZ voters); failover: new active \(v($k).failover.new_active_s.median // "?") s, write gap \(v($k).failover.write_gap_s.median // "?") s (median)"
+         elif $k == "soak" then "\(v("soak").rate // "?")/s for \(v("soak").hold // "?"): **\(if v("soak").pass then "PASS" else "FAIL" end)**, "
+            + "success \(v("soak").success_pct // "?")% (\(v("soak").failed // "?") of \(v("soak").requests // "?") failed), p99 \(v("soak").p99_ms // "?") ms, "
+            + "server CPU \(v("soak").server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end); "
+            + "growth: \(v("soak").drift_warnings // [] | if length == 0 then "none over threshold" else "⚠️ " + join(", ") end)"
          elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
@@ -621,7 +684,7 @@ start)
   if systemctl is-active --quiet "$UNIT"; then echo "$UNIT is already running"; exit 1; fi
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
-    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
+    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
     P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done
@@ -638,6 +701,7 @@ run)
     "t3:Vault cluster capacity on Consul's mount (stress)" "t3c:single vs multiple connections" \
     "t5:Consul leaf path, CSR limits removed (stress)" "t6:signing distribution" \
     "t3r:refinement near T3's ceiling" "t5r:refinement near T5's ceiling" \
+    "soak:${SOAK_RATE}/s through Consul for ${SOAK_HOLD} (leaks, rare errors)" \
     "t9v:Vault + non-voters: T3 from its last pass, then T3c" \
     "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \

@@ -14,6 +14,9 @@
 #     should have started. In an open model, dropped iterations mean every VU
 #     was busy waiting: the system can't keep up. If the load generator's own
 #     CPU is the busiest host, raise MAX_VUS or add a load generator instead.
+#   * a Vault or Consul server's mean CPU over the hold exceeds SERVER_CPU_MAX
+#     (default 90%; 0 turns it off): saturated, even if latency still holds.
+#     The mean, not the peak, so one busy 10 s sample doesn't fail a step.
 # The rate is multiplied by FACTOR (default 2) after each passing step, up to MAX
 # (default 12800). RATES="200 400 800 ..." runs that fixed list instead (T11:
 # the same grid at every voter count), still stopping at the first failure.
@@ -55,6 +58,7 @@ esac
 FACTOR=${FACTOR:-2}
 MAX=${MAX:-12800}
 MIN_ACHIEVED=${MIN_ACHIEVED:-0.95}
+SERVER_CPU_MAX=${SERVER_CPU_MAX:-90}
 STEP_GAP=${STEP_GAP:-0}
 HOLD=${HOLD:-10m}
 export HOLD
@@ -132,6 +136,7 @@ while [ "$rate" -le "$MAX" ]; do
 
   [ -n "$PROM" ] && sleep 20 # let Prometheus scrape the step's last seconds
   cpu='null'
+  scpu='null'
   raft='null'
   lcost='null'
   # Measure the step's steady state (from its phases.json), not the cooldown.
@@ -140,6 +145,7 @@ while [ "$rate" -le "$MAX" ]; do
     cpu=$(prom_query "$PROM" "topk(4, max_over_time(($CPU_EXPR)[${hold_s}s:10s]))" "$t_end" |
       jq -c 'map({instance: .metric.instance, cpu_pct: (.value[1] | tonumber | . * 10 | round / 10)})' || true)
     cpu=${cpu:-null}
+    scpu=$(server_cpu "$PROM" "$s_start" "$t_end")
     signs=$(prom_query "$PROM" "sum by (instance) (increase(${SIGN_METRIC}[${hold_s}s]))" "$t_end" |
       jq -c 'map({instance: .metric.instance, signs: (.value[1] | tonumber)})
         | (map(.signs) | add // 0) as $t
@@ -157,13 +163,15 @@ while [ "$rate" -le "$MAX" ]; do
     signs='null'
   fi
   # Leader cost per write: the steady-state write rate is the offered rate times the delivered fraction.
-  step_json=$(jq -c --argjson cpu "$cpu" --argjson signs "$signs" --argjson raft "${raft:-null}" --argjson lc "${lcost:-null}" \
+  step_json=$(jq -c --argjson cpu "$cpu" --argjson scpu "${scpu:-null}" --argjson cmax "$SERVER_CPU_MAX" \
+    --argjson signs "$signs" --argjson raft "${raft:-null}" --argjson lc "${lcost:-null}" \
     --argjson min "$MIN_ACHIEVED" '(.rate * .delivered) as $w
-    | . + {peak_cpu: $cpu, sign_nodes: $signs, vault_raft: $raft,
+    | ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax) as $sat
+    | . + {peak_cpu: $cpu, server_cpu_mean: $scpu, cpu_saturated: $sat, sign_nodes: $signs, vault_raft: $raft,
            leader_cost: (if $lc and $w > 0 then $lc + {
              tx_bytes_per_write: (if $lc.tx_bytes_per_s then ($lc.tx_bytes_per_s / $w | round) else null end),
              cpu_ms_per_write: (if $lc.cpu_cores then ($lc.cpu_cores / $w * 1000 * 1000 | round / 1000) else null end)} else $lc end),
-           pass: (.thresholds == "pass" and .delivered >= $min)}' <<<"$step_json")
+           pass: (.thresholds == "pass" and .delivered >= $min and ($sat | not))}' <<<"$step_json")
   jq --argjson s "$step_json" '. + [$s]' "$OUT/steps.json" > "$OUT/steps.tmp" && mv "$OUT/steps.tmp" "$OUT/steps.json"
   echo "step: $step_json"
 
@@ -172,7 +180,7 @@ while [ "$rate" -le "$MAX" ]; do
     break
   fi
   if [ "$(jq -r .pass <<<"$step_json")" != true ]; then
-    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json")"
+    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json"), server CPU $(jq -r '.server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end' <<<"$step_json")$(jq -r 'if .cpu_saturated then " (over '"$SERVER_CPU_MAX"'%)" else "" end' <<<"$step_json")"
     break
   fi
   rate=$(next_rate "$rate")

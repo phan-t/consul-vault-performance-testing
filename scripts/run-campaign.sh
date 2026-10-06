@@ -23,9 +23,9 @@
 #   PLAN_TESTS="settle t5 t5r" T5_START=800 scripts/run-campaign.sh start plan-2
 #
 # The main campaign ends with Stage 4: T11 (Vault Raft latency at 7, 5, 3 voters)
-# after T9-V's non-voters are converted to voters (~17–21 h in all). It needs a
+# after T9-V's non-voters are converted to voters (~19–23 h in all). It needs a
 # Vault license without the pki-only module; verify checks this. To leave
-# Stage 4 out: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r t9v".
+# Stage 4 out: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v".
 #
 # T11 can also run as its own campaign on a 7-voter build, run the same way
 # (start, status/follow, finish):
@@ -82,6 +82,7 @@ plan_env() {
   local v out=""
   for v in PLAN_TESTS T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX \
     T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE MEM_GUARD_PCT SETTLE_IDLE SETTLE_SCANNER_WAIT \
+    SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT \
     BASELINE COOLDOWN RAMP HOLD \
     T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE; do
     [ -n "${!v:-}" ] && out+="$v='${!v}' "
@@ -188,7 +189,7 @@ echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$r
     die "unexpected cluster state (want $vv Vault voters, 0 non-voters (held), $cv Consul voters, leaf TTL 168h, root pki_mesh_int)"
   if runs_t11 && ! grep -q "kv_mounts=ok" <<<"$out"; then
     die "the Vault license refuses KV mounts (pki-only module), so T11 can't run. Use a full Vault Enterprise license and rebuild, or leave out Stage 4:
-  PLAN_TESTS=\"settle t1 t2 t3 t3c t5 t6 t3r t5r t9v\" scripts/run-campaign.sh continue $PLAN"
+  PLAN_TESTS=\"settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v\" scripts/run-campaign.sh continue $PLAN"
   fi
   echo "  cluster OK: held non-voters not yet joined (T9-V starts them)"
 }
@@ -230,7 +231,7 @@ after_apply() {
   on_loadgen "/opt/perf/scripts/sync-assets.sh >/dev/null && cd /opt/perf && $(plan_env)run-plan.sh start $PLAN" 120
   cat <<EOF
 
-The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 … T5r → T9-V → Stage 4: T11 at 7, 5, 3 voters, ~17–21 h}).
+The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 … T5r → soak → T9-V → Stage 4: T11 at 7, 5, 3 voters, ~19–23 h}).
   Progress:  scripts/run-campaign.sh status $PLAN    (or follow $PLAN)
   Grafana:   $(tfo '.grafana_url.value // empty')
   When done: refresh AWS credentials, then scripts/run-campaign.sh finish $PLAN

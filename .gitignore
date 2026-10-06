@@ -31,3 +31,6 @@ __pycache__/
 
 # Downloaded campaign results (scripts/run-campaign.sh finish)
 results/
+
+# Archived campaign results (kept locally for comparison)
+results-archive/

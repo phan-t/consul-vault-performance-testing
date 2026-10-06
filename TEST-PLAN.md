@@ -13,11 +13,12 @@
 | | T6 | Where does signing land on Vault, directly, through Consul, and after an idle gap? | ~0.5 h |
 | | T3r / T5r | Where exactly is each ceiling, between the last passing and first failing rate? | ~0.5 h |
 | | Soak | Does the target rate hold for 2 h at ≥ 99.99% success, with no memory or file descriptor growth? | ~2.2 h |
-| 3: Vault scale-out | T9-V | Do 2 non-voters (performance standbys) raise T3 and T3c? | ~1.6 h |
+| 3: Vault scale-out | T9-V | Do 2 non-voters (redundancy zone spares, performance standbys) raise T3 and T3c? | ~1.6 h |
+| | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? | ~0.5 h |
 | 4: Vault Raft | T11 grow | Convert T9-V's 2 non-voters to voters (7 voters); how long does each take to join and be promoted? | ~0.2 h |
 | | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~7.7–10.7 h |
 
-Stages 0–4 run as one campaign (`plan-1`, ~19–23 h). The T5 rerun (`plan-2`)
+Stages 0–4 run as one campaign (`plan-1`, ~20–24 h). The T5 rerun (`plan-2`)
 repeats only T5 and T5r from 800/s. T11 can also run on its own (`raft-1`,
 `--t11`). Stage 4 needs a Vault license without the `pki-only` module.
 *Read-out* explains how to interpret the comparisons, and *Results* records
@@ -32,13 +33,13 @@ Run everything from your workstation with `scripts/run-campaign.sh`:
 export TF_CLOUD_ORGANIZATION=<your-org>
 scripts/run-campaign.sh start plan-1       # Stage 0 rebuild (type "yes" at the plan), wait, verify, start the campaign
 scripts/run-campaign.sh status plan-1      # check progress any time (or: follow plan-1)
-# ~19-23 h later, with fresh credentials again:
+# ~20-24 h later, with fresh credentials again:
 scripts/run-campaign.sh finish plan-1      # download results to ./results/, then offer terraform destroy
 ```
 
 The campaign ends with Stage 4 (T11 at 7, 5 and 3 voters). To leave it out,
 which also allows a PKI-only Vault license, set
-`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v"` before `start`. T11 can
+`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12"` before `start`. T11 can
 also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --t11`
 (see T11).
 
@@ -52,6 +53,7 @@ also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --
    - 5 Consul voters;
    - leaf TTL 168h;
    - root path `pki_mesh_int`;
+   - one Autopilot redundancy zone per Vault voter (unless `vault_redundancy_zones = false`);
    - when the run includes T11, that the Vault license allows KV mounts.
 5. Refreshes `credentials.txt`, and starts `run-plan.sh` on loadgen-0.
 
@@ -175,7 +177,7 @@ credentials: the runner uses the instances' own IAM roles.
 ```bash
 # 1. workstation: Stage 0 step 1 (full size + held non-voters), one apply
 # 2. loadgen-0, as ubuntu:
-run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → soak → T9-V → Stage 4 (~17.7–21.7 h)
+run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → soak → T9-V → T12 → Stage 4 (~18.2–22.2 h)
 run-plan.sh status plan-1         # progress, last log lines, RESULTS.md
 run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
 # 3. workstation, when it's finished: terraform destroy (the runner can't)
@@ -586,18 +588,83 @@ measured. The question here is whether the ceiling moves up.
 - t9-t3c against t3c: `multi_max` should rise, and `single_max` should stay flat
   on one node.
 
+### T12: Redundancy zone spares under load (~0.5 h)
+
+The HLD's design: **Autopilot redundancy zones**, starting with 5 voters and
+no non-voters, then adding non-voters as scale demands. Autopilot keeps
+**one voter per zone**. A non-voter added to a zone that already has a voter
+stays a non-voter (a spare, serving as a performance standby) until that
+voter fails. Then Autopilot promotes it. So there are two times to measure:
+how long a new spare takes to join, and how long promotion takes when it's
+needed.
+
+**The build matches that design** (`vault_redundancy_zones = true`, the
+default): `vault-0`…`vault-4` are in `zone-0`…`zone-4`, one voter each, and
+the held `vault-nv-0` and `vault-nv-1` join `zone-0` and `zone-1` as spares.
+They set `autopilot_redundancy_zone`, **not** `retry_join_as_non_voter`, which
+would make them permanent non-voters that Autopilot never promotes.
+`run-campaign.sh` checks for 5 zones at the start, which also checks that the
+license allows redundancy zones.
+
+Under a constant signing load on Consul's mount, at half T3's last passing
+rate (`T12_RATE`), `vault-zone-test.sh` picks a zone with a spare whose voter
+isn't the active node, then:
+
+1. **Join.** It re-adds the spare from scratch, the way a spare is added for
+   scale: stop, `remove-peer`, empty its Raft data, start. It records:
+   - **joined:** time until the spare appears in Autopilot's server list;
+   - **healthy:** time until Autopilot reports it healthy;
+   - its status 60 s later, which should still be non-voter.
+2. **Zone failure.** It freezes the zone's voter with `SIGSTOP`: a hung node,
+   unplanned, like T11's failover check. It records:
+   - **unhealthy:** time until Autopilot marks the voter unhealthy;
+   - **promoted:** time until the spare is a voter;
+   - **demoted:** time until the frozen voter is a non-voter;
+   - **restored:** time until failure tolerance is back to 2.
+
+   It thaws the voter 30 s after that, or after 5 minutes (`T12_FREEZE_MAX`)
+   if promotion never happens, and then records when Autopilot is healthy
+   again and where the old voter ended up.
+
+Times are polled every second, from the active node directly, so a poll never
+hangs on the frozen node. For each phase, k6's per-request samples give the
+client's view:
+- failed requests;
+- the error window, from the first failure to the last;
+- the longest gap between successful requests.
+
+Requests the NLB sends to the frozen node hang until k6's 30 s timeout, so the
+error window includes the NLB health checks.
+
+**Promotion isn't instant by design.** Autopilot waits until the voter has been
+out of contact for longer than `last_contact_threshold`, and the spare must have
+been healthy for `server_stabilization_time` (both 10 s by default). If
+`promoted` is missing, the spare was never promoted within 5 minutes. That's
+a finding, not a test bug: check the Autopilot configuration.
+
+```bash
+RUN_ID=t12 RATE=<T3 last pass / 2> vault-zone-test.sh; summarise.sh t12
+```
+
+T12 is skipped on a build without zones. Stage 4 follows, so the zones
+don't have to be back in their original layout afterwards.
+
 ## Stage 4: Vault Raft latency vs voter count
 
 ### T11 grow: Convert the non-voters to voters (~0.2 h)
 
-T11 needs 7 voters and no non-voters. After T9-V, the main build has 5 voters
-and 2 non-voters, so `t11grow` turns the non-voters into voters with
-`vault-raft-voters.sh convert`. On `vault-nv-0` and `vault-nv-1`, over SSM, it:
+T11 needs 7 voters and no non-voters. After T9-V and T12, the main build has
+5 voters and 2 non-voters. Usually those are `vault-nv-0` and `vault-nv-1`, but
+after T12 one of them may be the frozen voter, now a spare. `t11grow` turns
+whichever running nodes aren't voters into voters with
+`vault-raft-voters.sh convert`. On each one, over SSM, it:
 
 1. stops Vault (`systemctl disable --now vault`), then runs
    `vault operator raft remove-peer`;
 2. empties the Raft data directory, `/opt/vault/data`;
-3. sets `retry_join_as_non_voter = false` in `/etc/vault.d/vault.hcl`;
+3. sets `retry_join_as_non_voter = false` in `/etc/vault.d/vault.hcl` and,
+   with redundancy zones, gives the node a zone of its own (`t11-<node>`), so
+   Autopilot can make it a voter;
 4. starts Vault. Each node rejoins Raft as a non-voter, and Autopilot
    promotes it once it has been healthy for `server_stabilization_time`
    (10 s by default);
@@ -618,8 +685,8 @@ These go in `state.json` (`values.t11grow`) and the t11grow row of RESULTS.md.
 The times start before the SSM command, so they include its delivery and the
 data wipe, about 1–2 s.
 
-The EC2 `Voter` tag stays `false`. `shrink` removes the converted nodes first,
-so T11 at 5 voters runs on `vault-0`…`vault-4`, the same nodes as Stages 1–3.
+The EC2 `Voter` tags don't change. `shrink` removes `vault-nv-*` first, so T11
+at 5 voters runs on `vault-0`…`vault-4`, the same nodes as Stages 1–3.
 If `t11grow` fails, `t11smoke` and `t11v*` refuse to run, and the results from
 Stages 0–3 aren't affected.
 
@@ -866,6 +933,7 @@ targets. The report should also state the headroom above 200/s.
 | T3 / T5 refined | t3r / t5r | | | |
 | Soak, 200/s for 2 h | soak | success: ; growth: | | |
 | T9-V Vault + 2 non-voters | t9-t3 / t9-t3c | | | |
+| T12 zone spare: join / promotion under load | t12 | joined: ; healthy: ; promoted: ; restored: | | failed requests: |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
 
@@ -876,10 +944,10 @@ targets. The report should also state the headroom above 200/s.
 | Stage 0 (incl. settle) | ~1–1.1 h |
 | Stage 1: T1 sweep, T2, T3 (chained), T3c | ~3–3.4 h |
 | Stage 2: T5 (chained), T6 (short runs), refinement, soak | ~4.1–4.5 h |
-| Stage 3: T9-V (T3 from its last pass, T3c) | ~1.6 h |
+| Stage 3: T9-V (T3 from its last pass, T3c), T12 | ~2.1 h |
 | Stage 4: T11 grow, T11 smoke check, T11 at 7, 5, 3 voters | ~7.7–10.7 h |
-| **Total** | **~17.6–21.6 h (~US$160–215 at ~US$9–10/h)** |
-| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~9.9–10.9 h (~US$90–110)* |
+| **Total** | **~18.1–22.1 h (~US$165–220 at ~US$9–10/h)** |
+| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~10.4–11.4 h (~US$95–115)* |
 | *T11 as its own campaign* (`run-campaign.sh start raft-1 --t11`): Stage 0, T11 smoke check, T11 at 7, 5, 3 voters | *~9–11 h* |
 
 Stage 4 needs no extra instances: it reuses T9-V's two nodes. The nodes it

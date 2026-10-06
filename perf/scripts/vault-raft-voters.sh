@@ -15,14 +15,17 @@
 # One-way: a removed node keeps its old Raft data and can't simply rejoin. To
 # get back to 7 voters, rebuild (terraform apply -replace).
 #
-# convert (Stage 4: T11 after T9-V on the main build) rejoins every Voter=false
-# instance as a voter: stop Vault, remove-peer (if it's in Raft), wipe its Raft
-# data, set retry_join_as_non_voter = false, start Vault. Each node rejoins as a
-# non-voter and Autopilot promotes it once it has been healthy for
+# convert (Stage 4: T11 after T9-V and T12 on the main build) rejoins every
+# running Vault instance that isn't a Raft voter (zone spares, permanent
+# non-voters, held nodes, or a voter T12 demoted) as a voter: stop Vault,
+# remove-peer (if it's in Raft), wipe its Raft data, set
+# retry_join_as_non_voter = false and, with redundancy zones, a zone of its own
+# (t11-<node>; Autopilot keeps one voter per zone), start Vault. Each node
+# rejoins as a non-voter and Autopilot promotes it once it has been healthy for
 # server_stabilization_time, so convert records, per node, the time from start
-# to joining Raft and to promotion (polled every second). 5 voters + vault-nv-0
-# and vault-nv-1 give 7 voters spread 3/2/2, like a 7-voter build. The EC2
-# Voter tag stays "false"; shrink removes the converted nodes first.
+# to joining Raft and to promotion (polled every second). 5 voters + 2 more give
+# 7 voters spread 3/2/2, like a 7-voter build. The EC2 Voter tag doesn't
+# change; shrink removes vault-nv-* first, leaving vault-0..4.
 # Needs: root VAULT_TOKEN (env.sh), SSM Run Command on the Vault instances.
 . /opt/perf/scripts/lib.sh
 
@@ -99,12 +102,10 @@ shrink() {
 
 convert() {
   local nv ids p have want t0 now out bg node i=0 timing='{}'
-  nv=$(aws ec2 describe-instances \
-    --filters "Name=tag:Project,Values=$PERF_NAME" "Name=tag:Role,Values=vault" "Name=tag:Voter,Values=false" "Name=instance-state-name,Values=running" \
-    --query 'Reservations[].Instances[].{node: Tags[?Key==`Node`]|[0].Value, id: InstanceId}' --output json)
-  [ "$(jq length <<<"$nv")" -gt 0 ] || { echo "no Voter=false Vault instances to convert" >&2; return 1; }
-  ids=$(jq -r '.[].id' <<<"$nv")
   p=$(peers)
+  nv=$(jq -c --argjson p "$p" '[.[] | select(.node as $n | any($p[]; .node_id == $n and .voter) | not) | {node, id}]' <<<"$(instances)")
+  [ "$(jq length <<<"$nv")" -gt 0 ] || { echo "every running Vault instance is already a voter; nothing to convert" >&2; return 1; }
+  ids=$(jq -r '.[].id' <<<"$nv")
   have=$(jq '[.[] | select(.voter)] | length' <<<"$p")
   want=$((have + $(jq length <<<"$nv")))
   echo "$(date -u +%H:%M:%S) converting $(jq -r '[.[].node] | join(", ")' <<<"$nv") to voters ($have -> $want)" >&2
@@ -124,6 +125,8 @@ convert() {
 find /opt/vault/data -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} +
 sed -i -E "s/^([[:space:]]*retry_join_as_non_voter[[:space:]]*=[[:space:]]*)true/\1false/" /etc/vault.d/vault.hcl
 grep -Eq "^[[:space:]]*retry_join_as_non_voter[[:space:]]*=[[:space:]]*false" /etc/vault.d/vault.hcl
+node=$(sed -nE "s/^[[:space:]]*node_id[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p" /etc/vault.d/vault.hcl)
+sed -i -E "s/^([[:space:]]*autopilot_redundancy_zone[[:space:]]*=[[:space:]]*)\".*\"/\\1\"t11-$node\"/" /etc/vault.d/vault.hcl
 systemctl enable --now vault && echo converted' $ids > "$out" &
   bg=$!
   # Per node: when it first appears in Raft (as a non-voter) and when Autopilot promotes it.

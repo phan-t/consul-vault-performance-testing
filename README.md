@@ -29,7 +29,7 @@ through **HCP Terraform (TFC)**.
 | Component | Default | Notes |
 |---|---|---|
 | Vault Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 (6000 IOPS) Raft volume | `2.1.1+ent`. Raft auto-join via EC2 tags, KMS auto-unseal, TLS, file audit device |
-| Vault non-voters | `vault_non_voter_count = 0` | `retry_join_as_non_voter = true` (Enterprise). They run as performance standbys |
+| Vault non-voters | `vault_non_voter_count = 0` | Autopilot redundancy zone spares (Enterprise, `vault_redundancy_zones = true`): voter *i* is in `zone-i`, and `vault-nv-N` joins `zone-N` as a non-voter that Autopilot promotes if that zone's voter fails. With `vault_redundancy_zones = false`, permanent non-voters (`retry_join_as_non_voter`). Either way, they run as performance standbys |
 | Consul Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 data volume | `2.0.1+ent`, pinned (see [Consul version](#consul-version)). TLS, gossip encryption, ACLs (default deny), auto_encrypt for clients |
 | Consul read replicas | `consul_read_replica_count = 0` | `read_replica = true` (Enterprise non-voting servers) |
 | Connect CA | Vault provider, external root | Offline root → Vault intermediate (`pki_mesh_int`, Vault-managed) → Consul signing intermediate (`connect_<dc>_inter`) → leafs. The `leaf-cert` role uses `no_store=true`. Auth uses the Vault **AWS IAM auth method** (no static Vault token). See [Mesh PKI](#mesh-pki) |
@@ -147,12 +147,14 @@ in an SSM session.
 ## Scaling voters and non-voters
 
 ```hcl
-vault_non_voter_count     = 2   # adds vault-nv-0, vault-nv-1  (non-voters, perf standbys)
+vault_non_voter_count     = 2   # adds vault-nv-0, vault-nv-1  (zone spares in zone-0, zone-1; perf standbys)
 consul_read_replica_count = 2   # adds consul-rr-0, consul-rr-1 (read replicas)
 ```
 
 Apply again. The new nodes auto-join as non-voters without touching the
-existing voters.
+existing voters. With redundancy zones (the default), Autopilot keeps one voter
+per zone, so a spare stays a non-voter until its zone's voter fails (T12 in
+TEST-PLAN.md measures this).
 
 To check membership:
 

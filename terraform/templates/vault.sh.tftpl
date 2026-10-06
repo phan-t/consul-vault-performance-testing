@@ -50,9 +50,15 @@ storage "raft" {
   path    = "/opt/vault/data"
   node_id = "${node_name}"
 
-  # Enterprise: permanent non-voter. Replicates data and serves as a
-  # performance standby without affecting quorum.
-  retry_join_as_non_voter = ${voter ? "false" : "true"}
+  # Enterprise: a permanent non-voter replicates data and serves as a
+  # performance standby without affecting quorum. Never promoted.
+  retry_join_as_non_voter = ${permanent_non_voter ? "true" : "false"}
+%{ if redundancy_zone != "" ~}
+
+  # Enterprise: Autopilot keeps one voter per redundancy zone; other nodes in
+  # the zone are non-voter spares, promoted if the zone's voter fails.
+  autopilot_redundancy_zone = "${redundancy_zone}"
+%{ endif ~}
 
   retry_join {
     auto_join             = "provider=aws region=${region} tag_key=VaultCluster tag_value=${join_tag} addr_type=private_v4"

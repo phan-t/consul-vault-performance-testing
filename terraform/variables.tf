@@ -119,9 +119,25 @@ variable "vault_voter_count" {
 }
 
 variable "vault_non_voter_count" {
-  description = "Vault Enterprise permanent non-voters (retry_join_as_non_voter). They act as performance standbys."
+  description = <<-EOT
+    Extra Vault nodes beyond the voters (vault-nv-N). With vault_redundancy_zones
+    they're redundancy zone spares; without, permanent non-voters
+    (retry_join_as_non_voter). Either way they're performance standbys.
+  EOT
   type        = number
   default     = 0
+}
+
+variable "vault_redundancy_zones" {
+  description = <<-EOT
+    Autopilot redundancy zones (Enterprise), as the HLD recommends: voter i is in
+    zone-i, so each zone has one voter, and vault-nv-N joins zone-N as a spare.
+    Autopilot keeps one voter per zone: a spare stays a non-voter until its
+    zone's voter fails, then Autopilot promotes it. false = permanent
+    non-voters instead (never promoted).
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "vault_non_voters_start" {

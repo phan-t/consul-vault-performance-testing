@@ -3,7 +3,7 @@
 #
 #   run-plan.sh start [PLAN]    launch detached (systemd unit perf-plan-<PLAN>):
 #                               settle -> T1 -> T2 -> T3 -> T3c -> T5 -> T6 -> T3r
-#                               -> T5r -> soak -> T9-V -> Stage 4: t11grow -> t11smoke
+#                               -> T5r -> soak -> T9-V -> T12 -> Stage 4: t11grow -> t11smoke
 #                               -> t11v7 -> t11v5 -> t11v3
 #   run-plan.sh status [PLAN]   progress, key numbers, RESULTS.md
 #   run-plan.sh stop [PLAN]     stop (Consul CSR limits are restored)
@@ -24,6 +24,11 @@
 # scanners (perf_scanner_active, e.g. a vulnerability scanner on the image) to finish, and
 # a quiet check also requires no scanner activity. Every test records which
 # hosts ran a scanner during it; RESULTS.md flags those tests.
+#
+# T12 (redundancy zones, needs vault_redundancy_zones and T9-V's spares in Raft):
+# under signing load at T12_RATE (default half T3's last pass), re-add a zone
+# spare from scratch and time its join, then SIGSTOP that zone's voter and time
+# Autopilot promoting the spare (vault-zone-test.sh). Skipped without zones.
 #
 # Stage 4 runs T11 (Vault Raft commit latency vs voter count: t11v7 t11v5
 # t11v3) last, on the same build: t11grow turns T9-V's two non-voters into
@@ -50,7 +55,7 @@
 # (scripts/run-campaign.sh start raft-1 --t11 builds and starts exactly this.)
 #
 # PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order), e.g.
-# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v".
+# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12".
 #   run-plan.sh run [PLAN]      run in the foreground (what `start` launches)
 #
 # PLAN defaults to plan-<UTC date>. RUN_IDs are <PLAN>-t1, <PLAN>-t3, ...
@@ -76,7 +81,7 @@
 # T5_MAX, T3C_CONCURRENCY, T3C_MULTI_CONNS, T3C_STEP, T6_RATE, T6_BASELINE,
 # T6_COOLDOWN, T6_RAMP, T6_HOLD, T6_IDLE, T11_KV_RATES, T11_KV_REPEATS, T11_PAYLOADS,
 # T11_PAYLOAD_RATE, T11_RAMP, T11_HOLD, T11_KV_P99_MS, SERVER_CPU_MAX, SOAK_RATE,
-# SOAK_HOLD, SOAK_MAX_ERROR_RATE, SOAK_CPU_MAX, SOAK_DRIFT_PCT, T11_RESIZE_SETTLE, T11_FAILOVER_REPEATS, T11_FREEZE, plus the usual BASELINE, COOLDOWN, RAMP,
+# SOAK_HOLD, SOAK_MAX_ERROR_RATE, SOAK_CPU_MAX, SOAK_DRIFT_PCT, T12_RATE, T12_FREEZE_MAX, T11_RESIZE_SETTLE, T11_FAILOVER_REPEATS, T11_FREEZE, plus the usual BASELINE, COOLDOWN, RAMP,
 # HOLD, WARMUP, DURATION, EXPORT for every test.
 . /opt/perf/scripts/lib.sh
 
@@ -410,6 +415,23 @@ t9v() {
     '{t3: $s, t3c: $c, vault_targets_up: '"$up"', non_voters: '"$(raft_nonvoters)"'}')"
 }
 
+# T12: redundancy zone spares under load. Skipped on a build without zones.
+t12() {
+  local zones rate
+  zones=$(vault operator raft autopilot state -format=json 2>/dev/null |
+    jq '[.. | objects | (.redundancy_zone? // .RedundancyZone? // empty) | select(. != "")] | length' 2>/dev/null || echo 0)
+  if [ "${zones:-0}" -eq 0 ]; then
+    log "T12: no Autopilot redundancy zones (vault_redundancy_zones = false?); skipped"
+    sset '.values.t12' '{"skipped": true}'
+    return 0
+  fi
+  rate=${T12_RATE:-$(sget '(.values.t3.last_pass // 3200) / 2 | floor')}
+  RUN_ID="$PLAN-t12" RATE="$rate" FREEZE_MAX="${T12_FREEZE_MAX:-300s}" vault-zone-test.sh
+  # The frozen voter lowers failure tolerance by 1 on purpose until its spare is promoted.
+  sset '.values.t12' "$(jq -c --argjson ft "$(vault-raft-voters.sh status | jq '(.voters - 1) / 2 | floor - 1')" \
+    '. + {expected_failure_tolerance: $ft}' "$RESULTS_DIR/$PLAN-t12-$PERF_NODE-zones/zones.json")"
+}
+
 # jq def shared by T11: one stress.json -> the fields T11 keeps per run.
 T11_JQ="$DIR/t11.jq"
 cat > "$T11_JQ" <<'JQ'
@@ -616,6 +638,12 @@ results_md() {
             + "success \(v("soak").success_pct // "?")% (\(v("soak").failed // "?") of \(v("soak").requests // "?") failed), p99 \(v("soak").p99_ms // "?") ms, "
             + "server CPU \(v("soak").server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end); "
             + "growth: \(v("soak").drift_warnings // [] | if length == 0 then "none over threshold" else "⚠️ " + join(", ") end)"
+         elif $k == "t12" and v("t12").skipped then "skipped (no redundancy zones)"
+         elif $k == "t12" then v("t12") as $z | "\($z.rate // "?")/s; zone \($z.zone // "?"): "
+            + "spare \($z.spare // "?") joined \($z.join.joined_s // "-") s, healthy \($z.join.healthy_s // "-") s, then \($z.join.status_after // "?") "
+            + "(\($z.join.client.failed // "?") failed requests); voter \($z.voter // "?") frozen: unhealthy \($z.failure.unhealthy_s // "-") s, "
+            + "spare promoted \($z.failure.promoted_s | if . then "\(.) s" else "**never**" end), tolerance restored \($z.failure.restored_s | if . then "\(.) s" else "-" end); "
+            + "\($z.failure.client.failed // "?") failed requests over \($z.failure.client.error_window_s // "?") s"
          elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
@@ -684,7 +712,7 @@ start)
   if systemctl is-active --quiet "$UNIT"; then echo "$UNIT is already running"; exit 1; fi
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
-    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
+    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT T12_RATE T12_FREEZE_MAX T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
     P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done
@@ -703,6 +731,7 @@ run)
     "t3r:refinement near T3's ceiling" "t5r:refinement near T5's ceiling" \
     "soak:${SOAK_RATE}/s through Consul for ${SOAK_HOLD} (leaks, rare errors)" \
     "t9v:Vault + non-voters: T3 from its last pass, then T3c" \
+    "t12:redundancy zones: re-add a spare and fail its zone's voter, under load" \
     "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \
     "t11v7:Vault Raft latency, 7 voters" "t11v5:Vault Raft latency, 5 voters (shrinks Vault)" \
@@ -711,6 +740,9 @@ run)
     run_test "${t%%:*}" "${t#*:}"
   done
   log "plan $PLAN complete; results in $DIR/RESULTS.md. Remember: terraform destroy when done."
+  ;;
+t12)
+  run_test t12 "redundancy zones: re-add a spare and fail its zone's voter, under load"
   ;;
 t9v)
   run_test t9v "Vault + 2 non-voters: T3 from its last pass, then T3c"
@@ -727,7 +759,7 @@ status)
   echo; [ -f "$DIR/RESULTS.md" ] && cat "$DIR/RESULTS.md"
   ;;
 *)
-  echo "usage: run-plan.sh start|status|stop|t9v|run [PLAN]" >&2
+  echo "usage: run-plan.sh start|status|stop|t9v|t12|run [PLAN]" >&2
   exit 1
   ;;
 esac

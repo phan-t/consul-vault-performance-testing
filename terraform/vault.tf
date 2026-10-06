@@ -1,6 +1,7 @@
 # Vault Enterprise: var.vault_voter_count voters + var.vault_non_voter_count
-# permanent non-voters (performance standbys). Individual instances (not an
-# ASG) keep node IDs stable; add non-voters by raising the count.
+# extra nodes (performance standbys): redundancy zone spares, or permanent
+# non-voters without var.vault_redundancy_zones. Individual instances (not an
+# ASG) keep node IDs stable; add nodes by raising the count.
 
 resource "aws_instance" "vault" {
   for_each = { for n in local.vault_nodes : n.name => n }
@@ -34,29 +35,31 @@ resource "aws_instance" "vault" {
   }
 
   user_data = templatefile("${path.module}/templates/vault.sh.tftpl", {
-    common             = file("${path.module}/templates/common.sh")
-    name               = var.name
-    node_name          = each.key
-    voter              = each.value.voter
-    start_vault        = each.value.voter || var.vault_non_voters_start
-    bootstrap          = each.value.index == 0
-    region             = var.aws_region
-    vault_version      = var.vault_version
-    vault_fqdn         = local.vault_fqdn
-    join_tag           = local.vault_join_tag
-    kms_key_id         = aws_kms_key.vault_unseal.key_id
-    config_secret_id   = aws_secretsmanager_secret.vault_config.arn
-    init_secret_id     = aws_secretsmanager_secret.vault_init.arn
-    bootstrap_param    = aws_ssm_parameter.vault_bootstrap.name
-    audit_enabled      = var.vault_audit_enabled
-    consul_role_arn    = aws_iam_role.node["consul"].arn
-    mesh_pki_path      = local.mesh_pki_path
-    mesh_ca_secret_id  = aws_secretsmanager_secret.mesh_ca.arn
-    inter_pki_path     = local.connect_inter_pki_path
-    node_exporter_url  = local.node_exporter_url
-    scanner_pattern    = var.scanner_pattern
-    scanner_active_cpu = var.scanner_active_cpu
-    arch               = local.arch
+    common              = file("${path.module}/templates/common.sh")
+    name                = var.name
+    node_name           = each.key
+    voter               = each.value.voter
+    permanent_non_voter = !each.value.voter && !var.vault_redundancy_zones # zone spares join as ordinary nodes
+    redundancy_zone     = var.vault_redundancy_zones ? "zone-${each.value.index % var.vault_voter_count}" : ""
+    start_vault         = each.value.voter || var.vault_non_voters_start
+    bootstrap           = each.value.index == 0
+    region              = var.aws_region
+    vault_version       = var.vault_version
+    vault_fqdn          = local.vault_fqdn
+    join_tag            = local.vault_join_tag
+    kms_key_id          = aws_kms_key.vault_unseal.key_id
+    config_secret_id    = aws_secretsmanager_secret.vault_config.arn
+    init_secret_id      = aws_secretsmanager_secret.vault_init.arn
+    bootstrap_param     = aws_ssm_parameter.vault_bootstrap.name
+    audit_enabled       = var.vault_audit_enabled
+    consul_role_arn     = aws_iam_role.node["consul"].arn
+    mesh_pki_path       = local.mesh_pki_path
+    mesh_ca_secret_id   = aws_secretsmanager_secret.mesh_ca.arn
+    inter_pki_path      = local.connect_inter_pki_path
+    node_exporter_url   = local.node_exporter_url
+    scanner_pattern     = var.scanner_pattern
+    scanner_active_cpu  = var.scanner_active_cpu
+    arch                = local.arch
   })
 
   tags = {

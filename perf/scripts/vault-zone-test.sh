@@ -4,7 +4,11 @@
 #   RUN_ID=t12 RATE=3200 vault-zone-test.sh
 #
 # Under a constant signing load (vault-sign-consul-mount.js at RATE through the
-# NLB), it picks a zone with a spare whose voter isn't the active node, then:
+# NLB), it picks a zone with a spare, then:
+#   MODE=standby (default): a zone whose voter isn't the active node, other than
+#                EXCLUDE_ZONE if possible (repeats alternate zones)
+#   MODE=active: the active node's zone, so the freeze also forces an election
+#                (election plus promotion: the realistic worst case)
 #   1. join:    re-adds that spare from scratch (stop, remove-peer, wipe its Raft
 #               data, start), as when a spare is added for scale, and times
 #               joined_s (it appears in Autopilot's server list) and healthy_s
@@ -16,6 +20,8 @@
 #               it was). The voter is thawed (SIGCONT) THAW_AFTER (30s) after
 #               restored, or after FREEZE_MAX (300s) if that never happens, then
 #               recovered_s is when Autopilot is healthy again.
+# The NLB's view of the frozen voter is polled every 2 s (failure.nlb: out_s,
+# back_s): requests reach the frozen node until the NLB marks it unhealthy.
 # Times are seconds from the start command (join) or the freeze (failure),
 # polled every second. Client view per phase, from k6's per-request samples:
 # failed requests, the error window (first to last failure) and the longest gap
@@ -44,16 +50,18 @@ INST=$(aws ec2 describe-instances \
 iid() { jq -r --arg n "$1" '.[] | select(.node == $n) | .id' <<<"$INST"; }
 ipof() { jq -r --arg n "$1" '.[] | select(.node == $n) | .ip' <<<"$INST"; }
 
-# Autopilot state, keys normalised (lower case, no underscores), from the active
-# node directly: through the NLB a poll could land on the frozen node and hang.
+# Autopilot state, keys normalised (lower case, no underscores), from a voter
+# that won't be frozen (POLL_IP) directly: through the NLB a poll could land on
+# the frozen node and hang. Standbys forward the request to the active node, so
+# during an election (MODE=active) polls fail for a few seconds and are retried.
 # The TLS certificate names the NLB host, not node IPs, hence the server name.
 TLS_NAME=${VAULT_ADDR#https://}
 TLS_NAME=${TLS_NAME%%:*}
-LEADER_IP=""
+POLL_IP=""
 ap() {
-  local out
-  if [ -n "$LEADER_IP" ]; then
-    out=$(VAULT_ADDR="https://$LEADER_IP:8200" VAULT_TLS_SERVER_NAME="$TLS_NAME" VAULT_CLIENT_TIMEOUT=3s \
+  local out=""
+  if [ -n "$POLL_IP" ]; then
+    out=$(VAULT_ADDR="https://$POLL_IP:8200" VAULT_TLS_SERVER_NAME="$TLS_NAME" VAULT_CLIENT_TIMEOUT=3s \
       vault operator raft autopilot state -format=json 2>/dev/null) || out=""
   fi
   [ -n "$out" ] || out=$(VAULT_CLIENT_TIMEOUT=3s vault operator raft autopilot state -format=json 2>/dev/null) || return 1
@@ -65,22 +73,27 @@ ap() {
 srv() { jq -c --arg n "$2" '.servers[] | select(.node == $n)' <<<"$1"; } # srv <state> <node>
 is_voter() { jq -e '.status == "voter" or .status == "leader"' >/dev/null 2>&1 <<<"${1:-null}"; }
 
+MODE=${MODE:-standby}
+EXCLUDE_ZONE=${EXCLUDE_ZONE:-}
 st=$(vault-raft-voters.sh status)
 leader=$(jq -r .leader <<<"$st")
-LEADER_IP=$(ipof "$leader")
+POLL_IP=$(ipof "$leader")
 a=$(ap) || { echo "can't read Autopilot state" >&2; exit 1; }
 ft0=$(jq -r .ft <<<"$a")
-pick=$(jq -c --arg l "$leader" '.servers as $s
+pick=$(jq -c --arg l "$leader" --arg mode "$MODE" --arg ex "$EXCLUDE_ZONE" '.servers as $s
   | [$s[] | select(.status == "non-voter" and .zone != "") | .zone as $z
      | {spare: .node, zone: $z,
         voter: ([$s[] | select(.zone == $z and (.status == "voter" or .status == "leader")) | .node] | first)}]
-  | map(select(.voter != null and .voter != $l)) | first // empty' <<<"$a")
+  | map(select(.voter != null and (if $mode == "active" then .voter == $l else .voter != $l end)))
+  | (map(select(.zone != $ex)) + .) | first // empty' <<<"$a")
 if [ -z "$pick" ]; then
-  echo "no redundancy zone with a spare and a voter that isn't the active node; zones: $(jq -c '[.servers[] | {node, zone, status}]' <<<"$a")" >&2
-  exit 1
+  echo "MODE=$MODE: no redundancy zone with a spare and a suitable voter (active node $leader); zones: $(jq -c '[.servers[] | {node, zone, status}]' <<<"$a")" >&2
+  exit 3 # no suitable zone: the caller records a skip
 fi
 SPARE=$(jq -r .spare <<<"$pick"); VOTER=$(jq -r .voter <<<"$pick"); ZONE=$(jq -r .zone <<<"$pick")
-echo "$(date -u +%H:%M:%S) zone $ZONE: voter $VOTER, spare $SPARE (active node $leader, failure tolerance $ft0)"
+# Poll through a voter that won't be frozen.
+POLL_IP=$(ipof "$(jq -r --arg v "$VOTER" '[.voter_nodes[] | select(. != $v)] | first' <<<"$st")")
+echo "$(date -u +%H:%M:%S) MODE=$MODE zone $ZONE: voter $VOTER, spare $SPARE (active node $leader, failure tolerance $ft0)"
 
 T0=$(now_ms)
 idle baseline "$BASELINE"
@@ -127,6 +140,7 @@ idle "zone settle" "$SETTLE"
 
 # --- 2. failure: freeze the zone's voter --------------------------------------
 vid=$(iid "$VOTER")
+nlb_watch_start "$vid" "$OUT/nlb.txt"
 ssm_run $((freeze_max_s + 120)) "rm -f /tmp/zt-thaw; pid=\$(pidof vault); echo freeze_ms=\$(date +%s%3N); kill -STOP \$pid
 i=0; while [ \$i -lt $freeze_max_s ] && [ ! -f /tmp/zt-thaw ]; do sleep 1; i=\$((i + 1)); done
 kill -CONT \$pid; echo thaw_ms=\$(date +%s%3N)" "$vid" > "$OUT/freeze.ssm" &
@@ -161,6 +175,7 @@ for i in $(seq 1 600); do
   sleep 1
 done
 f1=$(now_ms)
+nlb_watch_stop "$OUT/nlb.txt"
 layout=$(jq -c '[.servers[] | {node, zone, status}] | sort_by(.zone, .node)' <<<"${a:-{\}}")
 ft=$(jq -c --argjson t0 "$fms" --argjson th "${tms:-null}" --argjson rc "${rms:-null}" \
   --arg vf "$(jq -r --arg n "$VOTER" '.[] | select(.node == $n) | .status' <<<"$layout")" '
@@ -168,6 +183,7 @@ ft=$(jq -c --argjson t0 "$fms" --argjson th "${tms:-null}" --argjson rc "${rms:-
   {unhealthy_s: s("unhealthy_ms"), promoted_s: s("promoted_ms"), demoted_s: s("demoted_ms"), restored_s: s("restored_ms"),
    thaw_s: (if $th then ($th - $t0) / 1000 else null end), recovered_s: (if $rc then ($rc - $t0) / 1000 else null end),
    frozen_voter_after: $vf}' <<<"$ft")
+ft=$(jq -c --argjson nlb "$(nlb_watch_summary "$OUT/nlb.txt" "$fms")" '. + {nlb: $nlb}' <<<"$ft")
 echo "  failure: $ft"
 
 stop_k6
@@ -203,7 +219,7 @@ gzip -f "$OUT/points.csv"
 
 jq -n --arg zone "$ZONE" --arg voter "$VOTER" --arg spare "$SPARE" --arg leader "$leader" --argjson rate "$RATE" \
   --argjson ft0 "$ft0" --argjson j "$jt" --argjson f "$ft" --argjson c "${client:-{\}}" --argjson layout "$layout" \
-  '{rate: $rate, zone: $zone, voter: $voter, spare: $spare, active_node: $leader, failure_tolerance: $ft0,
+  --arg mode "$MODE" '{mode: $mode, rate: $rate, zone: $zone, voter: $voter, spare: $spare, active_node: $leader, failure_tolerance: $ft0,
     join: ($j + {client: $c.join}), failure: ($f + {client: $c.failure}), layout_after: $layout}' > "$OUT/zones.json"
 jq -c '{zone, voter, spare, join, failure}' "$OUT/zones.json"
 

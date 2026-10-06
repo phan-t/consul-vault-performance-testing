@@ -17,18 +17,20 @@
 # your laptop and credentials aren't needed until `finish`.
 #
 # Options: --yes (terraform -auto-approve), --destroy (finish: destroy without asking),
-#          --t11 (start: the T11 campaign, see above).
+#          --t11 (start: the T11 campaign, see below),
+#          --with-t11 (start: the main campaign plus Stage 4, T11 on the same build).
 # run-plan.sh settings set in your environment are passed through to the
 # campaign (start, continue, resume), e.g. only T5 and T5r, from 800/s:
 #   PLAN_TESTS="settle t5 t5r" T5_START=800 scripts/run-campaign.sh start plan-2
 #
-# The main campaign ends with Stage 4: T11 (Vault Raft latency at 7, 5, 3 voters)
-# after T9-V's non-voters are converted to voters (~20–24 h in all). It needs a
-# Vault license without the pki-only module; verify checks this. To leave
-# Stage 4 out: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12".
+# The main campaign (~13.5-14.5 h) ends with T13 (CA rotation). T11 (Vault Raft latency at 7, 5,
+# 3 voters) is its own campaign on a fresh 7-voter build, because its shrink is
+# one-way. Each campaign runs unattended; switching between them needs a
+# terraform apply, so fresh credentials. --with-t11 instead appends Stage 4 (T11
+# after converting T9-V's spares to voters, ~21-25 h in all) to one unattended
+# run.
 #
-# T11 can also run as its own campaign on a 7-voter build, run the same way
-# (start, status/follow, finish):
+# T11 as its own campaign, run the same way (start, status/follow, finish):
 #   scripts/run-campaign.sh start raft-1 --t11     # settle -> t11smoke -> t11v7 -> t11v5 -> t11v3
 # --t11 writes terraform/raft.auto.tfvars (7 voters, no non-voters) and defaults
 # PLAN_TESTS to the T11 sequence; a start without --t11 removes that profile, and
@@ -45,11 +47,13 @@ PLAN=plan-1
 YES=false
 DESTROY=false
 T11=false
+WITH_T11=false
 for a in "$@"; do
   case "$a" in
   --yes) YES=true ;;
   --destroy) DESTROY=true ;;
   --t11) T11=true ;;
+  --with-t11) WITH_T11=true ;;
   -*) echo "unknown option $a" >&2; exit 1 ;;
   *) PLAN=$a ;;
   esac
@@ -82,7 +86,7 @@ plan_env() {
   local v out=""
   for v in PLAN_TESTS T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX \
     T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE MEM_GUARD_PCT SETTLE_IDLE SETTLE_SCANNER_WAIT \
-    SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT T12_RATE T12_FREEZE_MAX \
+    SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT TARGET_RATE T13_CACHED T13_RATE T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX \
     BASELINE COOLDOWN RAMP HOLD \
     T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE; do
     [ -n "${!v:-}" ] && out+="$v='${!v}' "
@@ -167,8 +171,12 @@ want_voters() { # want_voters vault|consul
   echo "${v:-5}"
 }
 
-# Does this run include T11 (the default plan's Stage 4, or the --t11 campaign)?
-runs_t11() { [ -z "${PLAN_TESTS:-}" ] || grep -qE '(^| )t11' <<<"$PLAN_TESTS"; }
+# --with-t11: every main test, then Stage 4.
+MAIN_TESTS="settle t1 t3 t3r t3c t5 t5r t6 soak burst t3f t14 t2 t9v t12 t15 t13"
+STAGE4_TESTS="t11grow t11smoke t11v7 t11v5 t11v3"
+with_t11() {
+  if $WITH_T11; then PLAN_TESTS=${PLAN_TESTS:-"$MAIN_TESTS $STAGE4_TESTS"}; export PLAN_TESTS; fi
+}
 
 verify() {
   say "Verifying the cluster"
@@ -179,11 +187,8 @@ nv=$(vault operator raft list-peers -format=json | jq "[.data.config.servers[] |
 c=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul operator raft list-peers | tail -n +2 | grep -c true)
 ttl=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul connect ca get-config | jq -r ".Config.LeafCertTTL // .Config.leaf_cert_ttl")
 root=$(CONSUL_HTTP_TOKEN=$CONSUL_OPERATOR_TOKEN consul connect ca get-config | jq -r ".Config.RootPKIPath // .Config.root_pki_path")
-# T11 writes to KV mounts, which a pki-only license refuses.
-kv=refused
-vault secrets enable -path=kv_license_probe kv >/dev/null 2>&1 && vault secrets disable kv_license_probe >/dev/null 2>&1 && kv=ok
 z=$(vault operator raft autopilot state -format=json | jq "[.. | objects | (.redundancy_zone? // .RedundancyZone? // empty) | select(. != \"\")] | unique | length")
-echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$root kv_mounts=$kv vault_zones=$z"')
+echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$root vault_zones=$z"')
   echo "  $out"
   vv=$(want_voters vault); cv=$(want_voters consul)
   grep -q "vault_voters=$vv vault_nonvoters=0 consul_voters=$cv leaf_ttl=168h root=pki_mesh_int" <<<"$out" ||
@@ -192,10 +197,6 @@ echo "vault_voters=$v vault_nonvoters=$nv consul_voters=$c leaf_ttl=$ttl root=$r
   if ! cat "$TF"/*.auto.tfvars 2>/dev/null | grep -Eq '^ *vault_redundancy_zones *= *false'; then
     grep -q "vault_zones=$vv\b" <<<"$out" ||
       die "expected $vv Vault redundancy zones (one per voter): $(grep -o 'vault_zones=[0-9]*' <<<"$out"). Does the license include Autopilot redundancy zones?"
-  fi
-  if runs_t11 && ! grep -q "kv_mounts=ok" <<<"$out"; then
-    die "the Vault license refuses KV mounts (pki-only module), so T11 can't run. Use a full Vault Enterprise license and rebuild, or leave out Stage 4:
-  PLAN_TESTS=\"settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12\" scripts/run-campaign.sh continue $PLAN"
   fi
   echo "  cluster OK: held non-voters not yet joined (T9-V starts them)"
 }
@@ -227,6 +228,7 @@ start() {
 }
 
 after_apply() {
+  with_t11
   if $T11 || [ -f "$RAFT_PROFILE" ]; then PLAN_TESTS=${PLAN_TESTS:-$T11_TESTS}; export PLAN_TESTS; fi
   wait_bootstrap
   verify
@@ -237,7 +239,7 @@ after_apply() {
   on_loadgen "/opt/perf/scripts/sync-assets.sh >/dev/null && cd /opt/perf && $(plan_env)run-plan.sh start $PLAN" 120
   cat <<EOF
 
-The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 … T5r → soak → T9-V → T12 → Stage 4: T11 at 7, 5, 3 voters, ~20–24 h}).
+The campaign is running unattended on loadgen-0 (${PLAN_TESTS:-settle → T1 → T3 → T3r → T3c → T5 → T5r → T6 → soak → burst → T3f → T14 → T2 → T9-V → T12 → T15 → T13, ~13.5-14.5 h}).
   Progress:  scripts/run-campaign.sh status $PLAN    (or follow $PLAN)
   Grafana:   $(tfo '.grafana_url.value // empty')
   When done: refresh AWS credentials, then scripts/run-campaign.sh finish $PLAN
@@ -245,6 +247,7 @@ EOF
 }
 
 resume() {
+  with_t11
   if $T11 || [ -f "$RAFT_PROFILE" ]; then PLAN_TESTS=${PLAN_TESTS:-$T11_TESTS}; export PLAN_TESTS; fi
   # Syncing while run-plan.sh runs would change scripts under it: only resume a stopped plan.
   if on_loadgen "systemctl is-active perf-plan-$PLAN" 30 | grep -qx active; then

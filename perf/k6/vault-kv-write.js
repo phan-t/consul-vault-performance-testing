@@ -8,7 +8,7 @@
 import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
-import { arrivalScenario, commonOptions, env, summary, targetThresholds } from './lib/common.js';
+import { arrivalScenarios, commonOptions, env, summary, targetThresholds } from './lib/common.js';
 
 const VAULT_ADDR = env('VAULT_ADDR', 'https://vault.perf.internal:8200');
 const TOKEN = env('VAULT_TOKEN', '');
@@ -17,10 +17,14 @@ const KEYS = Number(env('KEYS', 10000));
 // Payload size in bytes (a typical small secret).
 const VALUE = 'x'.repeat(Number(env('VALUE_BYTES', 1024)));
 const PREFIX = `${env('PERF_NODE', 'lg')}`;
+// Log the first few failures (status and body) from a handful of VUs, so a
+// failing run says why. raft-1's 64 KiB runs failed 84% of writes, fast
+// (p50 56 ms), and left no trace of the cause.
+let logged = 0;
 
 export const options = {
   ...commonOptions,
-  scenarios: { write: arrivalScenario() },
+  scenarios: arrivalScenarios(),
   thresholds: targetThresholds('kv_write', 100),
 };
 
@@ -35,7 +39,11 @@ export default function () {
       timeout: env('REQ_TIMEOUT', '30s'),
     },
   );
-  check(res, { 'status 200': (r) => r.status === 200 });
+  const ok = check(res, { 'status 200': (r) => r.status === 200 });
+  if (!ok && exec.vu.idInTest <= 5 && logged < 3) {
+    logged += 1;
+    console.warn(`kv_write failed: status ${res.status} ${res.error || ''} ${String(res.body || '').slice(0, 300)}`);
+  }
 }
 
 export function handleSummary(data) {

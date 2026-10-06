@@ -12,7 +12,7 @@ import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
 import { Counter } from 'k6/metrics';
-import { arrivalScenario, commonOptions, env, summary, targetThresholds } from './lib/common.js';
+import { arrivalScenarios, commonOptions, env, summary, targetThresholds } from './lib/common.js';
 
 const ADDR = env('CONSUL_HTTP_ADDR', 'http://127.0.0.1:8500');
 const TOKEN = env('CONSUL_HTTP_TOKEN', '');
@@ -23,7 +23,7 @@ const rateLimited = new Counter('consul_csr_rate_limited');
 
 export const options = {
   ...commonOptions,
-  scenarios: { leaf: arrivalScenario() },
+  scenarios: arrivalScenarios(),
   discardResponseBodies: false,
   // Target: end-to-end leaf p99 <= 1 s, < 0.1% errors (README "Targets").
   thresholds: targetThresholds('leaf', 1000),
@@ -31,7 +31,7 @@ export const options = {
 
 export default function () {
   // Service names must start with "perf-" (perf ACL policy) and be DNS-safe.
-  const svc = `perf-${RUN_ID}-${NODE}-${exec.vu.idInTest}-${exec.vu.iterationInScenario}`.toLowerCase();
+  const svc = `perf-${RUN_ID}-${NODE}-${exec.scenario.name}-${exec.vu.idInTest}-${exec.vu.iterationInScenario}`.toLowerCase();
   const res = http.get(`${ADDR}/v1/agent/connect/ca/leaf/${svc}`, {
     headers: { 'X-Consul-Token': TOKEN },
     tags: { name: 'leaf' },

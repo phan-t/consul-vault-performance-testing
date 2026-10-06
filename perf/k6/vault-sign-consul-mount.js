@@ -10,7 +10,7 @@
 // per sign): PKI_PATH=pki_perf ROLE=leaf-store PKI_TOKEN=$VAULT_TOKEN.
 import http from 'k6/http';
 import { check } from 'k6';
-import { arrivalScenario, commonOptions, env, summary, targetThresholds } from './lib/common.js';
+import { arrivalScenarios, commonOptions, env, summary, targetThresholds } from './lib/common.js';
 
 const csr = open(env('CSR_FILE', '/opt/perf/results/leaf.csr'));
 const VAULT_ADDR = env('VAULT_ADDR', 'https://vault.perf.internal:8200');
@@ -23,7 +23,7 @@ const TTL = env('LEAF_TTL', '168h');
 
 export const options = {
   ...commonOptions,
-  scenarios: { sign: arrivalScenario() },
+  scenarios: arrivalScenarios(),
   // Target: Vault sign p99 <= 100 ms, < 0.1% errors (README "Targets").
   thresholds: targetThresholds('sign', 100),
 };

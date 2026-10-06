@@ -34,8 +34,12 @@ LABEL=${LABEL:-T3c connection test}
 SIGN_TOKEN=${SIGN_TOKEN:-$SIGN_VAULT_TOKEN}
 # Signs per Vault node come from the route metric of SIGN_PATH's mount
 # (vault_route_update_<mount>__count), not lib.sh's Consul-only SIGN_METRIC.
+# Matched by regex: plan-1's T1 found no series under the exact name for
+# pki_perf, so any separator after the mount name is accepted. If the metric
+# is still missing, vault_nodes_busy (mean CPU > 10%) shows the spread instead.
 _mount=${SIGN_PATH%%/*}
-ROUTE_METRIC="vault_route_update_${_mount//[^A-Za-z0-9]/_}__count"
+ROUTE_METRIC="{__name__=~\"vault_route_update_${_mount//[^A-Za-z0-9]/_}_+count\"}"
+P99_MS=${P99_MS:-100}
 
 PROM=$(prom_url || true)
 OUT="$RESULTS_DIR/$RUN_ID-$PERF_NODE-connection-test"
@@ -79,9 +83,12 @@ for mode in $MODES; do
       s_end=$(jq '.end_unix_ms / 1000 | ceil' "$OUT/step.json")
       vnodes=$(prom_query "$PROM" "sum by (instance) (increase(${ROUTE_METRIC}[$((s_end - s_start))s]))" "$s_end" |
         jq -c 'map({(.metric.instance): (.value[1] | tonumber | round)}) | add // {}' || echo null)
+      busy=$(prom_query "$PROM" "count(avg_over_time((100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"vault-.*\"}[1m]))))[$((s_end - s_start))s:10s]) > 10)" "$s_end" |
+        jq -c '.[0].value[1] // "0" | tonumber' || echo null)
     fi
-    jq --argjson v "${vnodes:-null}" '. + {requests_by_vault_node: $v,
-        vault_nodes_serving: (if $v then [$v[] | select(. > 0)] | length else null end)}' \
+    jq --argjson v "${vnodes:-null}" --argjson busy "${busy:-null}" '. + {requests_by_vault_node: $v,
+        vault_nodes_serving: (if $v and ($v | length) > 0 then [$v[] | select(. > 0)] | length else null end),
+        vault_nodes_busy: $busy}' \
       "$OUT/step.json" > "$OUT/step.tmp" && mv "$OUT/step.tmp" "$OUT/step.json"
     jq -c '{mode, concurrency, rps: (.rps | . * 10 | round / 10), p50: .latency_ms.p50, p95: .latency_ms.p95,
             p99: .latency_ms.p99, errors, distinct_connections, vault_nodes_serving}' "$OUT/step.json"
@@ -95,10 +102,19 @@ annotate_end "$AID" "$T3"
 idle cooldown "$COOLDOWN"
 T4=$(now_ms)
 
-jq '. as $s
-  | def best(m): [$s[] | select(.mode == m and .errors == 0)] | max_by(.rps)
-      | if . then {concurrency, rps, p99: .latency_ms.p99, distinct_connections, vault_nodes_serving, requests_by_vault_node} else null end;
-  {steps: $s, single_max: best("single-client"), multi_max: best("multi-client")}
+# single_max / multi_max: the best step within the target (no errors, p99 <=
+# P99_MS); single mode also needs exactly one connection: at high concurrency
+# Go's HTTP/2 client opens more (plan-1's 4045/s "single" used 3 connections,
+# 3 Vault nodes, p99 153 ms). *_max_any is the raw maximum, for reference.
+jq --argjson p99 "$P99_MS" '. as $s
+  | def pick: if . then {concurrency, rps, p99: .latency_ms.p99, distinct_connections, vault_nodes_serving, vault_nodes_busy, requests_by_vault_node} else null end;
+    def ok(m): [$s[] | select(.mode == m and .errors == 0)];
+  {steps: $s,
+   single_max: ([ok("single-client")[] | select(.distinct_connections == 1 and .latency_ms.p99 <= $p99)] | max_by(.rps) | pick),
+   multi_max: ([ok("multi-client")[] | select(.latency_ms.p99 <= $p99)] | max_by(.rps) | pick),
+   single_max_any: (ok("single-client") | max_by(.rps) | pick),
+   multi_max_any: (ok("multi-client") | max_by(.rps) | pick),
+   p99_limit_ms: $p99}
   | .single_to_multi_ratio = (if .single_max and .multi_max.rps > 0 then (.single_max.rps / .multi_max.rps * 100 | round / 100) else null end)' \
   "$OUT/steps.json" > "$OUT/connection-test.json"
 rm -f "$OUT/steps.json"

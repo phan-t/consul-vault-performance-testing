@@ -153,6 +153,104 @@ prom_range() {
     --data-urlencode "start=$3" --data-urlencode "end=$4" --data-urlencode "step=$5" | jq -c .data.result
 }
 
+# guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] -> JSON:
+# leader elections and minimum Autopilot failure tolerance over a window (ok:
+# none, and tolerance >= 2 for Consul, >= the given value for Vault), plus the
+# hosts where a security scanner ran. Used per test (run-plan.sh) and per
+# stress step (stress-k6.sh, where a breach fails the step).
+guardrails() { # guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] -> JSON
+  local prom s e w vmin=${3:-2}
+  prom=$(prom_url 2>/dev/null) || { echo null; return; }
+  s=$(($1 / 1000)); e=$(($2 / 1000)); w=$((e - s))
+  [ "$w" -gt 0 ] || { echo null; return; }
+  q() { prom_query "$prom" "$1" "$e" | jq -r '.[0].value[1] // "null"'; }
+  local scan
+  scan=$(prom_query "$prom" "max by (instance) (max_over_time(perf_scanner_active[${w}s])) > 0" "$e" | jq -c '[.[].metric.instance] | sort' 2>/dev/null || echo '[]')
+  jq -n -c --argjson scan "${scan:-[]}" \
+    --argjson ce "$(q "sum(increase(consul_raft_state_leader[${w}s]))")" \
+    --argjson ve "$(q "sum(changes(vault_core_active[${w}s])) / 2")" \
+    --argjson cf "$(q "min(min_over_time(consul_autopilot_failure_tolerance[${w}s]))")" \
+    --argjson vf "$(q "min(min_over_time(vault_autopilot_failure_tolerance[${w}s]))")" \
+    --argjson vmin "$vmin" \
+    '{consul_elections: ($ce | if . then (. | round) else . end), vault_leader_changes: ($ve | if . then (. | round) else . end),
+      consul_min_failure_tolerance: $cf, vault_min_failure_tolerance: $vf}
+     | .ok = ((.consul_elections // 0) == 0 and (.vault_leader_changes // 0) == 0
+              and (.consul_min_failure_tolerance // 2) >= 2 and (.vault_min_failure_tolerance // $vmin) >= $vmin)
+     | .scanner_hosts = $scan'
+}
+
+# --- server-side latency and Raft storage (per stress step) ------------------
+# prom_num <prom> <expr> <time s>: one number from an instant query (null if none).
+prom_num() {
+  prom_query "$1" "$2" "$3" 2>/dev/null |
+    jq -c '.[0].value[1] // null | if . == null or . == "NaN" or . == "+Inf" then null else (tonumber | . * 100 | round / 100) end' 2>/dev/null || echo null
+}
+# summary_stats <prom> <metric base> <label selector, e.g. method="X" or ""> <start s> <end s>:
+# {mean_ms, p99_ms} for a go-metrics summary (timers are in ms): the mean from
+# _sum/_count across nodes, p99 the highest node's 0.99 quantile averaged over the window.
+summary_stats() {
+  local p=$1 m=$2 sel=$3 s=$4 e=$5 w=$(($5 - $4)) c
+  c=${sel:+,$sel}
+  jq -n -c --argjson mean "$(prom_num "$p" "sum(increase({__name__=~\"${m}_sum\"$c}[${w}s])) / sum(increase({__name__=~\"${m}_count\"$c}[${w}s]))" "$e")" \
+    --argjson p99 "$(prom_num "$p" "max(avg_over_time(({__name__=~\"${m}\",quantile=\"0.99\"$c} >= 0)[${w}s:15s]))" "$e")" \
+    '{mean_ms: $mean, p99_ms: $p99}'
+}
+# server_latency <prom> <start s> <end s>: where the time goes, server side.
+#   vault_sign      Vault's route timer for signs on Consul's intermediate(s)
+#   vault_request   every Vault request (vault.core.handle_request)
+#   consul_sign     the Consul leader's ConnectCA.Sign RPC (consul.rpc.server.call)
+server_latency() {
+  local p=$1 s=$2 e=$3
+  [ $((e - s)) -gt 0 ] || { echo null; return; }
+  jq -n -c --argjson vs "$(summary_stats "$p" 'vault_route_update_connect_.+_inter_' '' "$s" "$e")" \
+    --argjson vr "$(summary_stats "$p" 'vault_core_handle_request' '' "$s" "$e")" \
+    --argjson cs "$(summary_stats "$p" 'consul_rpc_server_call' 'method="ConnectCA.Sign"' "$s" "$e")" \
+    '{vault_sign: $vs, vault_request: $vr, consul_sign: $cs}'
+}
+# vault_storage <prom> <start s> <end s>: Raft's storage on the Vault nodes.
+#   store_logs     appending to Raft's log, fsync included (vault.raft.boltdb.storeLogs)
+#   bolt_write     BoltDB write transactions (vault.raft_storage.bolt.write.time)
+#   disk_write_ms  the slowest Vault disk's mean write latency (node_exporter)
+#   data_mb        the largest /opt/vault/data usage at the end, and its growth
+vault_storage() {
+  local p=$1 s=$2 e=$3 w=$(($3 - $2)) used='(node_filesystem_size_bytes{mountpoint="/opt/vault/data"} - node_filesystem_avail_bytes{mountpoint="/opt/vault/data"}) / 1048576'
+  [ "$w" -gt 0 ] || { echo null; return; }
+  jq -n -c --argjson sl "$(summary_stats "$p" 'vault_raft_boltdb_storeLogs' '' "$s" "$e")" \
+    --argjson bw "$(summary_stats "$p" 'vault_raft_storage_bolt_write_time' '' "$s" "$e")" \
+    --argjson dw "$(prom_num "$p" "max(rate(node_disk_write_time_seconds_total{instance=~\"vault-.*\"}[${w}s]) / (rate(node_disk_writes_completed_total{instance=~\"vault-.*\"}[${w}s]) > 0)) * 1000" "$e")" \
+    --argjson d1 "$(prom_num "$p" "max($used)" "$e")" --argjson d0 "$(prom_num "$p" "max($used)" "$s")" \
+    '{store_logs: $sl, bolt_write: $bw, disk_write_ms: $dw, data_mb: $d1,
+      data_growth_mb: (if $d1 and $d0 then ($d1 - $d0) * 100 | round / 100 else null end)}'
+}
+
+# --- NLB target health (failure tests) --------------------------------------
+# nlb_watch_start <instance id> <file>: poll the Vault NLB's view of one target
+# every 2 s in the background, appending "<ms> <state>" (healthy, unhealthy,
+# draining, initial, unused). nlb_watch_stop <file> stops it.
+# nlb_watch_summary <file> <t0 ms> -> JSON: when the NLB first stopped calling
+# the target healthy after t0 (out_s), and when it was healthy again (back_s).
+nlb_tg_arn() {
+  aws elbv2 describe-target-groups --names "$PERF_NAME-vault" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null
+}
+nlb_watch_start() {
+  local tg
+  tg=$(nlb_tg_arn) || return 0
+  [ -n "$tg" ] && [ "$tg" != None ] || return 0
+  (while :; do
+    echo "$(date +%s%3N) $(aws elbv2 describe-target-health --target-group-arn "$tg" --targets "Id=$1,Port=8200" \
+      --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text 2>/dev/null || echo unknown)"
+    sleep 2
+  done) >> "$2" 2>/dev/null &
+  echo $! > "$2.pid"
+}
+nlb_watch_stop() { [ -f "$1.pid" ] && kill "$(cat "$1.pid")" 2>/dev/null; rm -f "$1.pid"; return 0; }
+nlb_watch_summary() {
+  [ -s "$1" ] || { echo null; return; }
+  awk -v t0="$2" '$1 >= t0 { if (!out && $2 != "healthy" && $2 != "unknown") out = $1; else if (out && !back && $2 == "healthy") back = $1 }
+    END { printf "{\"out_s\": %s, \"back_s\": %s, \"health_check\": \"every 10 s, unhealthy after 2\"}\n",
+      (out ? (out - t0) / 1000 : "null"), (back ? (back - t0) / 1000 : "null") }' "$1"
+}
+
 # server_cpu <prom> <start s> <end s>: the Vault or Consul server with the
 # highest mean CPU over a window, as {instance, cpu_pct} (null if unknown).
 # The mean, not the 10 s peak: one busy scrape shouldn't fail a step.

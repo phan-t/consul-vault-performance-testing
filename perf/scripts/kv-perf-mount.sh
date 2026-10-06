@@ -1,6 +1,5 @@
 #!/bin/bash
-# KV v2 mount for T11 (vault-kv-write.js). Needs a Vault license without the
-# pki-only module (a PKI-only license refuses kv mounts; t11smoke catches it).
+# KV v2 mount for T11 (vault-kv-write.js).
 #   kv-perf-mount.sh create    kv_perf/ (KV v2, max_versions=1, so overwrites don't grow the data)
 #   kv-perf-mount.sh destroy   disable kv_perf/
 # Idempotent. Uses VAULT_TOKEN (root, from env.sh).

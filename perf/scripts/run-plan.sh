@@ -2,12 +2,19 @@
 # Run the TEST-PLAN.md test sequence unattended on a load generator.
 #
 #   run-plan.sh start [PLAN]    launch detached (systemd unit perf-plan-<PLAN>):
-#                               settle -> T1 -> T2 -> T3 -> T3c -> T5 -> T6 -> T3r
-#                               -> T5r -> soak -> T9-V -> T12 -> Stage 4: t11grow -> t11smoke
-#                               -> t11v7 -> t11v5 -> t11v3
+#                               settle -> T1 -> T3 -> T3r -> T3c -> T5 -> T5r -> T6
+#                               -> soak -> burst -> T3f -> T14 -> T2 -> T9-V -> T12
+#                               -> T15 -> T13
+#                               (Stage 4, opt-in: t11grow -> t11smoke -> t11v7 -> t11v5 -> t11v3)
 #   run-plan.sh status [PLAN]   progress, key numbers, RESULTS.md
 #   run-plan.sh stop [PLAN]     stop (Consul CSR limits are restored)
-#   run-plan.sh t9v [PLAN]      run (or re-run) only T9-V
+#   run-plan.sh t9v|t12 [PLAN]  run (or re-run) only T9-V or T12
+#
+# Order: each boundary repeat (T3r, T5r) straight after its stress test, while
+# the cluster state is the same; T2 (1.2 M stored certificates in plan-1, and
+# Raft's files never shrink) after everything that measures Vault on a clean
+# store; T9-V, T12 and T15 late, as they add and rearrange nodes; T13 last, as
+# it leaves Consul's CA rotated.
 #
 # Fully unattended when Stage 0 provisions the Vault non-voters held
 # (vault_non_voter_count = 2, vault_non_voters_start = false): T9-V starts them
@@ -28,16 +35,31 @@
 # T12 (redundancy zones, needs vault_redundancy_zones and T9-V's spares in Raft):
 # under signing load at T12_RATE (default half T3's last pass), re-add a zone
 # spare from scratch and time its join, then SIGSTOP that zone's voter and time
-# Autopilot promoting the spare (vault-zone-test.sh). Skipped without zones.
+# Autopilot promoting the spare (vault-zone-test.sh). T12_REPEATS (3) runs in
+# zones whose voter isn't active, alternating zones, then one in the active
+# node's zone (election plus promotion). Skipped without zones.
 #
-# Stage 4 runs T11 (Vault Raft commit latency vs voter count: t11v7 t11v5
-# t11v3) last, on the same build: t11grow turns T9-V's two non-voters into
+# burst: leafs through Consul with its CSR limit SET to BURST_CSR_RATE (350/s):
+# 20,000 in a minute and 100,000 in 10 minutes (BURST_SPECS).
+# t3f: SIGSTOP the Vault node the Consul leader signs through for 60 s under
+# T3F_RATE of leafs (consul-vault-failover.sh).
+# t14: SIGSTOP the Consul leader for 60 s under T14_RATE of leafs, T14_REPEATS
+# times (consul-leader-failover.sh): election plus the new leader's CA setup.
+# t15: restart every Vault node in Raft, the active one last, under T15_RATE of
+# leafs (vault-rolling-restart.sh).
+# t13: CA rotation under load (ca-rotation-test.sh): T13_CACHED leafs cached on
+# the agent, CSR limit BURST_CSR_RATE, then the signing CA and the root are
+# rotated; the root rotation re-issues every cached leaf.
+# Rates default to TARGET_RATE (350/s, README Targets: a 100,000-sidecar mesh).
+#
+# Stage 4 (opt-in: PLAN_TESTS must name it; run-campaign.sh --with-t11) runs T11
+# (Vault Raft commit latency vs voter count: t11v7 t11v5 t11v3) last, on the
+# same build: t11grow turns T9-V's two non-voters into
 # voters (vault-raft-voters.sh convert: stop, remove-peer, wipe Raft data,
 # retry_join_as_non_voter = false, start), giving 7 voters spread 3/2/2, and
 # records each node's join and Autopilot promotion time. T11 also runs as its
 # own campaign on a vault_voter_count = 7 build (below). Either way it needs
-# no non-voters in Raft and a Vault license without the pki-only module (KV
-# mounts). Each size shrinks Vault in place first
+# no non-voters in Raft. Each size shrinks Vault in place first
 # (vault-raft-voters.sh: stop + remove-peer of 2 non-active voters, AZ spread
 # kept), then one chained timeline (one baseline, one cooldown, like T3/T5): a
 # KV v2 write stress over a fixed rate grid (vault-kv-write.js, T11_KV_RATES,
@@ -54,8 +76,8 @@
 #   PLAN_TESTS="settle t11smoke t11v7 t11v5 t11v3" run-plan.sh start raft-1
 # (scripts/run-campaign.sh start raft-1 --t11 builds and starts exactly this.)
 #
-# PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order), e.g.
-# everything but Stage 4: PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12".
+# PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order); empty
+# runs every test except Stage 4.
 #   run-plan.sh run [PLAN]      run in the foreground (what `start` launches)
 #
 # PLAN defaults to plan-<UTC date>. RUN_IDs are <PLAN>-t1, <PLAN>-t3, ...
@@ -63,11 +85,13 @@
 # uploaded to s3://<bucket>/results/<PLAN>-plan/. Re-running resumes: completed
 # tests are skipped. Decisions carried between tests:
 #   T1 knee (last worker level that still added >= 10% throughput) -> T2 WORKERS
-#   T3/T5 last pass / first fail -> refinement rate (midpoint) and T9-V START
-# A step, refinement or soak also fails when a Vault or Consul server's mean CPU
-# over its hold exceeds SERVER_CPU_MAX (90%; the soak: SOAK_CPU_MAX, 80%).
+#   T3/T5 last pass / first fail -> boundary repeats at last pass, midpoint and
+#     first fail (T3r/T5r: the ceiling as a range, confirmed..failed_at) and T9-V START
+# A step, repeat or soak also fails when a Vault or Consul server's mean CPU
+# over its hold exceeds SERVER_CPU_MAX (90%; the soak: SOAK_CPU_MAX, 80%), and
+# a step or repeat when a guardrail breaks during its hold.
 #
-# soak: SOAK_RATE (200/s, the target) through Consul (consul-leaf.js, CSR limits
+# soak: SOAK_RATE (TARGET_RATE, 350/s) through Consul (consul-leaf.js, CSR limits
 # removed) for SOAK_HOLD (2h) on the 5 voters. Fails on errors >= 0.01%
 # (SOAK_MAX_ERROR_RATE), p99 > 1 s, < 95% delivered or server CPU over
 # SOAK_CPU_MAX; warns when server memory, Go heap or file descriptors grow more
@@ -103,22 +127,43 @@ T3C_STEP=${T3C_STEP:-60s}
 T6_RATE=${T6_RATE:-100}
 SERVER_CPU_MAX=${SERVER_CPU_MAX:-90}
 export SERVER_CPU_MAX
-SOAK_RATE=${SOAK_RATE:-200}
+# The target (README Targets): 100,000 sidecars; a rolling Consul server restart
+# re-issues ~20,000 leafs in ~1 minute (~333/s), and a 2x-growth cold start
+# 200,000 in 10 minutes (~333/s). Rounded up to 350/s. Every target-derived
+# default follows it.
+TARGET_RATE=${TARGET_RATE:-350}
+T3_START=${T3_START:-$TARGET_RATE}
+SOAK_RATE=${SOAK_RATE:-$TARGET_RATE}
 SOAK_HOLD=${SOAK_HOLD:-2h}
 SOAK_MAX_ERROR_RATE=${SOAK_MAX_ERROR_RATE:-0.0001}
 SOAK_CPU_MAX=${SOAK_CPU_MAX:-80}
 SOAK_DRIFT_PCT=${SOAK_DRIFT_PCT:-10}
+# T3 and T5 start at the target: plan-1's steps below it only showed a flat line.
+T5_START=${T5_START:-$TARGET_RATE}
+BURST_CSR_RATE=${BURST_CSR_RATE:-$TARGET_RATE}
+# 20,000 leafs in 60 s (a rolling restart), 100,000 in 10 minutes (the mesh).
+BURST_SPECS=${BURST_SPECS:-"334:60s 167:10m"}
+T3F_RATE=${T3F_RATE:-$TARGET_RATE}
+T13_CACHED=${T13_CACHED:-100000}
+T13_RATE=${T13_RATE:-50}
+T14_RATE=${T14_RATE:-$TARGET_RATE}
+T14_REPEATS=${T14_REPEATS:-3}
+T15_RATE=${T15_RATE:-$TARGET_RATE}
+T12_REPEATS=${T12_REPEATS:-3}
+T12_FREEZE_MAX=${T12_FREEZE_MAX:-300s}
 SETTLE_APT=${SETTLE_APT:-1}
 SETTLE_IDLE=${SETTLE_IDLE:-10m}
 SETTLE_MAX_CPU=${SETTLE_MAX_CPU:-15}
 SETTLE_SCANNER_WAIT=${SETTLE_SCANNER_WAIT:-60m}
-# The same rate grid at every voter count: T3's rates (200/s doubling, to T3's
-# 12800 max) plus midpoints near saturation, where the leader's fan-out to N-1
-# followers shows. Stops at the first failing rate, so unreached rates cost nothing.
-T11_KV_RATES=${T11_KV_RATES:-"200 400 800 1600 2400 3200 4800 6400 9600 12800"}
+# The same rate grid at every voter count, fine where it matters: raft-1 hit
+# saturation at 1600/s at every size (delivered 0.60, p99 27 s), so 2400-12800
+# were never reached and 800 -> 1600 was too coarse. Stops at the first failure.
+T11_KV_RATES=${T11_KV_RATES:-"200 400 600 800 1000 1200 1600"}
 T11_KV_REPEATS=${T11_KV_REPEATS:-2}
 # Value sizes for the payload sweep, at T11_PAYLOAD_RATE (on the grid, so 1 KiB is its reference).
-T11_PAYLOADS=${T11_PAYLOADS:-"16384 65536"}
+# Not 64 KiB: raft-1 failed 84% of those writes in every run (cause unrecorded;
+# vault-kv-write.js now logs failures), so it measured errors, not latency.
+T11_PAYLOADS=${T11_PAYLOADS:-"16384 32768"}
 T11_PAYLOAD_RATE=${T11_PAYLOAD_RATE:-400}
 # T11 steps keep the plan's 2m warm-up (it absorbs carry-over, e.g. from the
 # failed last step of one KV run into the next run's 200/s) but hold 5m, not
@@ -131,11 +176,15 @@ T11_HOLD=${T11_HOLD:-5m}
 # p99 > 1 s, errors >= 0.1% or < 95% delivered.
 T11_KV_P99_MS=${T11_KV_P99_MS:-1000}
 T11_RESIZE_SETTLE=${T11_RESIZE_SETTLE:-2m}
-T11_FAILOVER_REPEATS=${T11_FAILOVER_REPEATS:-3}
+T11_FAILOVER_REPEATS=${T11_FAILOVER_REPEATS:-5}
 # The freeze must outlast detection + election + takeover: 8-11 s to a new
 # active node in the raft-1 run, so 60 s leaves ample room.
 T11_FREEZE=${T11_FREEZE:-60s}
 PLAN_TESTS=${PLAN_TESTS:-}
+# Stage 4 (T11 on this build) runs only when PLAN_TESTS names it: its shrink
+# is one-way, so a failure there costs a rebuild, and a fresh 7-voter build
+# (run-campaign.sh start raft-1 --t11) is the cleaner T11 baseline.
+OPT_IN_TESTS="t11grow t11smoke t11v7 t11v5 t11v3"
 
 # --- state helpers ------------------------------------------------------------
 sget() { jq -r "$1 // empty" "$STATE"; }
@@ -169,37 +218,26 @@ limits_restore() {
 }
 
 # --- guardrails over a test window --------------------------------------------
-guardrails() { # guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] -> JSON
-  local prom s e w vmin=${3:-2}
-  prom=$(prom_url 2>/dev/null) || { echo null; return; }
-  s=$(($1 / 1000)); e=$(($2 / 1000)); w=$((e - s))
-  [ "$w" -gt 0 ] || { echo null; return; }
-  q() { prom_query "$prom" "$1" "$e" | jq -r '.[0].value[1] // "null"'; }
-  local scan
-  scan=$(prom_query "$prom" "max by (instance) (max_over_time(perf_scanner_active[${w}s])) > 0" "$e" | jq -c '[.[].metric.instance] | sort' 2>/dev/null || echo '[]')
-  jq -n -c --argjson scan "${scan:-[]}" \
-    --argjson ce "$(q "sum(increase(consul_raft_state_leader[${w}s]))")" \
-    --argjson ve "$(q "sum(changes(vault_core_active[${w}s])) / 2")" \
-    --argjson cf "$(q "min(min_over_time(consul_autopilot_failure_tolerance[${w}s]))")" \
-    --argjson vf "$(q "min(min_over_time(vault_autopilot_failure_tolerance[${w}s]))")" \
-    --argjson vmin "$vmin" \
-    '{consul_elections: ($ce | if . then (. | round) else . end), vault_leader_changes: ($ve | if . then (. | round) else . end),
-      consul_min_failure_tolerance: $cf, vault_min_failure_tolerance: $vf}
-     | .ok = ((.consul_elections // 0) == 0 and (.vault_leader_changes // 0) == 0
-              and (.consul_min_failure_tolerance // 2) >= 2 and (.vault_min_failure_tolerance // $vmin) >= $vmin)
-     | .scanner_hosts = $scan'
-}
 
 # --- stress.json helpers --------------------------------------------------------
 stress_file() { echo "$RESULTS_DIR/$1-$PERF_NODE-stress-$2/stress.json"; }
-stress_values() { # -> {last_pass, first_fail, stop_reason, knee}
+stress_values() { # -> {last_pass, first_fail, stop_reason, knee, at_last_pass}
   # Invalid steps (load generator out of memory) are neither a pass nor a fail.
-  jq -c '{last_pass: .last_pass_rate, first_fail: ([.steps[] | select((.pass | not) and (.invalid | not)) | .rate] | first),
-          invalid_rate, stop_reason, knee: .knee_between}' "$1"
+  jq -c '.last_pass_rate as $lp | {last_pass: $lp, first_fail: ([.steps[] | select((.pass | not) and (.invalid | not)) | .rate] | first),
+          invalid_rate, stop_reason, knee: .knee_between,
+          at_last_pass: ([.steps[] | select(.rate == $lp)] | first | if . then {p99_ms, server_cpu_mean, server_latency, vault_storage} else null end)}' "$1"
 }
 midpoint() { # midpoint <values-json> -> rate or empty
   jq -r 'if .last_pass and .first_fail then ((.last_pass + .first_fail) / 2 | floor)
          elif .first_fail then (.first_fail / 2 | floor) else empty end' <<<"$1"
+}
+
+# Idle windows: every test starts with a full BASELINE and ends with a full
+# COOLDOWN (5m each). Runs inside one test (boundary repeats, bursts, T12's
+# repeats) are separated by GROUP_GAP (1m) of cooldown plus 1m of baseline.
+GROUP_GAP=${GROUP_GAP:-1m}
+group_idle() { # group_idle <run index, from 1> <runs> -> "<baseline> <cooldown>"
+  echo "$([ "$1" -eq 1 ] && echo "$BASELINE" || echo "$GROUP_GAP") $([ "$1" -eq "$2" ] && echo "$COOLDOWN" || echo "$GROUP_GAP")"
 }
 
 # --- tests ------------------------------------------------------------------------
@@ -256,9 +294,9 @@ t1() {
   knee=$(jq -c '[.steps[] | select(.errors == 0)] | sort_by(.concurrency) as $l
     | ([range(1; $l | length) | select($l[.].rps < 1.1 * $l[. - 1].rps)] | first) as $i
     | (if $i then $l[$i - 1] else $l[-1] end)
-    | {workers: .concurrency, rps: (.rps | . * 10 | round / 10), p99_ms: .latency_ms.p99, vault_nodes_serving}' "$res")
+    | {workers: .concurrency, rps: (.rps | . * 10 | round / 10), p99_ms: .latency_ms.p99, vault_nodes_serving, vault_nodes_busy}' "$res")
   sset '.values.t1' "$(jq -c --slurpfile r "$res" '{knee: ., levels: [$r[0].steps[] | {workers: .concurrency,
-      rps: (.rps | . * 10 | round / 10), p99_ms: .latency_ms.p99, errors, vault_nodes_serving, requests_by_vault_node}]}' <<<"$knee")"
+      rps: (.rps | . * 10 | round / 10), p99_ms: .latency_ms.p99, errors, vault_nodes_serving, vault_nodes_busy, requests_by_vault_node}]}' <<<"$knee")"
   log "T1 knee: $knee"
 }
 
@@ -294,11 +332,11 @@ t5() {
     stress-k6.sh /opt/perf/k6/consul-leaf.js
   limits_restore
   trap - EXIT
-  sset '.values.t5' "$(stress_file "$PLAN-t5" consul-leaf | xargs -I{} jq -c '{last_pass: .last_pass_rate,
-      first_fail: ([.steps[] | select((.pass | not) and (.invalid | not)) | .rate] | first), invalid_rate,
-      stop_reason, knee: .knee_between,
+  local f
+  f=$(stress_file "$PLAN-t5" consul-leaf)
+  sset '.values.t5' "$(jq -c --argjson v "$(stress_values "$f")" '$v + {
       loadgen_min_mem_pct: ([.steps[].loadgen_min_mem_pct // empty] | min),
-      max_consul_vault_connections: ([.steps[].sign_nodes.consul_vault_connections_max // empty] | max)}' {})"
+      max_consul_vault_connections: ([.steps[].sign_nodes.consul_vault_connections_max // empty] | max)}' "$f")"
 }
 
 t6() {
@@ -309,34 +347,66 @@ t6() {
     "$RESULTS_DIR/$PLAN-t6-$PERF_NODE-signing-distribution/distribution.json")"
 }
 
+# refine: repeat the boundary of a stress test, one full-hold run each at its
+# last passing rate, the midpoint and its first failing rate. A single run at
+# each is not enough to set csr_max_per_second: T5 at 1600/s gave p99 176 ms in
+# plan-1 and 35 ms in plan-2. The ceiling is reported as a range:
+#   confirmed  the highest rate that passed in the stress test AND here (with
+#              every repeated rate below it passing too)
+#   failed_at  the lowest rate that failed in either
+# Same pass criterion as a stress step: thresholds pass, >= MIN_ACHIEVED
+# delivered, server CPU <= SERVER_CPU_MAX, guardrails ok.
 refine() { # refine <id> <source values key> <script> <limits: yes|no>
-  local id=$1 src=$2 script=$3 lim=$4 vals rate rc dir
+  local id=$1 src=$2 script=$3 lim=$4 vals mid rates rate rc dir run g runs='[]'
   vals=$(sget ".values.$src | tojson")
-  rate=$(midpoint "${vals:-{\}}")
-  if [ -z "$rate" ]; then
-    log "$id: no pass/fail boundary in $src ($(jq -r '.stop_reason // "no data"' <<<"${vals:-{\}}")); skipped"
+  vals=${vals:-{\}}
+  mid=$(midpoint "$vals")
+  rates=$(jq -r --arg m "$mid" '[.last_pass, ($m | tonumber? // null), .first_fail] | map(select(. != null)) | unique | .[]' <<<"$vals")
+  if [ -z "$rates" ]; then
+    log "$id: no pass/fail boundary in $src ($(jq -r '.stop_reason // "no data"' <<<"$vals")); skipped"
     sset ".values.$id" '{"skipped": true}'
     return 0
   fi
+  log "$id: repeating $src's boundary at $(echo $rates | tr ' ' '/')/s"
   if [ "$lim" = yes ]; then limits_remove; trap limits_restore EXIT; fi
-  case "$script" in *consul-leaf.js) restart_consul_agent ;; esac
-  set +e
-  RUN_ID="$PLAN-$id" RATE="$rate" run-k6.sh "$script"
-  rc=$?
-  set -e
+  local i=0 n b c
+  n=$(wc -w <<<"$rates")
+  for rate in $rates; do
+    i=$((i + 1)); read -r b c < <(group_idle "$i" "$n")
+    case "$script" in *consul-leaf.js) restart_consul_agent ;; esac
+    set +e
+    RUN_ID="$PLAN-$id-r$rate" RATE="$rate" BASELINE="$b" COOLDOWN="$c" run-k6.sh "$script"
+    rc=$?
+    set -e
+    dir="$RESULTS_DIR/$PLAN-$id-r$rate-$PERF_NODE-k6-$(basename "$script" .js)"
+    g=null
+    if prom=$(prom_url 2>/dev/null) && read -r gs ge < <(steady_window "$dir"); then
+      g=$(guardrails $((gs * 1000)) $((ge * 1000)) | jq -c 'del(.scanner_hosts)')
+    fi
+    run=$(jq -c --argjson rate "$rate" --argjson rc "$rc" --argjson min "${MIN_ACHIEVED:-0.95}" \
+      --argjson scpu "$(steady_server_cpu "$dir")" --argjson cmax "$SERVER_CPU_MAX" --argjson g "${g:-null}" '.metrics as $m
+      | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
+      | ($m.iterations.values.count // 0) as $it | ($m.dropped_iterations.values.count // 0) as $dr
+      | {rate: $rate, thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
+         delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
+         p99_ms: ($d["p(99)"] | . * 100 | round / 100)}
+      | .server_cpu_mean = $scpu | .cpu_saturated = ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax) | .guardrails = $g
+      | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_saturated | not) and ($g.ok // true))' "$dir/summary.json" |
+      jq -c --argjson m "$(cat "$dir/loadgen-mem-min-pct" 2>/dev/null || echo null)" '. + {loadgen_min_mem_pct: $m}')
+    log "$id: $(jq -c '{rate, pass, p99_ms, delivered, server_cpu: .server_cpu_mean.cpu_pct}' <<<"$run")"
+    runs=$(jq -c --argjson r "$run" '. + [$r]' <<<"$runs")
+  done
   if [ "$lim" = yes ]; then limits_restore; trap - EXIT; fi
-  dir="$RESULTS_DIR/$PLAN-$id-$PERF_NODE-k6-$(basename "$script" .js)"
-  # Same pass criterion as a stress step: thresholds pass, >= MIN_ACHIEVED delivered, server CPU <= SERVER_CPU_MAX.
-  sset ".values.$id" "$(jq -c --argjson rate "$rate" --argjson rc "$rc" --argjson min "${MIN_ACHIEVED:-0.95}" \
-    --argjson scpu "$(steady_server_cpu "$dir")" --argjson cmax "$SERVER_CPU_MAX" '.metrics as $m
-    | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
-    | ($m.iterations.values.count // 0) as $it | ($m.dropped_iterations.values.count // 0) as $dr
-    | {rate: $rate, thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
-       delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
-       p99_ms: ($d["p(99)"] | . * 100 | round / 100)}
-    | .server_cpu_mean = $scpu | .cpu_saturated = ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax)
-    | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_saturated | not))' "$dir/summary.json" |
-    jq -c --argjson m "$(cat "$dir/loadgen-mem-min-pct" 2>/dev/null || echo null)" '. + {loadgen_min_mem_pct: $m}')"
+  sset ".values.$id" "$(jq -c -n --argjson runs "$runs" --argjson v "$vals" '
+    ($runs | sort_by(.rate)) as $r
+    | ([$r[] | select(.thresholds != "invalid")]) as $valid
+    | {runs: $r,
+       confirmed: ([foreach $valid[] as $x (true; . and $x.pass; if . then $x.rate else empty end)] | max),
+       # A stress failure that passes on repeat was noise: it does not bound the ceiling.
+       failed_at: ([$valid[] | select(.pass | not) | .rate]
+                   + [$v.first_fail // empty | select(. as $f | any($valid[]; .rate == $f and .pass) | not)] | min),
+       stress: {last_pass: $v.last_pass, first_fail: $v.first_fail}}
+    | .reproduced = ((.confirmed // 0) >= ($v.last_pass // 0))')"
 }
 # steady_server_cpu <run dir>: server_cpu over the run's steady phase (null if unknown).
 steady_server_cpu() {
@@ -383,6 +453,100 @@ soak() {
   [ "$(sget '.values.soak.pass')" = true ]
 }
 
+# burst: the bursts the target was sized for, with Consul's CSR limit SET (to
+# BURST_CSR_RATE, default the 350/s target, i.e. the value being recommended)
+# rather than removed: does the limiter shed load cleanly, and do the leafs
+# still arrive? Each spec in BURST_SPECS is <rate>:<duration>:
+#   334:60s  a rolling Consul server restart: 20,000 sidecars in a minute (README Targets)
+#   167:10m  the whole 100,000-sidecar mesh in 10 minutes
+# Leafs refused by the limiter are counted (consul_csr_rate_limited) as well as
+# failed; the agent retries them, so p99 shows the cost of the limit.
+burst() {
+  local spec rate hold rc dir out='[]'
+  limits_remove; trap limits_restore EXIT
+  log "burst: Consul CSR limit $BURST_CSR_RATE/s"
+  consul-ca-limits.sh "$BURST_CSR_RATE" 0 >/dev/null
+  local i=0 n b c
+  n=$(wc -w <<<"$BURST_SPECS")
+  for spec in $BURST_SPECS; do
+    rate=${spec%%:*}; hold=${spec#*:}
+    i=$((i + 1)); read -r b c < <(group_idle "$i" "$n")
+    restart_consul_agent
+    set +e
+    RUN_ID="$PLAN-burst-r$rate" RATE="$rate" RAMP=0 HOLD="$hold" BASELINE="$b" COOLDOWN="$c" run-k6.sh /opt/perf/k6/consul-leaf.js
+    rc=$?
+    set -e
+    dir="$RESULTS_DIR/$PLAN-burst-r$rate-$PERF_NODE-k6-consul-leaf"
+    out=$(jq -c --slurpfile s "$dir/summary.json" --argjson rate "$rate" --arg hold "$hold" --argjson rc "$rc" '. + [$s[0].metrics as $m
+      | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
+      | ([$m | to_entries[] | select(.key | startswith("http_req_failed{name:"))][0].value.values) as $f
+      | {rate: $rate, hold: $hold, leafs: ($m.iterations.values.count // 0), dropped: ($m.dropped_iterations.values.count // 0),
+         failed: ($f.passes // 0), rate_limited: ($m.consul_csr_rate_limited.values.count // 0),
+         p50_ms: ($d.med | . * 10 | round / 10), p99_ms: ($d["p(99)"] | . * 10 | round / 10), max_ms: ($d.max | round),
+         pass: ($rc == 0)}]' <<<"$out")
+    log "burst $spec: $(jq -c '.[-1]' <<<"$out")"
+  done
+  limits_restore; trap - EXIT
+  sset '.values.burst' "$(jq -c --argjson lim "$BURST_CSR_RATE" '{csr_max_per_second: $lim, runs: .}' <<<"$out")"
+  [ "$(jq '[.[].pass] | all' <<<"$out")" = true ]
+}
+
+# t3f: freeze the Vault node Consul's leader signs through, under leafs at T3F_RATE.
+t3f() {
+  limits_remove; trap limits_restore EXIT
+  set +e
+  RUN_ID="$PLAN-t3f" RATE="$T3F_RATE" consul-vault-failover.sh
+  local rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  [ "$rc" -eq 0 ] || return 1
+  # The freeze lowers Vault's failure tolerance by 1 on purpose (and, if the frozen
+  # node was active, elects a new leader: expected, see frozen_was_active).
+  sset '.values.t3f' "$(jq -c '. + {expected_failure_tolerance: 1}' "$RESULTS_DIR/$PLAN-t3f-$PERF_NODE-t3f/t3f.json")"
+}
+
+# t14: freeze the Consul leader under leafs at T14_RATE, T14_REPEATS times.
+t14() {
+  limits_remove; trap limits_restore EXIT
+  set +e
+  RUN_ID="$PLAN-t14" RATE="$T14_RATE" REPEATS="$T14_REPEATS" consul-leader-failover.sh
+  local rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  [ "$rc" -eq 0 ] || return 1
+  sset '.values.t14' "$(jq -c '{new_leader_s, max_gap_s, recovered_s, first_leaf_after_leader_s, failed_leafs,
+      repeats: [.repeats[] | {old_leader, new_leader, new_leader_s, max_gap_s, failed_leafs, recovered_s, first_leaf_after_leader_s}]}' \
+    "$RESULTS_DIR/$PLAN-t14-$PERF_NODE-t14/t14.json")"
+}
+
+# t15: restart every Vault node in Raft, one at a time (the active one last), under leafs at T15_RATE.
+t15() {
+  limits_remove; trap limits_restore EXIT
+  set +e
+  RUN_ID="$PLAN-t15" RATE="$T15_RATE" vault-rolling-restart.sh
+  local rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  [ "$rc" -eq 0 ] || return 1
+  # A restart lowers Vault's failure tolerance by 1 on purpose, and restarting the
+  # active node hands leadership over (expected).
+  sset '.values.t15' "$(jq -c '. + {expected_failure_tolerance: 1}' "$RESULTS_DIR/$PLAN-t15-$PERF_NODE-t15/t15.json")"
+}
+
+# t13: CA rotation (signing CA, then root) under load, with the CSR limit set to
+# BURST_CSR_RATE and T13_CACHED leafs cached on the agent. Last in the plan: it
+# leaves the CA rotated.
+t13() {
+  limits_remove; trap limits_restore EXIT
+  set +e
+  RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" ca-rotation-test.sh
+  local rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  [ "$rc" -eq 0 ] || return 1
+  sset '.values.t13' "$(jq -c . "$RESULTS_DIR/$PLAN-t13-$PERF_NODE-t13/t13.json")"
+}
+
 raft_nonvoters() { # count of Vault Raft non-voters
   vault operator raft list-peers -format=json 2>/dev/null | jq '[.data.config.servers[] | select(.voter | not)] | length' 2>/dev/null || echo 0
 }
@@ -408,7 +572,8 @@ t9v() {
     idle "non-voter settle" 5m
   fi
   up=$(prom_query "$(prom_url)" 'count(up{job="vault"} == 1)' "$(date +%s)" | jq -r '.[0].value[1] // 0')
-  env ${start:+START=$start} ${T3_MAX:+MAX=$T3_MAX} RUN_ID="$PLAN-t9-t3" stress-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
+  # It starts at T3's last pass, near the ceiling, so every step holds the full HOLD.
+  env ${start:+START=$start} ${T3_MAX:+MAX=$T3_MAX} LOW_HOLD="${HOLD:-10m}" RUN_ID="$PLAN-t9-t3" stress-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
   CONCURRENCY="$T3C_CONCURRENCY" MULTI_CONNS="$T3C_MULTI_CONNS" STEP="$T3C_STEP" RUN_ID="$PLAN-t9-t3c" connection-test.sh
   sset '.values.t9v' "$(jq -c -n --argjson s "$(stress_values "$(stress_file "$PLAN-t9-t3" vault-sign-consul-mount)")" \
     --argjson c "$(jq -c '{single_max, multi_max, single_to_multi_ratio}' "$RESULTS_DIR/$PLAN-t9-t3c-$PERF_NODE-connection-test/connection-test.json")" \
@@ -417,7 +582,7 @@ t9v() {
 
 # T12: redundancy zone spares under load. Skipped on a build without zones.
 t12() {
-  local zones rate
+  local zones rate i rc ex="" runs='[]' f id active=null
   zones=$(vault operator raft autopilot state -format=json 2>/dev/null |
     jq '[.. | objects | (.redundancy_zone? // .RedundancyZone? // empty) | select(. != "")] | length' 2>/dev/null || echo 0)
   if [ "${zones:-0}" -eq 0 ]; then
@@ -426,10 +591,43 @@ t12() {
     return 0
   fi
   rate=${T12_RATE:-$(sget '(.values.t3.last_pass // 3200) / 2 | floor')}
-  RUN_ID="$PLAN-t12" RATE="$rate" FREEZE_MAX="${T12_FREEZE_MAX:-300s}" vault-zone-test.sh
+  # T12_REPEATS standby-zone runs, alternating zones (one sample can't show the
+  # spread of two 10 s Autopilot timers), then one in the active node's zone.
+  # Only the first has a full baseline and only the last a full cooldown.
+  for i in $(seq 1 "$T12_REPEATS"); do
+    id="$PLAN-t12-$i"
+    set +e
+    RUN_ID="$id" RATE="$rate" MODE=standby EXCLUDE_ZONE="$ex" FREEZE_MAX="$T12_FREEZE_MAX" \
+      BASELINE="$(group_idle "$i" $((T12_REPEATS + 1)) | cut -d' ' -f1)" COOLDOWN="$GROUP_GAP" vault-zone-test.sh
+    rc=$?
+    set -e
+    f="$RESULTS_DIR/$id-$PERF_NODE-zones/zones.json"
+    if [ "$rc" -ne 0 ] || [ ! -f "$f" ]; then log "T12: repeat $i failed (exit $rc)"; return 1; fi
+    runs=$(jq -c --slurpfile z "$f" '. + $z' <<<"$runs")
+    ex=$(jq -r .zone "$f")
+  done
+  # Guardrails cover the standby runs; the active run elects a leader on purpose.
+  local mend
+  mend=$(now_ms)
+  set +e
+  RUN_ID="$PLAN-t12-active" RATE="$rate" MODE=active FREEZE_MAX="$T12_FREEZE_MAX" BASELINE="$GROUP_GAP" COOLDOWN="$COOLDOWN" vault-zone-test.sh
+  rc=$?
+  set -e
+  f="$RESULTS_DIR/$PLAN-t12-active-$PERF_NODE-zones/zones.json"
+  if [ "$rc" -eq 0 ] && [ -f "$f" ]; then active=$(jq -c . "$f")
+  elif [ "$rc" -eq 3 ]; then log "T12: the active node's zone has no spare; active-zone run skipped"; active='{"skipped": true}'
+  else log "T12: active-zone run failed (exit $rc)"; active='{"failed": true}'; fi
   # The frozen voter lowers failure tolerance by 1 on purpose until its spare is promoted.
-  sset '.values.t12' "$(jq -c --argjson ft "$(vault-raft-voters.sh status | jq '(.voters - 1) / 2 | floor - 1')" \
-    '. + {expected_failure_tolerance: $ft}' "$RESULTS_DIR/$PLAN-t12-$PERF_NODE-zones/zones.json")"
+  sset '.values.t12' "$(jq -c -n --argjson runs "$runs" --argjson active "$active" --argjson mend "$mend" \
+    --argjson ft "$(vault-raft-voters.sh status | jq '(.voters - 1) / 2 | floor - 1')" '
+    def st(xs): ([xs | select(. != null)] | sort) as $v
+      | if ($v | length) == 0 then null else {min: $v[0], median: $v[($v | length) / 2 | floor], max: $v[-1], n: ($v | length)} end;
+    {rate: $runs[0].rate, runs: $runs, active: $active,
+     join_healthy_s: st($runs[].join.healthy_s), promoted_s: st($runs[].failure.promoted_s),
+     restored_s: st($runs[].failure.restored_s), failed_requests: st($runs[].failure.client.failed),
+     error_window_s: st($runs[].failure.client.error_window_s),
+     never_promoted: [$runs[] | select(.failure.promoted_s == null) | .zone],
+     measure_end_ms: $mend, expected_failure_tolerance: $ft}')"
 }
 
 # jq def shared by T11: one stress.json -> the fields T11 keeps per run.
@@ -438,7 +636,7 @@ cat > "$T11_JQ" <<'JQ'
 def r2: if . == null then null else . * 100 | round / 100 end;
 def t11_run: {last_pass: .last_pass_rate,
   first_fail: ([.steps[] | select((.pass | not) and (.invalid | not)) | .rate] | first), stop_reason,
-  steps: [.steps[] | {rate, pass, delivered: (.delivered * 1000 | round / 1000), failed_rate, p50_ms: (.p50_ms | r2), p99_ms: (.p99_ms | r2),
+  steps: [.steps[] | {rate, pass, vu_starved, delivered: (.delivered * 1000 | round / 1000), failed_rate, p50_ms: (.p50_ms | r2), p99_ms: (.p99_ms | r2),
     raft: .vault_raft, leader: .leader_cost.leader, leader_az: .leader_cost.leader_az,
     tx_bytes_per_write: .leader_cost.tx_bytes_per_write, cpu_ms_per_write: .leader_cost.cpu_ms_per_write}]};
 JQ
@@ -485,7 +683,7 @@ t11() { # t11 <voters> [id]
   # one export of the whole size at the end, like a chained stress test.
   # KV grid, T11_KV_REPEATS times (only the first has a baseline): run-to-run spread.
   for r in $(seq 1 "$T11_KV_REPEATS"); do
-    env RATES="$T11_KV_RATES" RAMP="$T11_RAMP" HOLD="$T11_HOLD" P99_MS="$T11_KV_P99_MS" COOLDOWN=0 EXPORT=0 \
+    env RATES="$T11_KV_RATES" RAMP="$T11_RAMP" HOLD="$T11_HOLD" P99_MS="$T11_KV_P99_MS" COOLDOWN=0 EXPORT=0 STEP_VAULT_MIN_FT="$((($n - 1) / 2))" \
       BASELINE="$([ "$r" -eq 1 ] && echo "$BASELINE" || echo 0)" RUN_ID="$PLAN-$id-kv$r" \
       stress-k6.sh /opt/perf/k6/vault-kv-write.js
     sf=$(stress_file "$PLAN-$id-kv$r" vault-kv-write)
@@ -495,7 +693,7 @@ t11() { # t11 <voters> [id]
   # leader sends to each follower.
   for r in $(seq 1 "$T11_KV_REPEATS"); do
     for b in $T11_PAYLOADS; do
-      env RATES="$T11_PAYLOAD_RATE" RAMP="$T11_RAMP" HOLD="$T11_HOLD" P99_MS="$T11_KV_P99_MS" BASELINE=0 COOLDOWN=0 EXPORT=0 \
+      env RATES="$T11_PAYLOAD_RATE" RAMP="$T11_RAMP" HOLD="$T11_HOLD" P99_MS="$T11_KV_P99_MS" BASELINE=0 COOLDOWN=0 EXPORT=0 STEP_VAULT_MIN_FT="$((($n - 1) / 2))" \
         VALUE_BYTES="$b" KEYS=200 RUN_ID="$PLAN-$id-kv${b}b$r" stress-k6.sh /opt/perf/k6/vault-kv-write.js
       sf=$(stress_file "$PLAN-$id-kv${b}b$r" vault-kv-write)
       payload=$(jq -c --slurpfile f "$sf" --argjson b "$b" --argjson r "$r" \
@@ -599,8 +797,10 @@ run_test() { # run_test <id> <description>
   e=$(now_ms)
   # A test may narrow its guardrail window (T11: after the resize, before the failover) and expect another failure tolerance.
   g=$(guardrails "$(sget ".values[\"$id\"].measure_start_ms // $s")" "$(sget ".values[\"$id\"].measure_end_ms // $e")" "$(sget ".values[\"$id\"].expected_failure_tolerance")")
-  sset ".tests[\"$id\"]" "$(jq -n -c --arg st "$st" --argjson s "$s" --argjson e "$e" --argjson g "$g" \
-    '{status: $st, start_ms: $s, end_ms: $e, minutes: (($e - $s) / 60000 | round), guardrails: $g}')"
+  # Raft data before and after every test: what each test leaves behind (T2's stored certificates).
+  rd=$(prom=$(prom_url 2>/dev/null) && vault_storage "$prom" $((s / 1000)) $((e / 1000)) | jq -c '{data_mb, data_growth_mb}' || echo null)
+  sset ".tests[\"$id\"]" "$(jq -n -c --arg st "$st" --argjson s "$s" --argjson e "$e" --argjson g "$g" --argjson rd "${rd:-null}" \
+    '{status: $st, start_ms: $s, end_ms: $e, minutes: (($e - $s) / 60000 | round), guardrails: $g, raft_data: $rd}')"
   summarise.sh "$PLAN-${id/t9v/t9}" >/dev/null 2>&1 || true
   log "$id: $st ($(sget ".tests[\"$id\"].minutes") min, guardrails ok: $(sget ".tests[\"$id\"].guardrails.ok"))"
   results_md
@@ -615,19 +815,24 @@ results_md() {
       # Booleans need care: jq treats false like null in `//`, so `false // "?"` gives "?".
       def b(x): if x == null then "?" else (x | tostring) end;
     "# Results: \(.plan)\n",
-    "| Test | Status | Minutes | Guardrails | Key result |", "|---|---|---:|---|---|",
+    "| Test | Status | Minutes | Guardrails | Raft data (MB, growth) | Key result |", "|---|---|---:|---|---:|---|",
     (.tests | to_entries[] | . as $t | $t.key as $k
-      | "| \($k) | \($t.value.status) | \($t.value.minutes // "-") | \($t.value | g) | " +
-        (if $k == "t1" then "knee \(v("t1").knee.workers // "?") workers: \(v("t1").knee.rps // "?")/s, p99 \(v("t1").knee.p99_ms // "?") ms, \(v("t1").knee.vault_nodes_serving // "?") Vault node(s) serving"
+      | "| \($k) | \($t.value.status) | \($t.value.minutes // "-") | \($t.value | g) | "
+        + ($t.value.raft_data // {} | if .data_mb then "\(.data_mb | round) (\(if (.data_growth_mb // 0) >= 0 then "+" else "" end)\(.data_growth_mb // 0 | round))" else "-" end) + " | " +
+        (if $k == "t1" then "knee \(v("t1").knee.workers // "?") workers: \(v("t1").knee.rps // "?")/s, p99 \(v("t1").knee.p99_ms // "?") ms, \(v("t1").knee.vault_nodes_serving // "?") Vault node(s) serving (\(v("t1").knee.vault_nodes_busy // "?") busy)"
          elif $k == "t2" then "store @ \(v("t2").workers // "?") workers: \(v("t2").rps // "?")/s, p99 \(v("t2").p99_ms // "?") ms, \(v("t2").vault_nodes_serving // "?") Vault node(s) serving"
          elif $k == "t3" or $k == "t5" then "last pass \(v($k).last_pass // "-")/s, first fail \(v($k).first_fail // "-")/s, knee \(v($k).knee // "-" | tostring)"
             + (if v($k).invalid_rate then ", **\(v($k).invalid_rate)/s invalid: load generator out of memory**" else "" end)
             + (if $k == "t5" then ", max Consul→Vault conns \(v("t5").max_consul_vault_connections // "-")" else "" end)
+            + (v($k).at_last_pass.server_latency // null | if . then "; at last pass, server p99: Vault sign \(.vault_sign.p99_ms // "?") ms"
+                + (if $k == "t5" then ", Consul Sign RPC \(.consul_sign.p99_ms // "?") ms" else "" end) else "" end)
+            + (v($k).at_last_pass.vault_storage // null | if . then ", Raft log append p99 \(.store_logs.p99_ms // "?") ms" else "" end)
          elif $k == "t3c" then "single \(v("t3c").single_max.rps // 0 | round)/s vs multi \(v("t3c").multi_max.rps // 0 | round)/s (ratio \(v("t3c").single_to_multi_ratio // "?"))"
          elif $k == "t6" then "expected behaviour: \(v("t6").expected_behaviour // "?"), node changed after idle: \(b(v("t6").busiest_node_changed_after_idle))"
          elif $k == "t3r" or $k == "t5r" then (if v($k).skipped then "skipped (no boundary)"
-            elif v($k).thresholds == "invalid" then "\(v($k).rate // "?")/s: **INVALID** (load generator out of memory)"
-            else "\(v($k).rate // "?")/s: **\(if v($k).pass then "PASS" else "FAIL" end)** (thresholds \(v($k).thresholds // "?"), delivered \(v($k).delivered // "?"), p99 \(v($k).p99_ms // "?") ms)" end)
+            else "ceiling **\(v($k).confirmed // "below the stress test\u0027s last pass")–\(v($k).failed_at // "?")/s**"
+              + "\(if v($k).reproduced then "" else " (stress last pass not reproduced)" end); repeats: "
+              + (v($k).runs // [] | map("\(.rate) \(if .thresholds == "invalid" then "invalid" elif .pass then "✓" else "✗" end) (p99 \(.p99_ms // "?") ms, delivered \(.delivered // "?"), CPU \(.server_cpu_mean.cpu_pct // "?")%)") | join(", ")) end)
          elif $k == "settle" then "waited \(v("settle").scanner_wait_min // 0) min for scanners; quiet: \(b(v("settle").quiet.quiet)) (busiest CPU \(v("settle").quiet.busiest_cpu_pct // "?")%, elections \(v("settle").quiet.elections // "?"), \(v("settle").quiet.checks // "?") check(s)); apt: \(v("settle").apt.nodes // "-") nodes, locks free \(b(v("settle").apt.all_free))"
          elif $k == "t11smoke" then (v("t11smoke").checks // {}) as $c
             | "hard checks: " + ([$c.hard // {} | to_entries[] | "\(.key) \(if .value then "ok" else "**FAILED**" end)"] | join(", "))
@@ -639,11 +844,33 @@ results_md() {
             + "server CPU \(v("soak").server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end); "
             + "growth: \(v("soak").drift_warnings // [] | if length == 0 then "none over threshold" else "⚠️ " + join(", ") end)"
          elif $k == "t12" and v("t12").skipped then "skipped (no redundancy zones)"
-         elif $k == "t12" then v("t12") as $z | "\($z.rate // "?")/s; zone \($z.zone // "?"): "
-            + "spare \($z.spare // "?") joined \($z.join.joined_s // "-") s, healthy \($z.join.healthy_s // "-") s, then \($z.join.status_after // "?") "
-            + "(\($z.join.client.failed // "?") failed requests); voter \($z.voter // "?") frozen: unhealthy \($z.failure.unhealthy_s // "-") s, "
-            + "spare promoted \($z.failure.promoted_s | if . then "\(.) s" else "**never**" end), tolerance restored \($z.failure.restored_s | if . then "\(.) s" else "-" end); "
-            + "\($z.failure.client.failed // "?") failed requests over \($z.failure.client.error_window_s // "?") s"
+         elif $k == "t12" then v("t12") as $z
+            | def r(x): if x then "\(x.median) s (\(x.min)–\(x.max), n=\(x.n))" else "-" end;
+            "\($z.rate // "?")/s, \($z.runs // [] | length) standby-zone runs: spare healthy after joining \(r($z.join_healthy_s)); "
+            + "zone voter frozen: spare promoted \(r($z.promoted_s)), tolerance restored \(r($z.restored_s)), "
+            + "failed requests \($z.failed_requests.median // "?") (max \($z.failed_requests.max // "?"))"
+            + (if ($z.never_promoted // []) | length > 0 then "; **never promoted in \($z.never_promoted | join(", "))**" else "" end)
+            + "; active-node zone: " + ($z.active // {} | if .skipped then "skipped (no spare there)" elif .failed then "**failed**"
+                else "promoted \(.failure.promoted_s // "**never**") s, \(.failure.client.failed // "?") failed requests" end)
+         elif $k == "burst" then "CSR limit \(v("burst").csr_max_per_second // "?")/s: " + (v("burst").runs // [] | map(
+              "\(.leafs) leafs at \(.rate)/s for \(.hold): \(if .pass then "PASS" else "**FAIL**" end), p99 \(.p99_ms) ms, "
+              + "\(.failed) failed (\(.rate_limited) rate-limited)") | join("; "))
+         elif $k == "t3f" then v("t3f") as $f | "froze \($f.frozen_node // "?")\(if $f.frozen_was_active then " (active)" else "" end) for \($f.freeze // "?") at \($f.rate // "?")/s: "
+            + "longest gap with no leaf \($f.max_gap_s // "?") s, \($f.failed_leafs // "?") failed over \($f.error_window_s // "?") s, recovered \($f.recovered_s // "?") s; "
+            + "Consul then signed through \($f.signer_after // "?")\(if $f.moved then " (moved)" else " (waited for it)" end)"
+         elif $k == "t14" then v("t14") as $c | "Consul leader frozen x\($c.repeats // [] | length): new leader \($c.new_leader_s.median // "?") s (median), "
+            + "longest gap with no leaf \($c.max_gap_s.median // "?") s (max \($c.max_gap_s.max // "?")), first leaf after the new leader \($c.first_leaf_after_leader_s.median // "?") s, "
+            + "\($c.failed_leafs // "?") failed, recovered \($c.recovered_s.median // "?") s"
+         elif $k == "t15" then v("t15") as $r | "\($r.nodes // [] | length) Vault nodes restarted: \($r.failed_leafs // "?") failed leafs, longest gap \($r.max_gap_s // "?") s, "
+            + "slowest back to healthy \($r.healthy_s_max // "?") s, NLB out/back (median) \([$r.nodes[]?.nlb.out_s // empty] | sort | if length > 0 then .[length / 2 | floor] else "?" end)/"
+            + "\([$r.nodes[]?.nlb.back_s // empty] | sort | if length > 0 then .[length / 2 | floor] else "?" end) s"
+            + (if ($r.never_healthy // []) | length > 0 then "; **never healthy: \($r.never_healthy | join(", "))**" else "" end)
+         elif $k == "t13" then v("t13") as $c | "CSR limit \($c.csr_limit // "?")/s, \($c.cached // "?") cached leafs. Signing CA rotation: switched \($c.signing_rotation.switched_s // "?") s, "
+            + "re-issued ~\($c.signing_rotation.reissued_approx // "?"), \($c.signing_rotation.foreground.failed // "?") new-leaf failures. "
+            + "Root rotation: storm \($c.root_rotation.duration_s // "?") s (expected ~\($c.root_rotation.expected_storm_s // "?") s at the limit), "
+            + "re-issued ~\($c.root_rotation.reissued_approx // "?"), peak \($c.root_rotation.peak_signs_per_s // "?") signs/s; "
+            + "new leafs during it: p99 \($c.root_rotation.foreground.p99_ms // "?") ms, \($c.root_rotation.foreground.failed // "?") failed, "
+            + "longest gap \($c.root_rotation.foreground.max_gap_s // "?") s"
          elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
@@ -656,7 +883,8 @@ results_md() {
          def agg(xs): ([xs | select(. != null)]) as $v
            | if ($v | length) == 0 then "-" elif ($v | length) == 1 then "\($v[0] | . * 100 | round / 100)"
              else "\($v | add / length | . * 100 | round / 100) ±\(($v | max) - ($v | min) | . / 2 * 100 | round / 100)" end;
-         def at($r): [.kv.runs[]?.steps[]? | select(.rate == $r)];
+         # VU-starved steps measure the load generator queue, not Vault: left out (shown as "starved").
+         def at($r): [.kv.runs[]?.steps[]? | select(.rate == $r and (.vu_starved | not))];
          def mark: if any(.[]; .pass | not) then " ✗" else "" end;
          def kb: if . == null then null else . / 1024 | . * 100 | round / 100 end;
          ([$t[].kv.runs[]?.steps[]?.rate] | unique) as $rates
@@ -697,7 +925,7 @@ results_md() {
          "| failover: write gap, median / max (s) | " + ($t | map(.failover | "\(.write_gap_s.median // "-") / \(.write_gap_s.max // "-") (\(.failed_writes // "-") failed)") | join(" | ")) + " |",
          "| failover from logs: detected / elected / active, median (s) | " + ($t | map(.failover
               | "\(.detected_s.median // "-") / \(.elected_s.median // "-") / \(.active_s.median // "-")") | join(" | ")) + " |",
-         "\n✗ = a step failed its thresholds (p99 or errors) or delivered < 95%. "
+         "\n✗ = a step failed its thresholds (p99 or errors), CPU or guardrails. Steps that delivered < 95% (VU-starved) are left out: their latency is the load generator queue. "
          + "Failover: SIGSTOP of the active node; new active = until another voter answers as active; "
          + "write gap = longest time with no successful write (20 writes/s through the NLB). "
          + "From the Vault logs: detected = first heartbeat timeout, elected = election won, active = post-unseal setup complete; "
@@ -712,7 +940,7 @@ start)
   if systemctl is-active --quiet "$UNIT"; then echo "$UNIT is already running"; exit 1; fi
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
-    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT T12_RATE T12_FREEZE_MAX T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
+    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT TARGET_RATE T13_CACHED T13_RATE T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
     P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done
@@ -725,18 +953,26 @@ run)
   log "plan $PLAN starting on $PERF_NODE"
   limits_restore # a previous run stopped mid-T5 leaves limits removed
   for t in "settle:settle the cluster (apt jobs, idle, quiet check)" \
-    "t1:Vault PKI baseline (no_store worker sweep, all nodes)" "t2:cost of storing certificates" \
-    "t3:Vault cluster capacity on Consul's mount (stress)" "t3c:single vs multiple connections" \
-    "t5:Consul leaf path, CSR limits removed (stress)" "t6:signing distribution" \
-    "t3r:refinement near T3's ceiling" "t5r:refinement near T5's ceiling" \
+    "t1:Vault PKI baseline (no_store worker sweep, all nodes)" \
+    "t3:Vault cluster capacity on Consul's mount (stress)" "t3r:T3 boundary repeats (last pass, midpoint, first fail)" \
+    "t3c:single vs multiple connections" \
+    "t5:Consul leaf path, CSR limits removed (stress)" "t5r:T5 boundary repeats (last pass, midpoint, first fail)" \
+    "t6:signing distribution" \
     "soak:${SOAK_RATE}/s through Consul for ${SOAK_HOLD} (leaks, rare errors)" \
+    "burst:leaf bursts with Consul's CSR limit set to ${BURST_CSR_RATE}/s" \
+    "t3f:freeze the Vault node Consul signs through, under ${T3F_RATE}/s of leafs" \
+    "t14:freeze the Consul leader under ${T14_RATE}/s of leafs (x${T14_REPEATS})" \
+    "t2:cost of storing certificates (after the soak: stored certificates leave Raft state behind)" \
     "t9v:Vault + non-voters: T3 from its last pass, then T3c" \
-    "t12:redundancy zones: re-add a spare and fail its zone's voter, under load" \
+    "t12:redundancy zones: re-add a spare and fail its zone's voter, under load (x${T12_REPEATS} + active zone)" \
+    "t15:rolling restart of every Vault node under ${T15_RATE}/s of leafs" \
+    "t13:CA rotation (signing CA, then root) under load, ${T13_CACHED} cached leafs, CSR limit ${BURST_CSR_RATE}/s" \
     "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \
     "t11v7:Vault Raft latency, 7 voters" "t11v5:Vault Raft latency, 5 voters (shrinks Vault)" \
     "t11v3:Vault Raft latency, 3 voters (shrinks Vault)"; do
     if [ -n "$PLAN_TESTS" ] && ! grep -qw -- "${t%%:*}" <<<"$PLAN_TESTS"; then continue; fi
+    if [ -z "$PLAN_TESTS" ] && grep -qw -- "${t%%:*}" <<<"$OPT_IN_TESTS"; then continue; fi
     run_test "${t%%:*}" "${t#*:}"
   done
   log "plan $PLAN complete; results in $DIR/RESULTS.md. Remember: terraform destroy when done."

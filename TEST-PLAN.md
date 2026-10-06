@@ -6,21 +6,29 @@
 |---|---|---|---|
 | 0 | Settle | Is the full-size cluster built, verified and quiet? | ~1–1.1 h |
 | 1: Vault ceiling | T1 | What's Vault's `no_store` signing ceiling and knee across all 5 nodes? | ~1 h |
-| | T2 | What does storing certificates cost compared with `no_store`? | ~0.4 h |
-| | T3 | What rate can Vault sustain on Consul's own mount and role? | ~0.9–1.3 h |
+| | T3 | What rate can Vault sustain on Consul's own mount and role? | ~1–1.3 h |
+| | T3r | Does T3's ceiling reproduce? Repeats at its last pass, midpoint and first fail, giving a range | ~0.7 h |
 | | T3c | What can one Consul-style connection carry, compared with many? | ~0.7 h |
-| 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~0.9–1.3 h |
+| 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~1–1.3 h |
+| | T5r | Does T5's ceiling reproduce? The same boundary repeats | ~0.7 h |
 | | T6 | Where does signing land on Vault, directly, through Consul, and after an idle gap? | ~0.5 h |
-| | T3r / T5r | Where exactly is each ceiling, between the last passing and first failing rate? | ~0.5 h |
 | | Soak | Does the target rate hold for 2 h at ≥ 99.99% success, with no memory or file descriptor growth? | ~2.2 h |
-| 3: Vault scale-out | T9-V | Do 2 non-voters (redundancy zone spares, performance standbys) raise T3 and T3c? | ~1.6 h |
-| | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? | ~0.5 h |
-| 4: Vault Raft | T11 grow | Convert T9-V's 2 non-voters to voters (7 voters); how long does each take to join and be promoted? | ~0.2 h |
-| | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~7.7–10.7 h |
+| | Burst | With `csr_max_per_second` set to the target, do 20,000 leafs in 1 minute and 100,000 in 10 minutes arrive? | ~0.3 h |
+| | T3f | What do sidecars see when the Vault node Consul signs through hangs? | ~0.25 h |
+| | T14 | What do sidecars see when the Consul leader hangs (election plus the new leader's CA setup)? 3 runs | ~0.35 h |
+| | T2 | What does storing certificates cost compared with `no_store`? (Runs here: it leaves Raft state behind.) | ~0.4 h |
+| 3: Vault scale-out | T9-V | Do 2 non-voters (redundancy zone spares, performance standbys) raise T3 and T3c? | ~1.5 h |
+| | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? 3 runs, plus 1 in the active node's zone | ~0.8 h |
+| | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
+| | T13 | What happens when Consul's CA rotates under load: the signing CA, then the root, which re-issues all 100,000 leafs? Runs last: it leaves the CA rotated | ~0.5 h |
+| *Own campaign* | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~9–11 h |
 
-Stages 0–4 run as one campaign (`plan-1`, ~20–24 h). The T5 rerun (`plan-2`)
-repeats only T5 and T5r from 800/s. T11 can also run on its own (`raft-1`,
-`--t11`). Stage 4 needs a Vault license without the `pki-only` module.
+The tests run in the order of this table, as one unattended campaign
+(`plan-1`, ~13.5–14.5 h). T11 shrinks Vault for good, so it runs as its own
+unattended campaign on a fresh 7-voter build (`raft-1`, `--t11`). Moving
+between the two campaigns needs a `terraform apply`, so fresh credentials.
+`--with-t11` instead appends T11 to `plan-1` as Stage 4 (~21–25 h in one
+run; see *Stage 4*).
 *Read-out* explains how to interpret the comparisons, and *Results* records
 the outcome of each test.
 
@@ -33,15 +41,18 @@ Run everything from your workstation with `scripts/run-campaign.sh`:
 export TF_CLOUD_ORGANIZATION=<your-org>
 scripts/run-campaign.sh start plan-1       # Stage 0 rebuild (type "yes" at the plan), wait, verify, start the campaign
 scripts/run-campaign.sh status plan-1      # check progress any time (or: follow plan-1)
-# ~20-24 h later, with fresh credentials again:
+# ~13.5-14.5 h later, with fresh credentials again:
 scripts/run-campaign.sh finish plan-1      # download results to ./results/, then offer terraform destroy
+
+# then T11 on its own build, the same way:
+scripts/run-campaign.sh start raft-1 --t11
+# ~9-11 h later:
+scripts/run-campaign.sh finish raft-1
 ```
 
-The campaign ends with Stage 4 (T11 at 7, 5 and 3 voters). To leave it out,
-which also allows a PKI-only Vault license, set
-`PLAN_TESTS="settle t1 t2 t3 t3c t5 t6 t3r t5r soak t9v t12"` before `start`. T11 can
-also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --t11`
-(see T11).
+To run both in one unattended campaign instead, start with
+`scripts/run-campaign.sh start plan-1 --with-t11` (see *Stage 4* for the
+trade-offs).
 
 **What `start` does:**
 1. Runs the preflight checks.
@@ -53,8 +64,7 @@ also run on its own build with `--t11`: `scripts/run-campaign.sh start raft-1 --
    - 5 Consul voters;
    - leaf TTL 168h;
    - root path `pki_mesh_int`;
-   - one Autopilot redundancy zone per Vault voter (unless `vault_redundancy_zones = false`);
-   - when the run includes T11, that the Vault license allows KV mounts.
+   - one Autopilot redundancy zone per Vault voter (unless `vault_redundancy_zones = false`).
 5. Refreshes `credentials.txt`, and starts `run-plan.sh` on loadgen-0.
 
 **While it runs:** the campaign runs unattended on loadgen-0. Your laptop and
@@ -68,7 +78,7 @@ The sections below explain each stage and test, and are the manual fallback.
 ## Goal
 
 Confirm whether Vault and Consul can issue leaf certificates fast enough for
-an example mesh, and find where the bottleneck is. The example mesh has **60,000
+an example mesh, and find where the bottleneck is. The example mesh has **100,000
 sidecars on Consul Dataplane**, a **7-day leaf TTL**, and needs 2× growth
 headroom. The results set Consul's `csr_max_per_second` (default 50/s, too low
 for the targets).
@@ -79,12 +89,12 @@ See README → *Targets* for how these were sized.
 
 | Target | Value |
 |---|---|
-| Leaf throughput through Consul | **≥ 200 leafs/s** sustained |
-| End-to-end leaf p99 at 200/s | **≤ 1 s**, errors < 0.1% |
-| Vault sign p99 on Consul's intermediate at 200/s | **≤ 100 ms**, errors < 0.1% |
-| Server CPU | Stress steps and refinements: mean CPU over the hold ≤ 90% on every Vault and Consul server. Soak: ≤ 80% |
-| Soak at 200/s for 2 h | ≥ 99.99% success, p99 ≤ 1 s; server memory, Go heap and file descriptors grow ≤ 10% (a warning, not a failure) |
-| Guardrails | 0 leader elections, Autopilot failure tolerance 2, Raft leader last contact p99 < 200 ms (T11: tolerance (N−1)/2, so 1 at 3 voters; its failover check is excluded) |
+| Leaf throughput through Consul | **≥ 350 leafs/s** sustained (a rolling server restart re-issues ~20,000 leafs in ~1 minute, ~333/s) |
+| End-to-end leaf p99 at 350/s | **≤ 1 s**, errors < 0.1% |
+| Vault sign p99 on Consul's intermediate at 350/s | **≤ 100 ms**, errors < 0.1% |
+| Server CPU | Stress steps and boundary repeats: mean CPU over the steady state ≤ 90% on every Vault and Consul server. Soak: ≤ 80% |
+| Soak at 350/s for 2 h | ≥ 99.99% success, p99 ≤ 1 s; server memory, Go heap and file descriptors grow ≤ 10% (a warning, not a failure) |
+| Guardrails | 0 leader elections, Autopilot failure tolerance 2, Raft leader last contact p99 < 200 ms (T11: tolerance (N−1)/2, so 1 at 3 voters; its failover check is excluded). Checked after every test, and **fail** a stress step or boundary repeat when broken during its steady state |
 
 ## Environment
 
@@ -130,19 +140,59 @@ end, and one export.
 | baseline 5m | step 1: warm-up 2m + steady 10m | step 2: warm-up 2m + steady 10m | … | cooldown 5m | → export
 ```
 
-- **Each step keeps its full 2-minute warm-up and 10-minute steady state.**
-  The warm-up absorbs any carry-over from the previous step.
+- **Each step has a 2-minute warm-up, which starts at the previous step's
+  rate,** so load doesn't dip between steps.
+- **Steps hold 5 minutes until the busiest server's mean CPU reaches 50%,
+  then 10 minutes** (`LOW_HOLD`, `FINE_CPU`). In plan-1, steady state arrived
+  within 1–4 minutes (T3 at 6,400/s: client p99 7.06 → 7.69 ms over the hold,
+  Vault CPU flat from the first minute), so the full hold matters only near
+  the ceiling. Fixed-rate grids (`RATES`, T11) hold `HOLD` throughout.
+- **p99 and errors come from the steady state only.** k6 runs each step as two
+  scenarios, `warmup` and `steady`, and the pass criteria apply to `steady`.
 - **Each step's windows become their own export phases**
   (`steady-r200`, `steady-w64`, …). `stats.md` compares each step with the
   idle baseline and cooldown.
 - **Annotations** mark every step.
-- **Exceptions:**
-  - **T3c** uses 15 s + 60 s steps, because it compares connection modes and
-    doesn't measure steady-state capacity.
-  - **T6** uses 30 s + 2 min runs with 1-minute idles, because it answers
-    *where* signing lands.
-  - **T11** keeps the 2-minute warm-up but holds 5 minutes, and repeats its
-    runs to measure noise instead (see T11).
+- **Every test starts with a 5-minute idle baseline and ends with a 5-minute
+  idle cooldown.** Runs inside one test (boundary repeats, bursts, T12's
+  repeats) are separated by 1 minute of cooldown plus 1 minute of baseline
+  (`GROUP_GAP`), so each still has its own idle reference.
+
+Each test's windows, and why some differ:
+
+| Test | Baseline / cooldown | Warm-up | Steady state | Why it differs |
+|---|---|---|---|---|
+| T1, T2 | 5m / 5m | 2m per level | 10m per level | — |
+| T3, T5 (stress) | 5m / 5m | 2m per step, from the previous rate | 5m below 50% server CPU, then 10m | Steady state arrives within 1–4 minutes; the full hold matters near the ceiling |
+| T3r, T5r (3 runs) | 5m first / 5m last, 1m between | 2m | 10m | — |
+| T3c (×2 in T9-V) | 5m / 5m | 15s per step | 60s per step | Compares connection modes, not sustained capacity |
+| T6 (4 runs) | 1m / 1m per run | 30s | 2m | Answers *where* signing lands; the gap between runs is the test (> 90 s idle) |
+| Soak | 5m / 5m | 2m | 2h | Long enough for drift and rare errors |
+| Burst (2 runs) | 5m first / 5m last, 1m between | none | 60s, 10m | A burst has no ramp by definition |
+| T3f | 5m / 5m | 30s, then 2m steady before the freeze | freeze 60s + 2m after | An event under load, not a capacity measurement |
+| T14 | 5m / 5m | 30s, then 90s steady before the first freeze | 3 × (freeze 60s, until healthy, 60s gap) | An event under load |
+| T9-V T3 rerun | 5m / 5m | 2m per step | 10m every step | Starts at T3's last pass, already near the ceiling |
+| T12 (3 + 1 runs) | 5m first / 5m last, 1m between | 30s, then 60s steady before the join | join ~1–2m, freeze until promoted + 30s | An event under load |
+| T15 | 5m / 5m | 30s, then 2m steady before the first restart | per node: until healthy, then 60s | An event under load |
+| T13 | 5m / 5m | the cache fill (~5m at 350/s), then 60s of foreground | signing CA 5m; root until the storm ends (≤ 30m) | An event under load |
+| T11, per size | 5m / 5m once per size | 2m per step | 5m | The repeats measure noise; repeat spread in raft-1 was tiny |
+| t11smoke | 1m / 1m | 30s | 1m | A check that the measurements work, not a measurement |
+
+**Server-side metrics, per stress step** (in `stress.json`, and at the last
+passing rate in RESULTS.md), so the client's latency can be split without
+opening Grafana:
+- **`server_latency`:** Vault's sign route on Consul's intermediate, every
+  Vault request (`vault.core.handle_request`), and the Consul leader's
+  `ConnectCA.Sign` RPC, each as mean and p99;
+- **`vault_storage`:** Raft log appends including fsync
+  (`vault.raft.boltdb.storeLogs`), BoltDB write transactions, the slowest
+  Vault disk's write latency, and `/opt/vault/data` size and growth.
+
+Every test also records Raft data size and growth (RESULTS.md's *Raft data*
+column), which shows what each test leaves behind (T2's stored
+certificates, for example). The failure tests (T3f, T12, T15) poll the NLB's
+view of the affected node every 2 s. Metric names that don't exist in this
+Vault or Consul version come back as null rather than failing the step.
 
 Each run produces:
 
@@ -177,7 +227,7 @@ credentials: the runner uses the instances' own IAM roles.
 ```bash
 # 1. workstation: Stage 0 step 1 (full size + held non-voters), one apply
 # 2. loadgen-0, as ubuntu:
-run-plan.sh start plan-1          # settle → T1 → T2 → T3 → T3c → T5 → T6 → T3r → T5r → soak → T9-V → T12 → Stage 4 (~18.2–22.2 h)
+run-plan.sh start plan-1          # settle → T1 → T3 → T3r → T3c → T5 → T5r → T6 → soak → burst → T3f → T2 → T9-V → T12 (~11.5–12.5 h)
 run-plan.sh status plan-1         # progress, last log lines, RESULTS.md
 run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
 # 3. workstation, when it's finished: terraform destroy (the runner can't)
@@ -200,8 +250,8 @@ run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
   settle for 5 minutes, then reruns T3 (from T3's last passing rate) and T3c.
   Without held non-voters, T9-V is skipped. `run-plan.sh t9v plan-1` reruns
   it alone.
-- **Stage 4** then converts those non-voters to voters (`t11grow`) and runs
-  T11. See *Stage 4*.
+- **T12** then repeats a zone failure under load (see *T12*). Stage 4 (T11)
+  runs only when `PLAN_TESTS` names it (`run-campaign.sh --with-t11`).
 - **It survives disconnects** and **resumes:** re-running `start plan-1` skips
   completed tests. From the workstation, `scripts/run-campaign.sh resume plan-1`
   uploads and syncs the latest scripts first (only once the plan has
@@ -209,15 +259,18 @@ run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
 - **Decisions between tests are automatic:**
   - T2 uses T1's knee, the last worker level that still added ≥ 10%
     throughput.
-  - The refinements use the midpoint between each stress test's last pass and
-    first fail. They pass only if the thresholds pass, ≥ 95% was delivered and
-    no server's mean CPU is over 90%. They're skipped if there's no boundary.
-  - Consul's CSR limits are removed for T5 and T5r and always restored.
+  - T3r and T5r repeat each stress test's boundary: one full run each at its
+    last pass, the midpoint and its first fail, with the same pass criteria
+    as a step. They're skipped if there's no boundary.
+  - Consul's CSR limits are removed for T5, T5r, the soak and T3f, set to
+    `BURST_CSR_RATE` for the burst test, and always restored.
 - **After every test** it checks the guardrails (Consul and Vault leader
   elections, minimum Autopilot failure tolerance), runs `summarise.sh`,
   rewrites `RESULTS.md`, and uploads to `s3://<bucket>/results/<PLAN>-plan/`.
 - **Settings default to this plan and can be overridden with env vars:**
   `T1_WORKERS`, `T3_START`/`T3_MAX`, `T5_START`/`T5_MAX`, `T3C_*`, `T6_*`,
+  `SOAK_*`, `BURST_*`, `T3F_RATE`, `T12_*`, `SERVER_CPU_MAX`, `FINE_CPU`,
+  `FINE_FACTOR`, `LOW_HOLD`,
   `SETTLE_APT`/`SETTLE_IDLE`/`SETTLE_MAX_CPU`, `P99_MS`, `MAX_ERROR_RATE`,
   and the usual `BASELINE`/`COOLDOWN`/`RAMP`/`HOLD`/`WARMUP`/`DURATION`.
 
@@ -343,7 +396,11 @@ Consul's `leaf-cert` role (`pki-perf-mount.sh create`).
 
 The load comes from `vault-sign-load` with **32 independent clients** (32
 connections), so the NLB spreads it across every Vault node. The result
-records `vault_nodes_serving` and the per-node split to prove it.
+records `vault_nodes_serving` and the per-node split to prove it, from the
+`pki_perf` mount's route metric. In plan-1 that metric matched nothing (every
+level reported 0 nodes), so the name is now matched by regex, and
+`vault_nodes_busy` (Vault nodes over 10% mean CPU) shows the spread even if it
+still doesn't.
 vault-benchmark isn't used for T1: it multiplexes every worker over one
 HTTP/2 connection, which the NLB pins to a single node. (In the first plan-1
 attempt, vault-3 served all of T1.) The single-connection case, which is how
@@ -366,6 +423,10 @@ climbing.
 
 ### T2: Cost of storing certificates (~0.4 h)
 
+*Runs after T3f, not here.* T2 stores about 1.2 million certificates (plan-1:
+1,637/s for 12 minutes) and then unmounts them. Raft's database files never
+shrink, so that state would sit under every Vault measurement after it.
+
 Measures what `no_store` saves. Stored certificates are Raft writes, which
 performance standbys forward to the active node.
 
@@ -379,14 +440,22 @@ summarise.sh t2
 **Compare with T1** at the same concurrency: throughput, p99, Vault Raft
 commit time and active-node CPU.
 
-### T3: Vault cluster capacity on Consul's mount (~0.9–1.3 h)
+### T3: Vault cluster capacity on Consul's mount (~1–1.3 h)
 
 A stress test of `connect_dc1_inter/sign/leaf-cert`, the role Consul created.
 It uses many connections and a token with Consul's `consul-connect-ca` policy.
-The rate starts at 200/s and doubles each step until p99 exceeds 100 ms,
-errors exceed 0.1%, less than 95% of the planned rate is delivered, or a Vault
-or Consul server's mean CPU over the hold exceeds 90% (`SERVER_CPU_MAX`). The
-steps are chained, at about 12 minutes each.
+The rate starts at the 350/s target and doubles each step, then rises ×1.5 once the
+busiest server's mean CPU reaches 50% (doubling is too coarse near the
+ceiling). Steps hold 5 minutes below that, then 10. A step fails when, over
+its steady state:
+- p99 exceeds 100 ms, or errors exceed 0.1%;
+- less than 95% of the planned rate is delivered. k6 stops the step as soon
+  as that's certain, and marks it **VU-starved**: every k6 worker was busy, so
+  its latency is the load generator's queue. VU-starved steps stay in
+  `stress.json` but out of latency tables;
+- a Vault or Consul server's mean CPU exceeds 90% (`SERVER_CPU_MAX`);
+- a guardrail breaks: a Consul or Vault leader election, or Autopilot failure
+  tolerance below 2.
 
 ```bash
 RUN_ID=t3 stress-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
@@ -417,18 +486,30 @@ summarise.sh t3c
 ```
 
 **Record:** from `connection-test.json`:
-- `single_max` and `multi_max`, and the ratio between them;
+- `single_max` and `multi_max`, and the ratio between them. Both are the best
+  step **within the target** (no errors, p99 ≤ 100 ms), and `single_max` must
+  use exactly one connection. At high concurrency Go's HTTP/2 client opens
+  more: plan-1's raw single-mode maximum, 4,045/s, used 3 connections, 3
+  Vault nodes and had p99 153 ms. The honest figure was 2,048/s at
+  concurrency 64 (p99 63 ms). `single_max_any` and `multi_max_any` keep the
+  raw maxima for reference;
 - in single mode, whether a second connection or node appears at high
   concurrency.
 
 ## Stage 2: Consul ceiling
 
-### T5: Consul leaf path, CSR limits removed (~0.9–1.3 h)
+### T5: Consul leaf path, CSR limits removed (~1–1.3 h)
 
 Measures Consul's real ceiling on the path agent → Consul leader → Vault. The
-rate starts at 50/s and doubles each step (chained, about 12 minutes per step,
-plus the agent restart that clears its leaf cache). It stops on the same
-criteria as T3, with p99 over 1 s instead of 100 ms. Each step records the Consul
+rate starts at the 350/s target (plan-1's steps below it only showed a flat line)
+and steps like T3, with the agent restarted between steps to clear its leaf
+cache. It stops on the same criteria as T3, with p99 over 1 s instead of
+100 ms.
+
+**Expect a single Vault node's CPU to set this ceiling.** Consul's leader signs
+through one connection, so one Vault node: at 3,200/s that node ran at
+98.7–99% in both plan-1 and plan-2. With the 90% CPU rule, T5's last pass
+will likely move to 1,600/s. Each step records the Consul
 leader's connections to Vault (`consul_vault_connections_max`) and how signing
 is spread across Vault nodes.
 
@@ -504,16 +585,30 @@ the Consul runs is still well over 90 s: 1 minute of cooldown, the 150 s
 - each run's verdict and nodes serving;
 - `busiest_node_changed_after_idle`.
 
-### Refinement runs (~0.5 h)
+### T3r and T5r: Boundary repeats (~0.7 h each)
 
-The stress tests double the rate at each step, so a ceiling is only known to
-within a factor of 2. Run one steady run between each test's last passing and
-first failing rate:
+Each runs straight after its stress test. A single stress run doesn't support
+a `csr_max_per_second` recommendation: at the same 1,600/s, T5's p99 was
+176 ms in plan-1 and 35 ms in plan-2. So each repeats the stress test's
+boundary with one full run (2-minute warm-up, 10-minute hold) at:
+- its last passing rate;
+- the midpoint between that and the first failing rate;
+- its first failing rate.
+
+They use the same pass criteria as a stress step. The ceiling is then a
+**range**:
+- **confirmed:** the highest repeated rate that passed, with every repeated
+  rate below it passing too;
+- **failed_at:** the lowest rate that failed, in the stress test or a repeat.
+  A stress failure that passes on repeat counts as noise.
+
+If the stress test's last pass fails on repeat, RESULTS.md says it wasn't
+reproduced. Manual equivalent, per rate:
 
 ```bash
-RUN_ID=t3r RATE=<between T3 pass/fail> run-k6.sh /opt/perf/k6/vault-sign-consul-mount.js; summarise.sh t3r
+RUN_ID=t3r-r<rate> RATE=<rate> BASELINE=1m COOLDOWN=1m run-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
 consul-ca-limits.sh 0 0
-RUN_ID=t5r RATE=<between T5 pass/fail> run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh t5r
+RUN_ID=t5r-r<rate> RATE=<rate> BASELINE=1m COOLDOWN=1m run-k6.sh /opt/perf/k6/consul-leaf.js
 consul-ca-limits.sh 50 0
 ```
 
@@ -521,7 +616,7 @@ consul-ca-limits.sh 50 0
 
 The stress steps hold each rate for 10 minutes. That's long enough to find a
 ceiling, but too short to show slow memory growth or rare errors. The soak
-runs the **200/s target through Consul** (`consul-leaf.js`, CSR limits removed
+runs the **350/s target through Consul** (`consul-leaf.js`, CSR limits removed
 like T5) for **2 hours** on the 5 voters, before T9-V adds the non-voters.
 
 It **fails** on:
@@ -539,18 +634,102 @@ any Vault or Consul server grows by more than 10%:
 These are warnings, not failures: a heap that grows and then levels off is
 normal, so read the Grafana memory panels before calling it a leak.
 
-The load generator's Consul agent caches every leaf it fetches: about 1.44
-million in 2 hours, fewer than T5's 3,200/s step. Its memory grows, but that's
-the load generator, which the drift check doesn't measure.
+The load generator's Consul agent caches every leaf it fetches: about 2.5
+million in 2 hours (~30 GB of the load generator's 128 GiB). Its memory grows,
+but that's the load generator, which the drift check doesn't measure.
 
 ```bash
 consul-ca-limits.sh 0 0
-RUN_ID=soak RATE=200 HOLD=2h MAX_ERROR_RATE=0.0001 run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh soak
+RUN_ID=soak RATE=350 HOLD=2h MAX_ERROR_RATE=0.0001 run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh soak
 consul-ca-limits.sh 50 0
 ```
 
 Change it with `SOAK_RATE`, `SOAK_HOLD`, `SOAK_MAX_ERROR_RATE`,
 `SOAK_CPU_MAX` and `SOAK_DRIFT_PCT`.
+
+**For a stronger leak check,** run a long soak as its own plan, for example
+`PLAN_TESTS="settle soak" SOAK_HOLD=10h scripts/run-campaign.sh start soak-1`
+(~12 h, ~US$110). Note that this soak's leaf cache lives on the load
+generator's agent. With Consul Dataplane, Consul servers hold it, so server
+memory at 100,000–200,000 cached leafs isn't measured here.
+
+### Burst: the target bursts with the CSR limit set (~0.3 h)
+
+The 350/s target was sized for bursts: a rolling Consul server restart
+re-issues about 20,000 sidecars' leafs in about a minute (README *Targets*). Every other test runs at a constant
+rate with Consul's CSR limit removed. This one sets `csr_max_per_second` to
+the value being recommended (`BURST_CSR_RATE`, default the 350/s target) and
+sends, through Consul:
+- **20,000 leafs in 60 s** (334/s): a rolling server restart;
+- **100,000 leafs in 10 minutes** (167/s): the whole mesh.
+
+Each run records leafs issued, failed, rate-limited
+(`consul_csr_rate_limited`), p50, p99 and max. It passes on errors < 0.1% and
+p99 ≤ 1 s. If the limiter's refusals reach the client as errors instead of
+being retried by the agent, it fails, which is a finding about the limit
+rather than a test bug. Change it with `BURST_CSR_RATE` and `BURST_SPECS`
+(`<rate>:<duration> ...`).
+
+```bash
+consul-ca-limits.sh 350 0
+RUN_ID=burst-r334 RATE=334 RAMP=0 HOLD=60s run-k6.sh /opt/perf/k6/consul-leaf.js
+RUN_ID=burst-r167 RATE=167 RAMP=0 HOLD=10m run-k6.sh /opt/perf/k6/consul-leaf.js
+consul-ca-limits.sh 50 0
+```
+
+### T3f: The Vault node Consul signs through hangs (~0.25 h)
+
+Consul's leader signs through one connection, so one Vault node (T3c, T6).
+This is the failure sidecars actually see, and DBS's "failover under load" on
+the leaf path. Under 350/s of leafs through Consul (`T3F_RATE`, CSR limits
+removed), `consul-vault-failover.sh`:
+1. finds the Vault node Consul signs through: the most signs on Consul's
+   intermediate over the last minute. It records whether that node is active;
+2. freezes it with `SIGSTOP` for 60 s, then `SIGCONT`. If it's the active node,
+   Vault also elects a new one;
+3. waits for Autopilot to be healthy, then keeps the load 2 more minutes.
+
+It records, over the freeze plus 60 s:
+- **max_gap_s:** the longest time with no leaf issued at all;
+- **failed_leafs** and **error_window_s** (first to last failure; k6's leaf
+  timeout is 60 s);
+- **recovered_s:** the end of the last disrupted 5-second window (any failure,
+  or under 90% of the rate succeeding);
+- **signer_after:** which Vault node signed most in the minute after the
+  freeze. Did Consul move to another node, or wait for the frozen one?
+
+```bash
+consul-ca-limits.sh 0 0
+RUN_ID=t3f RATE=350 consul-vault-failover.sh
+consul-ca-limits.sh 50 0
+```
+
+T3f also polls the NLB's view of the frozen node every 2 s (`nlb.out_s`,
+`nlb.back_s`): requests keep reaching it until the NLB's health checks (every
+10 s, unhealthy after 2) take it out, so this shows how much of the gap is the
+NLB rather than Vault or Consul.
+
+### T14: The Consul leader hangs (~0.35 h)
+
+The other half of T3f. Every CSR is signed on the Consul leader, through its
+Vault CA provider. A new leader has to set up its own provider (Vault login,
+connection) before it signs anything, so leafs may stall for longer than the
+election. Under 350/s of leafs through Consul (`T14_RATE`, CSR limits removed),
+`consul-leader-failover.sh` freezes the Consul leader with `SIGSTOP` for 60 s,
+3 times (`T14_REPEATS`; election timing is random), and records per repeat:
+- **new_leader_s:** until another server leads (polled every 0.5 s);
+- **max_gap_s:** the longest time with no leaf issued;
+- **first_leaf_after_leader_s:** from the new leader to the first leaf after the
+  gap. That's the cost of the new leader's CA setup;
+- **failed_leafs** and **recovered_s**, as in T3f.
+
+RESULTS.md gives the median and range over the repeats.
+
+```bash
+consul-ca-limits.sh 0 0
+RUN_ID=t14 RATE=350 REPEATS=3 consul-leader-failover.sh
+consul-ca-limits.sh 50 0
+```
 
 ## Stage 3: Vault scale-out
 
@@ -588,7 +767,7 @@ measured. The question here is whether the ceiling moves up.
 - t9-t3c against t3c: `multi_max` should rise, and `single_max` should stay flat
   on one node.
 
-### T12: Redundancy zone spares under load (~0.5 h)
+### T12: Redundancy zone spares under load (~0.8 h)
 
 The HLD's design: **Autopilot redundancy zones**, starting with 5 voters and
 no non-voters, then adding non-voters as scale demands. Autopilot keeps
@@ -636,6 +815,21 @@ client's view:
 Requests the NLB sends to the frozen node hang until k6's 30 s timeout, so the
 error window includes the NLB health checks.
 
+**Repeats.** One sample can't show the spread of two 10-second Autopilot timers
+plus 1-second polling, so T12 runs **3 times** (`T12_REPEATS`), alternating
+zones, each re-adding a spare and freezing a voter. RESULTS.md gives the
+median and range of join, promotion, recovery and failed requests. Then
+**one more run in the active node's zone** (`MODE=active`), where the freeze
+also forces an election: the realistic worst case. T12's guardrails cover the
+3 standby runs only, since the active run elects a new leader on purpose. If
+the active node's zone has no spare, that run is skipped.
+
+**Zones aren't AZs here.** Nodes are placed in subnets by index, so
+`vault-nv-0` is in a different AZ from `zone-0`'s voter, `vault-0`. T12 tests
+Autopilot's zone mechanism, not losing an AZ, where a zone's voter and spare
+would fail together. Whether DBS's zones map to AZs decides which of those
+matters.
+
 **Promotion isn't instant by design.** Autopilot waits until the voter has been
 out of contact for longer than `last_contact_threshold`, and the spare must have
 been healthy for `server_stabilization_time` (both 10 s by default). If
@@ -643,13 +837,90 @@ been healthy for `server_stabilization_time` (both 10 s by default). If
 a finding, not a test bug: check the Autopilot configuration.
 
 ```bash
-RUN_ID=t12 RATE=<T3 last pass / 2> vault-zone-test.sh; summarise.sh t12
+RUN_ID=t12-1 RATE=<T3 last pass / 2> vault-zone-test.sh               # repeat 1
+RUN_ID=t12-2 RATE=<...> EXCLUDE_ZONE=<zone of repeat 1> vault-zone-test.sh
+RUN_ID=t12-active RATE=<...> MODE=active vault-zone-test.sh
 ```
 
-T12 is skipped on a build without zones. Stage 4 follows, so the zones
-don't have to be back in their original layout afterwards.
+T12 is skipped on a build without zones. Nothing after it depends on the
+zones' original layout.
+
+### T15: Rolling restart of Vault under load (~0.4 h)
+
+The routine, planned operation (patching, config changes, the shape of an
+upgrade), and the planned counterpart to T3f and T12. Under 350/s of leafs
+through Consul (`T15_RATE`, CSR limits removed), `vault-rolling-restart.sh`
+restarts every Vault node in Raft with `systemctl restart vault`, one at a
+time, the active node last (a graceful restart: it steps down first). After
+each, it waits for Autopilot to be healthy with failure tolerance restored,
+then 60 s. Per node it records:
+- **healthy_s:** restart to healthy;
+- **max_gap_s** and **failed_leafs** for the sidecars;
+- **signer_before / signer_after:** did restarting the node Consul signs
+  through move Consul's connection?
+- **nlb:** when the NLB stopped and resumed sending it requests.
+
+With redundancy zones, a restart that outlasts Autopilot's thresholds can
+promote the zone's spare, so the layout before and after is recorded. Runs
+after T12, with the spares in the cluster, as production would be.
+
+```bash
+consul-ca-limits.sh 0 0
+RUN_ID=t15 RATE=350 vault-rolling-restart.sh
+consul-ca-limits.sh 50 0
+```
+
+### T13: CA rotation under load (~0.5 h)
+
+The biggest leaf storm in normal operation. When Consul's root changes, every
+leaf is re-issued, paced only by `csr_max_per_second`: 100,000 leafs at 350/s
+is about 5 minutes of signing at the limit. It runs **last**, because it leaves
+the CA rotated.
+
+**The rotation target exists from the build.** Terraform signs a second mesh
+intermediate with the same offline root (`<name>/vault/mesh-ca-next`, readable
+by the load generators). Rotating Consul's `RootPKIPath` to it changes Consul's
+active root but not the trust anchor, like rotating the Vault intermediate
+before it expires.
+
+Under a constant 50/s of new leafs (`T13_RATE`: new sidecars keep arriving),
+with the CSR limit set to the recommended 350/s, `ca-rotation-test.sh`:
+1. **fills the local agent's cache with 100,000 leafs** (`T13_CACHED`), at
+   350/s. The agent keeps them fresh, as Dataplane's servers would for their
+   proxies, so a root change re-issues all of them;
+2. **rotates the signing CA:** mounts `connect_<dc>_next_inter`, lets Consul's
+   policy use it, and points `IntermediatePKIPath` at it. Consul creates a new
+   signing CA under the same root. It watches 5 minutes: did signing continue,
+   and were cached leafs re-issued (they shouldn't need to be)?
+3. **rotates the root:** mounts `pki_mesh_int_next` from the secret and points
+   `RootPKIPath` at it. Every cached leaf is re-issued. It watches until 95%
+   were, the sign rate is back to the foreground rate for a minute, or 30
+   minutes.
+
+It records, per phase: when signing moved to the new CA, leafs re-issued
+(Vault's signs on Consul's intermediates minus the foreground's), the storm's
+duration and peak sign rate (expect about the limit), and the new leafs' p99,
+failures and longest gap. The question is whether new sidecars still get
+leafs while the storm runs.
+
+```bash
+RUN_ID=t13 CACHED=100000 CSR_LIMIT=350 RATE=50 ca-rotation-test.sh
+```
 
 ## Stage 4: Vault Raft latency vs voter count
+
+**T11 normally runs as its own campaign** on a fresh 7-voter build
+(`run-campaign.sh start raft-1 --t11`, ~9–11 h). That campaign is unattended
+too; moving between the two needs a `terraform apply`, so fresh credentials.
+Running T11 on its own:
+- gives a clean 7-voter baseline, without Stages 1–3's history;
+- lets each campaign be rerun without the other, which matters because the
+  shrink is one-way: a T11 failure late in a combined run means a rebuild;
+- lets the two run in parallel if they're in separate environments.
+
+**Stage 4 runs T11 on the main build instead,** for one unattended run
+(`run-campaign.sh start plan-1 --with-t11`, ~21–25 h in all). It converts T9-V's
+spares to voters (T11 grow), then runs T11 as below.
 
 ### T11 grow: Convert the non-voters to voters (~0.2 h)
 
@@ -712,26 +983,28 @@ workloads:
   per size (`kv_perf_t11v7`, …; `max_versions=1`, keys cycled over 10,000, so
   the data set stays the same size). Every write goes through Raft on the active node (standbys forward
   it), so this isolates Raft. The smoke check records Raft applies per write.
-  - **License:** T11 needs a Vault license without the `pki-only` module. A
-    PKI-only license refuses `kv` mounts ("mounts of type kv are not supported
-    by license"), and `t11smoke` fails on its writes-reach-Raft check.
-  - **The same rate grid at every size:** 200, 400, 800, 1,600, 2,400, 3,200,
-    4,800, 6,400, 9,600 and 12,800/s. That's T3's rates up to its 12,800/s
-    maximum, plus midpoints near saturation. The grid stops at the first
-    failing rate, so unreached rates cost nothing.
+  - **The same rate grid at every size:** 200, 400, 600, 800, 1,000, 1,200
+    and 1,600/s. In raft-1, every size saturated at 1,600/s (delivered 0.60,
+    p99 27 s), so 2,400–12,800/s were never reached, and 800 → 1,600 was too
+    coarse to separate the sizes. The grid stops at the first failing rate.
   - **It stops at saturation, not at T3's 100 ms.** A step fails on
-    p99 > 1 s (`T11_KV_P99_MS`), errors ≥ 0.1% or < 95% delivered. T3's 100 ms
+    p99 > 1 s (`T11_KV_P99_MS`), errors ≥ 0.1%, < 95% delivered (VU-starved,
+    left out of the latency tables), or a guardrail break (failure tolerance
+    below (N−1)/2). T3's 100 ms
     is Vault's *signing* target; KV writes have no target, and KV v2 on 7
     voters was already about 130 ms p99 at 200/s in the smoke check. With
     100 ms the grid would stop at its first step.
   - **Run twice** (`T11_KV_REPEATS=2`), to measure run-to-run noise. A difference
     between sizes counts only when it's larger than the spread between repeats.
-- **Payload sweep:** 16 KiB and 64 KiB values at 400/s (1 KiB at 400/s is the
+- **Payload sweep:** 16 KiB and 32 KiB values at 400/s (1 KiB at 400/s is the
   grid step), **run twice** like the grid, so every payload comparison has a
   noise estimate. Bigger entries multiply what the leader sends to each follower,
-  so this is where commit latency is most likely to separate by size. 64 KiB at
-  400/s writes about 26 MB/s, well under the volume's 250 MB/s. Keys cycle over
-  200, so the large values add only about 13 MB per size.
+  so this is where commit latency is most likely to separate by size. Keys cycle
+  over 200, so the large values add only a few MB per size.
+  - **Not 64 KiB:** in raft-1, 84% of 64 KiB writes failed in all six runs, and
+    fast (p50 56 ms), so the step measured errors, not latency. The cause
+    wasn't recorded. `vault-kv-write.js` now logs the first failures' status
+    and body, so a failing payload run shows why.
 - **No stored-certificate signing.** T2 already measures the cost of storing
   certificates. In T11, deleting the stored certificates between sizes took
   about 15 minutes per 18,000 and, when a delete was cancelled, hung the active
@@ -739,8 +1012,10 @@ workloads:
 
 - **Failover** (`vault-failover-test.sh`): under 20 KV writes/s, it freezes the
   active node with `SIGSTOP` for 60 s, then `SIGCONT`: a hung or crashed
-  leader that comes back. This repeats 3 times, because election timing is
-  random. It records:
+  leader that comes back. This repeats **5 times** (`T11_FAILOVER_REPEATS`),
+  because election timing is random: in raft-1, 3 repeats at 5 voters spread
+  7.9–14.6 s, wider than the gap between the sizes' medians. Compare the
+  sizes' ranges, not just their medians. It records:
   - **new active:** time until another voter answers `/v1/sys/health` as active.
     In the raft-1 run, followers detected the frozen leader after 5–7 s and a
     new node was active after 8–11 s. The 60 s freeze leaves ample room;
@@ -791,12 +1066,12 @@ checks and Autopilot catch up. Then it runs one **chained** timeline, like T3
 and T5:
 
 ```
-| baseline 5m | KV grid ×2 | payload 16K, 64K ×2 | failover ~8m | cooldown 5m | → one export
+| baseline 5m | KV grid ×2 | payload 16K, 32K ×2 | failover ~13m | cooldown 5m | → one export
 ```
 
 - **Every step keeps the plan's 2-minute warm-up.** It absorbs carry-over, and
   T11 has the riskiest handovers: from the failing last step of one KV run
-  into the next run's 200/s, and from 64 KiB writes into the failover's load.
+  into the next run's 200/s, and from 32 KiB writes into the failover's load.
 - **Every step holds 5 minutes, not the plan's 10.** The repeats, not longer
   holds, measure the noise, and at these rates even 5 minutes puts tens of
   thousands of writes behind every p99. When you compare a T11 step with T3 at
@@ -856,9 +1131,10 @@ and one failover. Then it checks what T11 depends on:
 - **Soft checks**, recorded as warnings in RESULTS.md: the `vault_raft_apply`
   metric, the failover stages from the logs, and millisecond write-gap timing.
 
-`run-plan.sh` runs Stage 4 (`t11grow`, `t11smoke`, `t11v*`) by default, and
-`PLAN_TESTS` can leave it out. `--t11` sets `PLAN_TESTS` to
-`settle t11smoke t11v7 t11v5 t11v3`. To
+`run-plan.sh` runs Stage 4 (`t11grow`, `t11smoke`, `t11v*`) only when
+`PLAN_TESTS` names it. `--t11` sets `PLAN_TESTS` to
+`settle t11smoke t11v7 t11v5 t11v3`, and `--with-t11` to the main tests plus
+Stage 4. To
 tune it, set `T11_KV_RATES`, `T11_KV_REPEATS`, `T11_PAYLOADS`,
 `T11_PAYLOAD_RATE`, `T11_RAMP`, `T11_HOLD`, `T11_KV_P99_MS`,
 `T11_RESIZE_SETTLE`, `T11_FAILOVER_REPEATS` and `T11_FREEZE`. Manual equivalent for one size, on loadgen-0:
@@ -868,14 +1144,14 @@ vault-raft-voters.sh status                 # voters, leader, AZ spread, failure
 vault-raft-voters.sh shrink 5
 export KV_MOUNT=kv_perf_t11v5; kv-perf-mount.sh create
 export RAMP=2m HOLD=5m P99_MS=1000
-G="200 400 800 1600 2400 3200 4800 6400 9600 12800"
+G="200 400 600 800 1000 1200 1600"
 RUN_ID=t11v5-kv1 RATES="$G" COOLDOWN=0 stress-k6.sh /opt/perf/k6/vault-kv-write.js
 RUN_ID=t11v5-kv2 RATES="$G" BASELINE=0 COOLDOWN=0 stress-k6.sh /opt/perf/k6/vault-kv-write.js
-for r in 1 2; do for b in 16384 65536; do
+for r in 1 2; do for b in 16384 32768; do
   RUN_ID=t11v5-kv${b}b$r RATES=400 VALUE_BYTES=$b KEYS=200 BASELINE=0 COOLDOWN=0 \
     stress-k6.sh /opt/perf/k6/vault-kv-write.js
 done; done
-REPEATS=3 BASELINE=0 RUN_ID=t11v5-failover vault-failover-test.sh
+REPEATS=5 BASELINE=0 RUN_ID=t11v5-failover vault-failover-test.sh
 ```
 
 (Run by hand, each command exports its own Grafana window. `run-plan.sh` makes
@@ -889,7 +1165,7 @@ size, then four tables. Each column is a voter count:
 2. **Leader cost per write,** per grid rate: KB sent, CPU ms, and the ratio to
    the 3-voter value. Expect about 2× at 5 voters and 3× at 7.
 3. **Payload sweep:** commit time, client p99 and KB per write at 1, 16 and
-   64 KiB (mean of the repeats ± half their range).
+   32 KiB (mean of the repeats ± half their range).
 4. **Failover:** new active and write gap (median / max), failed writes, and
    the stages from the logs.
 
@@ -911,14 +1187,22 @@ size, then four tables. Each column is a voter count:
 | T5 vs T3c single | T5 well below single | The Consul leader is the bottleneck (RPC, Raft, CPU) |
 | T3c single vs T3 / T3c multi | Single ≪ multi | Vault's scale-out doesn't reach the Consul path |
 | T9-V vs T3 / T3c | Multi rises, single flat | Non-voters help direct clients only |
-| T5 vs targets | T5 ≥ 200/s within p99 ≤ 1 s | `csr_max_per_second` can be raised to the target |
+| T5 vs targets | T5 ≥ 350/s within p99 ≤ 1 s | `csr_max_per_second` can be raised to the target |
+| Burst vs targets | 20,000 in 60 s and 100,000 in 10 min arrive, p99 ≤ 1 s, with the limit set | The recommended limit absorbs the sized bursts |
+| T13 root rotation | Storm ≈ 100,000 / limit, new leafs still issued | Rotation is paced by the limit as designed; its duration is the cost of the limit |
+| T13 root rotation | New leafs starve or fail during the storm | Re-issues crowd out new sidecars: rotate in a quiet window, or raise the limit for the rotation |
+| T14 vs T3f | Consul leader gap ≫ Vault node gap | The Consul leader's CA setup, not Vault, dominates recovery |
+| T3f | Long gap, Consul waits for the frozen node | A hung Vault node stalls every sidecar's renewal until it recovers: weigh this in Vault health checks and timeouts |
+| T12 promotion vs T11 failover | Promotion ≈ Autopilot's two 10 s timers | Zone spares restore failure tolerance in about 20 s; a longer or missing promotion points at the Autopilot configuration |
 | T11 7 vs 5 vs 3 voters | Commit time and KV ceiling flat | Voter count is free for Vault writes: choose it for failure tolerance |
 | T11 7 vs 5 vs 3 voters | Commit p99 rises with voters | Each voter pair costs that much on every write: weigh it against the extra failure tolerance |
 | T11 failover | Write gap differs by voter count | Election time depends on cluster size; otherwise it's the heartbeat/election timeout, whatever the size |
 
-The **recommended `csr_max_per_second`** is the lower of Consul's sustained
-rate from T5/t5r and Vault's single-connection rate from T3c, within the
-targets. The report should also state the headroom above 200/s.
+The **recommended `csr_max_per_second`** is the lower of Consul's confirmed
+ceiling from T5r (the low end of its range) and Vault's single-connection rate
+from T3c (`single_max`, one connection, within 100 ms), confirmed by the burst
+test with that limit set. The report should also state the headroom above
+350/s, and how long a root rotation takes at that limit (T13).
 
 ## Results
 
@@ -930,10 +1214,15 @@ targets. The report should also state the headroom above 200/s.
 | T3c single / multi | t3c | single: / multi: | | |
 | T5 Consul path | t5 | last pass: | | |
 | T6 distribution | t6 | expected_behaviour: | | |
-| T3 / T5 refined | t3r / t5r | | | |
-| Soak, 200/s for 2 h | soak | success: ; growth: | | |
+| T3 / T5 boundary repeats | t3r / t5r | ceiling range: / | | |
+| Soak, 350/s for 2 h | soak | success: ; growth: | | |
+| Burst, CSR limit set | burst | 12k/60 s: ; 60k/10 min: | | rate-limited: |
+| T3f, Consul's Vault node frozen | t3f | max gap: ; failed: ; recovered: | | moved: ; NLB out/back: |
+| T14, Consul leader frozen (×3) | t14 | new leader: ; max gap: ; first leaf after: | | failed: |
 | T9-V Vault + 2 non-voters | t9-t3 / t9-t3c | | | |
-| T12 zone spare: join / promotion under load | t12 | joined: ; healthy: ; promoted: ; restored: | | failed requests: |
+| T12 zone spare: join / promotion under load (3 + active) | t12 | healthy (median, range): ; promoted: ; restored: | | failed requests: ; NLB out/back: |
+| T15 Vault rolling restart | t15 | failed leafs: ; max gap: ; slowest healthy: | | NLB out/back: |
+| T13 CA rotation, 100,000 cached | t13 | signing: switched ; root storm: s, peak /s | new-leaf p99: | failed: |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
 
@@ -942,26 +1231,41 @@ targets. The report should also state the headroom above 200/s.
 | Stage | Time |
 |---|---|
 | Stage 0 (incl. settle) | ~1–1.1 h |
-| Stage 1: T1 sweep, T2, T3 (chained), T3c | ~3–3.4 h |
-| Stage 2: T5 (chained), T6 (short runs), refinement, soak | ~4.1–4.5 h |
-| Stage 3: T9-V (T3 from its last pass, T3c), T12 | ~2.1 h |
-| Stage 4: T11 grow, T11 smoke check, T11 at 7, 5, 3 voters | ~7.7–10.7 h |
-| **Total** | **~18.1–22.1 h (~US$165–220 at ~US$9–10/h)** |
-| *Stages 0–3 only* (`PLAN_TESTS` without Stage 4) | *~10.4–11.4 h (~US$95–115)* |
-| *T11 as its own campaign* (`run-campaign.sh start raft-1 --t11`): Stage 0, T11 smoke check, T11 at 7, 5, 3 voters | *~9–11 h* |
+| Stage 1: T1, T3 (adaptive steps), T3r, T3c | ~3.4–3.7 h |
+| Stage 2: T5 (adaptive, from 350/s), T5r, T6, soak, burst, T3f, T14, T2 | ~5.8–6.1 h |
+| Stage 3: T9-V, T12 (3 runs + active zone), T15, T13 | ~3.2 h |
+| **Main campaign** (`plan-1`) | **~13.5–14.5 h (~US$125–145 at ~US$9–10/h)** |
+| T11 as its own campaign (`raft-1 --t11`): Stage 0, smoke check, T11 at 7, 5, 3 voters | ~9–11 h (~US$85–105) |
+| *Or Stage 4 on the main build* (`--with-t11`): T11 grow, smoke check, T11 | *+7.7–10.7 h, ~21–25 h in one run* |
+
+Against the previous plan (~10–11 h without Stage 4), the boundary repeats
+(+1.4 h), burst, T3f, T14, T15, T13, T12 repeats and 5 failover repeats add
+time; 5-minute holds below the knee, starting at the target and the T11 grid
+without unreachable rates take some back. Every number behind the
+`csr_max_per_second` recommendation now has at least two samples.
 
 Stage 4 needs no extra instances: it reuses T9-V's two nodes. The nodes it
-shrinks away keep running, and billing, until the destroy. With Stage 4, the run goes
-overnight. Chaining the multi-step tests saves about
-4 h compared with running every step with its own idle windows and export. No
-step loses warm-up or steady-state time.
+shrinks away keep running, and billing, until the destroy. Chaining the
+multi-step tests saves about 4 h compared with running every step with its
+own idle windows and export.
 
 ## Not in this plan
 
 - **Consul Dataplane load tool** (issue #1): server-side key generation and
-  cold-start/server-restart bursts.
+  cold-start/server-restart bursts, and Consul server memory with the leaf
+  cache on the servers (100,000–200,000 leafs).
+- **Planned failover** (`vault operator step-down`): an unplanned hang is the
+  harder case and is covered by T3f, T11, T12 and T14; T15 covers planned
+  restarts.
+- **Full Vault outage and recovery backlog** (issue #2).
+- **Audit device cost, and audit metrics per step** (issue #3).
+- **Raft snapshots under load** (issue #4).
+- **Network degradation between the Consul leader and Vault** (issue #5).
+- **Go runtime metrics and Consul CA expiry gauges** (issue #6).
+- **Leaf correctness under load:** SPIFFE SAN, TTL, chain (issue #7).
+- **Performance Replication lag** to a secondary cluster (DBS's plan): this
+  build is one cluster in one region.
 - **T5 with non-voters:** would measure, not infer, that non-voters don't raise
   Consul's ceiling.
-- **Pinned-node failover (T3f).**
 - **Agent-based burst and renewal tests (T7, T8).**
 - **Consul read replicas (T10).**

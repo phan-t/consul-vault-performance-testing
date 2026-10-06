@@ -170,17 +170,18 @@ running cluster by accident. To rebuild a node on purpose, use
 The step-by-step run order, commands and a results template are in
 [TEST-PLAN.md](TEST-PLAN.md).
 
-These are sized for an example mesh: **60,000 service instances
+These are sized for an example mesh: **100,000 service instances
 with sidecars on Consul Dataplane (no client agents)**, a **7-day leaf TTL**,
 and 2× growth headroom.
 
 | Event | Leafs | Window | Rate needed |
 |---|---|---|---|
-| Renewals (7-day TTL, at ~75% of TTL) | 60,000 | continuous | ~0.13/s |
-| AZ failure (⅓ of workloads reschedule) | 20,000 | 5 min | ~67/s |
-| **Rolling Consul server restart** (per server, 5 servers) | ~12,000 | ~1 min *(assumed)* | **~200/s** |
-| Cold start / DR | 60,000 | 10 min | 100/s |
-| Cold start at 2× growth | 120,000 | 10 min | 200/s |
+| Renewals (7-day TTL, at ~75% of TTL) | 100,000 | continuous | ~0.22/s |
+| AZ failure (⅓ of workloads reschedule) | ~33,000 | 5 min | ~111/s |
+| **Rolling Consul server restart** (per server, 5 servers) | ~20,000 | ~1 min *(assumed)* | **~333/s** |
+| Cold start / DR | 100,000 | 10 min | ~167/s |
+| Cold start at 2× growth | 200,000 | 10 min | ~333/s |
+| CA root rotation (every leaf re-issued) | 100,000 | paced by `csr_max_per_second` | the limit itself |
 
 With Dataplane, each Consul server issues and holds the leafs for the
 proxies connected to it, in memory. When a server restarts, its dataplanes
@@ -190,20 +191,20 @@ manages leafs and should be validated.
 
 | Target | Value |
 |---|---|
-| **Leaf throughput through Consul** | **≥ 200 leafs/s** sustained |
-| End-to-end leaf p99 at 200/s | **≤ 1 s**, errors < 0.1% (`consul-leaf.js` thresholds) |
-| Vault sign p99 on Consul's intermediate at 200/s | **≤ 100 ms**, errors < 0.1% (`vault-sign-consul-mount.js` thresholds) |
-| Guardrails at 200/s | 0 leader elections, Autopilot failure tolerance stays at 2, Raft leader last contact p99 < 200 ms |
+| **Leaf throughput through Consul** | **≥ 350 leafs/s** sustained (~333/s needed, rounded up) |
+| End-to-end leaf p99 at 350/s | **≤ 1 s**, errors < 0.1% (`consul-leaf.js` thresholds) |
+| Vault sign p99 on Consul's intermediate at 350/s | **≤ 100 ms**, errors < 0.1% (`vault-sign-consul-mount.js` thresholds) |
+| Guardrails at 350/s | 0 leader elections, Autopilot failure tolerance stays at 2, Raft leader last contact p99 < 200 ms |
 | Stretch | The actual ceilings of the Vault path (T3) and the Consul path (T5) |
 
 - **The limits are configurable per run:** `P99_MS` and `MAX_ERROR_RATE`
   (default `0.001`) override the k6 thresholds.
-- **Stress tests start near the target:** `stress-k6.sh` starts at 200/s for
-  `vault-sign-consul-mount.js` and 50/s for `consul-leaf.js`, per load
-  generator.
+- **Stress tests start at the target:** `stress-k6.sh` starts at 350/s for
+  `vault-sign-consul-mount.js` and `consul-leaf.js`, per load generator
+  (`TARGET_RATE` in `run-plan.sh` moves every target-derived rate).
 - **The main decision these results feed** is Consul's `csr_max_per_second`.
-  The default of 50/s would take about 21 minutes for a 60,000-leaf cold
-  start and about 4 minutes per server restart. Set it to what both the
+  The default of 50/s would take about 33 minutes for a 100,000-leaf cold
+  start or root rotation, and about 7 minutes per server restart. Set it to what both the
   Consul leader and Vault sustain within these targets.
 
 **What the current tests model for Dataplane:**

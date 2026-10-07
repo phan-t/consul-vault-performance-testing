@@ -1,30 +1,37 @@
 #!/bin/bash
-# T13: Consul CA rotation under load, with the CSR limit set.
+# T13: Consul signing CA rotation under load, with the CSR limit set.
 #   RUN_ID=t13 CACHED=100000 CSR_LIMIT=350 ca-rotation-test.sh
 #
-# A root rotation makes every sidecar's leaf invalid, so the whole mesh is
-# re-issued at once, paced only by Consul's CSR limit: the biggest leaf storm
-# in normal operation. Under a constant foreground load of new leafs
-# (consul-leaf.js at RATE, default 50/s: new sidecars keep arriving), it:
+# Consul renews its signing CA (the intermediate that signs leafs) on its own,
+# and operators rotate it by changing IntermediatePKIPath. Root rotation is out
+# of scope: Consul's root here is a Vault intermediate under the enterprise
+# root CA, whose lifecycle belongs to that CA (issue #12). Under a constant
+# foreground load of new leafs (consul-leaf.js at RATE, default 50/s: new
+# sidecars keep arriving), it:
 #   0. sets Consul's CSR limit to CSR_LIMIT (the recommended value) and fills
 #      the local agent's leaf cache with CACHED leafs (default 100,000, the
 #      mesh) at PREFILL_RATE. The agent keeps those leafs fresh, as Dataplane's
-#      servers would for their proxies, so a root change re-issues all of them;
+#      servers would for their proxies;
 #   1. signing CA rotation: mounts connect_<dc>_next_inter, lets Consul's policy
 #      use it and points IntermediatePKIPath at it. Consul creates a new signing
 #      CA under the same root. Watches WATCH (5m): did signing continue, and were
-#      cached leafs re-issued (they shouldn't need to be)?
-#   2. root rotation: mounts the next mesh intermediate (pki_mesh_int_next,
-#      from the <name>/vault/mesh-ca-next secret, signed by the same offline
-#      root) and points RootPKIPath at it. Consul's active root changes, and
-#      every cached leaf is re-issued: the storm. Watches until 95% of CACHED
-#      were re-issued, the sign rate is back to the foreground rate for a
-#      minute, or STORM_MAX (30m).
-# Records per phase: time until signing moved to the new CA, re-issued leafs
-# (Vault signs on Consul's intermediates minus the foreground's), the storm's
-# duration and peak sign rate, and the foreground's failures, p99 and longest
-# gap with no new leaf (k6 per-request samples). Leaves the CA rotated: run it
-# last. Writes <RUN_ID>-<node>-t13/t13.json, points.csv.gz, phases.json.
+#      cached leafs re-issued? (plan-1: switched in 15 s, 0 of 100,000 re-issued.)
+#   2. client agent check (issue #11): after the rotation a restarted client
+#      agent's auto_encrypt certificate, signed by the new signing CA, was
+#      rejected by every server ("tls: unknown certificate authority"). It
+#      restarts the local agent and records whether it reconnects within
+#      AGENT_WAIT (90s); then restarts the Consul servers one at a time
+#      (followers first, leader last, each until Autopilot is healthy), restarts
+#      the agent again and records how long it takes to reconnect.
+# PHASES="signing root" also runs a root rotation (RootPKIPath to the next mesh
+# intermediate). It needs a next intermediate bundle in <name>/vault/mesh-ca-next,
+# which the build no longer creates, and in this design Vault refuses the
+# cross-sign (issue #12), so it's kept only for reference.
+# Records: time until signing moved to the new CA, re-issued leafs (Vault signs
+# on Consul's intermediates minus the foreground's), the foreground's failures,
+# p99 and longest gap with no new leaf during the rotation (k6 per-request
+# samples), and the agent check. Leaves the CA rotated: run it last.
+# Writes <RUN_ID>-<node>-t13/t13.json, points.csv.gz, phases.json.
 . /opt/perf/scripts/lib.sh
 export CONSUL_HTTP_TOKEN="$CONSUL_OPERATOR_TOKEN"
 
@@ -34,11 +41,9 @@ PREFILL_RATE=${PREFILL_RATE:-350}
 CSR_LIMIT=${CSR_LIMIT:-350}
 WATCH=${WATCH:-5m}
 STORM_MAX=${STORM_MAX:-30m}
-# Which rotations to run: "signing root" (default), or one of them. plan-1 ran
-# the signing CA rotation alone first; afterwards a restarted client agent's
-# auto_encrypt certificate (signed by the new signing CA) was rejected by every
-# server ("tls: unknown certificate authority") until the rotation was undone.
-PHASES=${PHASES:-signing root}
+# Which rotations to run: "signing" (default) or "signing root" (see above).
+PHASES=${PHASES:-signing}
+AGENT_WAIT=${AGENT_WAIT:-90}
 NEXT_INTER="connect_${CONSUL_DATACENTER}_next_inter"
 NEXT_ROOT="pki_mesh_int_next"
 ROOT_BEFORE=""
@@ -149,8 +154,51 @@ k6_pid=$!
 trap stop_k6 EXIT
 sleep 70
 
+# agent_back <max s>: restart the local agent; print the seconds until it has a
+# leader again, or null if it doesn't within <max s> (locked out).
+agent_back() {
+  local t0 i l
+  sudo systemctl restart consul
+  t0=$(now_ms)
+  for i in $(seq 1 "$1"); do
+    l=$(curl -s --max-time 2 "${CONSUL_HTTP_ADDR:-http://127.0.0.1:8500}/v1/status/leader" || true)
+    case "$l" in *:8300*) echo $(((($(now_ms) - t0) + 500) / 1000)); return 0 ;; esac
+    sleep 1
+  done
+  echo null
+}
+# consul_rolling_restart: restart every Consul server, followers first and the
+# leader last, each until Autopilot is healthy again (asked of another server's
+# HTTPS API: the local agent may be locked out). Prints the seconds it took.
+consul_rolling_restart() {
+  local inst t0 leader n id ip i h
+  inst=$(aws ec2 describe-instances \
+    --filters "Name=tag:Project,Values=$PERF_NAME" "Name=tag:Role,Values=consul" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].{node: Tags[?Key==`Node`]|[0].Value, id: InstanceId, ip: PrivateIpAddress}' --output json)
+  srv_api() { # srv_api <skip ip> <path>
+    local x
+    for x in $(jq -r '.[].ip' <<<"$inst"); do
+      [ "$x" = "$1" ] && continue
+      curl -sk --max-time 5 -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" "https://$x:8501$2" && return 0
+    done
+    return 1
+  }
+  t0=$(now_ms)
+  leader=$(srv_api none /v1/status/leader | tr -d '"' | cut -d: -f1 || true)
+  while read -r n id ip; do
+    echo "$(date -u +%H:%M:%S) restarting Consul server $n" >&2
+    ssm_run 120 'systemctl restart consul && echo ok' "$id" >/dev/null
+    for i in $(seq 1 60); do
+      sleep 5
+      h=$(srv_api "$ip" /v1/operator/autopilot/health | jq -r '.Healthy' 2>/dev/null || true)
+      [ "$h" = true ] && break
+    done
+  done < <(jq -r --arg l "$leader" '[.[] | select(.ip != $l)] + [.[] | select(.ip == $l)] | .[] | "\(.node) \(.id) \(.ip)"' <<<"$inst")
+  echo $((($(now_ms) - t0) / 1000))
+}
+
 # --- 1. signing CA rotation --------------------------------------------------
-A0=$(now_ms); A1=$A0; a='{"skipped": true}'
+A0=$(now_ms); A1=$A0; AG1=$A0; a='{"skipped": true}'
 if grep -qw signing <<<"$PHASES"; then
 root0=$(active_root)
 mount_once "$NEXT_INTER" "Consul signing CA after T13 rotation" 8760h
@@ -162,9 +210,25 @@ a=$(watch_phase signing "$A0" 0 "$(to_secs "$WATCH")" 0)
 A1=$(now_ms)
 a=$(jq -c --arg r0 "$root0" --arg r1 "$(active_root)" '. + {active_root_changed: ($r0 != $r1)}' <<<"$a")
 echo "  signing CA rotation: $a"
+
+# --- 2. client agent check (issue #11) -----------------------------------------
+echo "$(date -u +%H:%M:%S) restarting the client agent after the rotation (up to ${AGENT_WAIT}s)"
+before=$(agent_back "$AGENT_WAIT")
+echo "  agent reconnected: ${before} s (null = locked out)"
+rr=null; after=null
+if [ "$before" = null ]; then
+  rr=$(consul_rolling_restart)
+  after=$(agent_back "$AGENT_WAIT")
+  echo "  Consul servers restarted in ${rr} s; agent reconnected after: ${after} s"
+fi
+AG1=$(now_ms)
+a=$(jq -c --argjson b "$before" --argjson rr "$rr" --argjson af "$after" \
+  '. + {agent_check: {reconnected_s: $b, locked_out: ($b == null), servers_restarted_s: $rr, reconnected_after_server_restart_s: $af}}' <<<"$a")
 fi
 
-# --- 2. root rotation --------------------------------------------------------
+# --- 3. root rotation (out of scope by default; see the header) -----------------
+B0=$(now_ms); B1=$B0; b='{"skipped": true, "reason": "out of scope: enterprise root CA (issue #12)"}'
+if grep -qw root <<<"$PHASES"; then
 mount_once "$NEXT_ROOT" "Next mesh intermediate CA (T13 root rotation)" 43800h
 aws secretsmanager get-secret-value --secret-id "$PERF_NAME/vault/mesh-ca-next" --query SecretString --output text |
   jq -r .pem_bundle > "$OUT/bundle.pem"
@@ -195,6 +259,7 @@ B1=$(now_ms)
 b=$(jq -c --arg r0 "$root1" --arg r1 "$(active_root)" --arg cs "$CROSS_SIGN" \
   '. + {active_root_changed: ($r0 != $r1), cross_signed: ($cs == "true")}' <<<"$b")
 echo "  root rotation: $b"
+fi
 sleep 30
 
 stop_k6
@@ -233,16 +298,17 @@ jq -n --argjson rate "$RATE" --argjson cached "$CACHED" --argjson lim "$CSR_LIMI
   --argjson c "${client:-{\}}" --argjson pf "$(((P1 - T1) / 1000))" \
   '{foreground_rate: $rate, cached: $cached, csr_limit: $lim, prefill_s: $pf,
     signing_rotation: ($a + {foreground: $c.signing}),
-    root_rotation: ($b + {foreground: $c.root,
-      expected_storm_s: (($cached / $lim) | round)})}' > "$OUT/t13.json"
+    root_rotation: (if $b.skipped then $b else ($b + {foreground: $c.root,
+      expected_storm_s: (($cached / $lim) | round)}) end)}' > "$OUT/t13.json"
 jq -c . "$OUT/t13.json"
 
 idle cooldown "$COOLDOWN"
 T4=$(now_ms)
 jq -n --argjson t0 "$T0" --argjson t1 "$T1" --argjson p1 "$P1" --argjson a0 "$A0" --argjson a1 "$A1" \
-  --argjson b0 "$B0" --argjson b1 "$B1" --argjson t3 "$T3" --argjson t4 "$T4" \
+  --argjson ag1 "$AG1" --argjson b0 "$B0" --argjson b1 "$B1" --argjson t3 "$T3" --argjson t4 "$T4" \
   '[{name: "baseline", start: $t0, end: $t1}, {name: "prefill", start: $t1, end: $p1},
-    {name: "rotate-signing", start: $a0, end: $a1}, {name: "rotate-root", start: $b0, end: $b1},
+    {name: "rotate-signing", start: $a0, end: $a1}, {name: "agent-check", start: $a1, end: $ag1},
+    {name: "rotate-root", start: $b0, end: $b1},
     {name: "cooldown", start: $t3, end: $t4}] | map(select(.end > .start))' > "$OUT/phases.json"
 export_grafana "$OUT" "T13 CA rotation ($RUN_ID)"
 upload_results "$OUT"

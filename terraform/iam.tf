@@ -121,8 +121,6 @@ data "aws_iam_policy_document" "loadgen" {
       aws_secretsmanager_secret.vault_init.arn,
       # Grafana credentials for run annotations and result exports.
       aws_secretsmanager_secret.monitoring.arn,
-      # The next mesh intermediate, which T13 mounts to rotate Consul's root.
-      aws_secretsmanager_secret.mesh_ca_next.arn,
     ]
   }
 

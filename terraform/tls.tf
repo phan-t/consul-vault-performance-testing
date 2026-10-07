@@ -134,32 +134,3 @@ resource "tls_locally_signed_cert" "mesh_int" {
 
   allowed_uses = ["cert_signing", "crl_signing", "digital_signature"]
 }
-
-# The NEXT mesh intermediate, for T13 (CA rotation under load): signed by the
-# same offline root, so rotating Consul's root_pki_path to it changes Consul's
-# active root (every leaf is re-issued) while the trust anchor stays the same.
-# Like rotating the Vault intermediate before it expires. Only the load
-# generators read it, when T13 mounts it; nothing uses it otherwise.
-resource "tls_private_key" "mesh_int_next" {
-  algorithm   = "ECDSA"
-  ecdsa_curve = "P256"
-}
-
-resource "tls_cert_request" "mesh_int_next" {
-  private_key_pem = tls_private_key.mesh_int_next.private_key_pem
-
-  subject {
-    common_name  = "${var.name} Vault Mesh Intermediate CA (next)"
-    organization = var.name
-  }
-}
-
-resource "tls_locally_signed_cert" "mesh_int_next" {
-  cert_request_pem      = tls_cert_request.mesh_int_next.cert_request_pem
-  ca_private_key_pem    = tls_private_key.mesh_root.private_key_pem
-  ca_cert_pem           = tls_self_signed_cert.mesh_root.cert_pem
-  is_ca_certificate     = true
-  validity_period_hours = 24 * 365 * 5
-
-  allowed_uses = ["cert_signing", "crl_signing", "digital_signature"]
-}

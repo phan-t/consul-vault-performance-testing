@@ -181,7 +181,6 @@ and 2× growth headroom.
 | **Rolling Consul server restart** (per server, 5 servers) | ~20,000 | ~1 min *(assumed)* | **~333/s** |
 | Cold start / DR | 100,000 | 10 min | ~167/s |
 | Cold start at 2× growth | 200,000 | 10 min | ~333/s |
-| CA root rotation (every leaf re-issued) | 100,000 | paced by `csr_max_per_second` | the limit itself |
 
 With Dataplane, each Consul server issues and holds the leafs for the
 proxies connected to it, in memory. When a server restarts, its dataplanes
@@ -204,7 +203,7 @@ manages leafs and should be validated.
   (`TARGET_RATE` in `run-plan.sh` moves every target-derived rate).
 - **The main decision these results feed** is Consul's `csr_max_per_second`.
   The default of 50/s would take about 33 minutes for a 100,000-leaf cold
-  start or root rotation, and about 7 minutes per server restart. Set it to what both the
+  start, and about 7 minutes per server restart. Set it to what both the
   Consul leader and Vault sustain within these targets.
 
 **What the current tests model for Dataplane:**

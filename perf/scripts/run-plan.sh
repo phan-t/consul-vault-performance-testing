@@ -47,9 +47,11 @@
 # times (consul-leader-failover.sh): election plus the new leader's CA setup.
 # t15: restart every Vault node in Raft, the active one last, under T15_RATE of
 # leafs (vault-rolling-restart.sh).
-# t13: CA rotation under load (ca-rotation-test.sh): T13_CACHED leafs cached on
-# the agent, CSR limit BURST_CSR_RATE, then the signing CA and the root are
-# rotated; the root rotation re-issues every cached leaf.
+# t13: signing CA rotation under load (ca-rotation-test.sh): T13_CACHED leafs
+# cached on the agent, CSR limit BURST_CSR_RATE, then Consul's signing CA is
+# rotated, and a restarted client agent is checked for the auto_encrypt lock-out
+# (issue #11; Consul servers restarted if it's locked out). Root rotation is
+# out of scope: the root is the enterprise root CA's (issue #12).
 # Rates default to TARGET_RATE (350/s, README Targets: a 100,000-sidecar mesh).
 #
 # Stage 4 (opt-in: PLAN_TESTS must name it; run-campaign.sh --with-t11) runs T11
@@ -533,14 +535,14 @@ t15() {
   sset '.values.t15' "$(jq -c '. + {expected_failure_tolerance: 1}' "$RESULTS_DIR/$PLAN-t15-$PERF_NODE-t15/t15.json")"
 }
 
-# t13: CA rotation (signing CA, then root) under load, with the CSR limit set to
+# t13: signing CA rotation under load, with the CSR limit set to
 # BURST_CSR_RATE and T13_CACHED leafs cached on the agent. Last in the plan: it
 # leaves the CA rotated.
 t13() {
   limits_remove; trap limits_restore EXIT
   set +e
   RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" \
-    PHASES="${T13_PHASES:-signing root}" ca-rotation-test.sh
+    PHASES="${T13_PHASES:-signing}" ca-rotation-test.sh
   local rc=$?
   set -e
   limits_restore; trap - EXIT
@@ -870,12 +872,14 @@ results_md() {
             + "\([$r.nodes[]?.nlb.back_s // empty] | sort | if length > 0 then .[length / 2 | floor] else "?" end) s"
             + (if ($r.never_healthy // []) | length > 0 then "; **never healthy: \($r.never_healthy | join(", "))**" else "" end)
          elif $k == "t13" and v("t13").note then v("t13").note
-         elif $k == "t13" then v("t13") as $c | "CSR limit \($c.csr_limit // "?")/s, \($c.cached // "?") cached leafs. Signing CA rotation: switched \($c.signing_rotation.switched_s // "?") s, "
-            + "re-issued ~\($c.signing_rotation.reissued_approx // "?"), \($c.signing_rotation.foreground.failed // "?") new-leaf failures. "
-            + "Root rotation: storm \($c.root_rotation.duration_s // "?") s (expected ~\($c.root_rotation.expected_storm_s // "?") s at the limit), "
-            + "re-issued ~\($c.root_rotation.reissued_approx // "?"), peak \($c.root_rotation.peak_signs_per_s // "?") signs/s; "
-            + "new leafs during it: p99 \($c.root_rotation.foreground.p99_ms // "?") ms, \($c.root_rotation.foreground.failed // "?") failed, "
-            + "longest gap \($c.root_rotation.foreground.max_gap_s // "?") s"
+         elif $k == "t13" then v("t13") as $c | ($c.signing_rotation // {}) as $sr
+            | "CSR limit \($c.csr_limit // "?")/s, \($c.cached // "?") cached leafs. Signing CA rotation: switched \($sr.switched_s // "?") s, "
+            + "re-issued ~\($sr.reissued_approx // "?"), new leafs: \($sr.foreground.failed // "?") failed, p99 \($sr.foreground.p99_ms // "?") ms, "
+            + "longest gap \($sr.foreground.max_gap_s // "?") s. Restarted client agent: "
+            + ($sr.agent_check // null | if . == null then "not checked"
+                elif .locked_out then "**locked out** (issue #11); Consul servers restarted in \(.servers_restarted_s // "?") s, then reconnected in \(.reconnected_after_server_restart_s // "never") s"
+                else "reconnected in \(.reconnected_s) s" end)
+            + (if ($c.root_rotation // {}) | .skipped then "" else "; root rotation: storm \($c.root_rotation.duration_s // "?") s, re-issued ~\($c.root_rotation.reissued_approx // "?")" end)
          elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
@@ -971,7 +975,7 @@ run)
     "t9v:Vault + non-voters: T3 from its last pass, then T3c" \
     "t12:redundancy zones: re-add a spare and fail its zone's voter, under load (x${T12_REPEATS} + active zone)" \
     "t15:rolling restart of every Vault node under ${T15_RATE}/s of leafs" \
-    "t13:CA rotation (signing CA, then root) under load, ${T13_CACHED} cached leafs, CSR limit ${BURST_CSR_RATE}/s" \
+    "t13:signing CA rotation under load, ${T13_CACHED} cached leafs, CSR limit ${BURST_CSR_RATE}/s" \
     "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \
     "t11v7:Vault Raft latency, 7 voters" "t11v5:Vault Raft latency, 5 voters (shrinks Vault)" \

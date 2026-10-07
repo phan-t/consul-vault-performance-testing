@@ -20,7 +20,7 @@
 | 3: Vault scale-out | T9-V | Do 2 non-voters (redundancy zone spares, performance standbys) raise T3 and T3c? | ~1.5 h |
 | | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? 3 runs, plus 1 in the active node's zone | ~0.8 h |
 | | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
-| | T13 | What happens when Consul's CA rotates under load: the signing CA, then the root, which re-issues all 100,000 leafs? Runs last: it leaves the CA rotated | ~0.5 h |
+| | T13 | What does rotating Consul's signing CA under load do to sidecars and to client agents that restart? (Root rotation is out of scope.) Runs last: it leaves the signing CA rotated | ~0.5 h |
 | *Own campaign* | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~9–11 h |
 
 The tests run in the order of this table, as one unattended campaign
@@ -174,7 +174,7 @@ Each test's windows, and why some differ:
 | T9-V T3 rerun | 5m / 5m | 2m per step | 10m every step | Starts at T3's last pass, already near the ceiling |
 | T12 (3 + 1 runs) | 5m first / 5m last, 1m between | 30s, then 60s steady before the join | join ~1–2m, freeze until promoted + 30s | An event under load |
 | T15 | 5m / 5m | 30s, then 2m steady before the first restart | per node: until healthy, then 60s | An event under load |
-| T13 | 5m / 5m | the cache fill (~5m at 350/s), then 60s of foreground | signing CA 5m; root until the storm ends (≤ 30m) | An event under load |
+| T13 | 5m / 5m | the cache fill (~5m at 350/s), then 60s of foreground | signing CA 5m, then the agent check (up to ~5m with server restarts) | An event under load |
 | T11, per size | 5m / 5m once per size | 2m per step | 5m | The repeats measure noise; repeat spread in raft-1 was tiny |
 | t11smoke | 1m / 1m | 30s | 1m | A check that the measurements work, not a measurement |
 
@@ -872,42 +872,53 @@ RUN_ID=t15 RATE=350 vault-rolling-restart.sh
 consul-ca-limits.sh 50 0
 ```
 
-### T13: CA rotation under load (~0.5 h)
+### T13: Signing CA rotation under load (~0.5 h)
 
-The biggest leaf storm in normal operation. When Consul's root changes, every
-leaf is re-issued, paced only by `csr_max_per_second`: 100,000 leafs at 350/s
-is about 5 minutes of signing at the limit. It runs **last**, because it leaves
-the CA rotated.
+Consul renews its signing CA, the intermediate that signs leafs, on its own at
+half its TTL, and operators rotate it by changing `IntermediatePKIPath`. T13
+checks what that does to sidecars and to client agents. It runs **last**,
+because it leaves the signing CA rotated.
 
-**The rotation target exists from the build.** Terraform signs a second mesh
-intermediate with the same offline root (`<name>/vault/mesh-ca-next`, readable
-by the load generators). Rotating Consul's `RootPKIPath` to it changes Consul's
-active root but not the trust anchor, like rotating the Vault intermediate
-before it expires.
+**Root rotation is out of scope.** Consul's root here is a Vault intermediate
+under the enterprise root CA, so replacing it belongs to that CA's lifecycle.
+In plan-1 it also turned out that Consul can't rotate an externally signed root
+in this design: Vault refuses the cross-sign (issue #12, closed as out of
+scope). Only a root change forces every leaf to be re-issued. The load of a full
+re-issue is covered by the burst test: 100,000 leafs in 10 minutes at the
+350/s limit.
 
 Under a constant 50/s of new leafs (`T13_RATE`: new sidecars keep arriving),
 with the CSR limit set to the recommended 350/s, `ca-rotation-test.sh`:
 1. **fills the local agent's cache with 100,000 leafs** (`T13_CACHED`), at
    350/s. The agent keeps them fresh, as Dataplane's servers would for their
-   proxies, so a root change re-issues all of them;
+   proxies;
 2. **rotates the signing CA:** mounts `connect_<dc>_next_inter`, lets Consul's
    policy use it, and points `IntermediatePKIPath` at it. Consul creates a new
    signing CA under the same root. It watches 5 minutes: did signing continue,
-   and were cached leafs re-issued (they shouldn't need to be)?
-3. **rotates the root:** mounts `pki_mesh_int_next` from the secret and points
-   `RootPKIPath` at it. Every cached leaf is re-issued. It watches until 95%
-   were, the sign rate is back to the foreground rate for a minute, or 30
-   minutes.
+   and were cached leafs re-issued? In plan-1, signing switched in 15 s and
+   **0 of 100,000** were re-issued. Existing leafs still verify against the old
+   signing CA and move to the new one at their normal renewal;
+3. **checks a client agent (issue #11):** in plan-1, after the rotation, a
+   restarted client agent's `auto_encrypt` certificate, now signed by the new
+   signing CA, was rejected by every server (`tls: unknown certificate
+   authority`). T13 restarts the local agent and records whether it reconnects
+   within 90 s (`AGENT_WAIT`). If it's locked out, it restarts the Consul
+   servers one at a time, followers first and the leader last, each until
+   Autopilot is healthy, which was the workaround in plan-1. Then it restarts
+   the agent again and records how long it takes to reconnect.
 
-It records, per phase: when signing moved to the new CA, leafs re-issued
-(Vault's signs on Consul's intermediates minus the foreground's), the storm's
-duration and peak sign rate (expect about the limit), and the new leafs' p99,
-failures and longest gap. The question is whether new sidecars still get
-leafs while the storm runs.
+It records: when signing moved to the new CA, leafs re-issued (Vault's signs
+on Consul's intermediates minus the foreground's), the new leafs' failures,
+p99 and longest gap during the rotation, and the agent check: locked out or
+not, how long the server restarts took, and reconnect time after them.
 
 ```bash
 RUN_ID=t13 CACHED=100000 CSR_LIMIT=350 RATE=50 ca-rotation-test.sh
 ```
+
+`PHASES="signing root"` also runs the root rotation, kept for reference only.
+It needs a next mesh intermediate in `<name>/vault/mesh-ca-next`, which the
+build no longer creates, and in this design Vault refuses its cross-sign.
 
 ## Stage 4: Vault Raft latency vs voter count
 
@@ -1191,8 +1202,8 @@ size, then four tables. Each column is a voter count:
 | T9-V vs T3 / T3c | Multi rises, single flat | Non-voters help direct clients only |
 | T5 vs targets | T5 ≥ 350/s within p99 ≤ 1 s | `csr_max_per_second` can be raised to the target |
 | Burst vs targets | 20,000 in 60 s and 100,000 in 10 min arrive, p99 ≤ 1 s, with the limit set | The recommended limit absorbs the sized bursts |
-| T13 root rotation | Storm ≈ 100,000 / limit, new leafs still issued | Rotation is paced by the limit as designed; its duration is the cost of the limit |
-| T13 root rotation | New leafs starve or fail during the storm | Re-issues crowd out new sidecars: rotate in a quiet window, or raise the limit for the rotation |
+| T13 signing CA rotation | No re-issue, no new-leaf failures | Signing CA rotation is safe for sidecars |
+| T13 agent check | Restarted agent locked out until the servers restart | After a signing CA rotation, restart the Consul servers before any client agent restarts (issue #11) |
 | T14 vs T3f | Consul leader gap ≫ Vault node gap | The Consul leader's CA setup, not Vault, dominates recovery |
 | T3f | Long gap, Consul waits for the frozen node | A hung Vault node stalls every sidecar's renewal until it recovers: weigh this in Vault health checks and timeouts |
 | T12 promotion vs T11 failover | Promotion ≈ Autopilot's two 10 s timers | Zone spares restore failure tolerance in about 20 s; a longer or missing promotion points at the Autopilot configuration |
@@ -1204,7 +1215,8 @@ The **recommended `csr_max_per_second`** is the lower of Consul's confirmed
 ceiling from T5r (the low end of its range) and Vault's single-connection rate
 from T3c (`single_max`, one connection, within 100 ms), confirmed by the burst
 test with that limit set. The report should also state the headroom above
-350/s, and how long a root rotation takes at that limit (T13).
+350/s, and how long a full re-issue of 100,000 leafs takes at that limit
+(about 5 minutes at 350/s; the burst test covers that load).
 
 ## Results
 
@@ -1224,7 +1236,7 @@ test with that limit set. The report should also state the headroom above
 | T9-V Vault + 2 non-voters | t9-t3 / t9-t3c | | | |
 | T12 zone spare: join / promotion under load (3 + active) | t12 | healthy (median, range): ; promoted: ; restored: | | failed requests: ; NLB out/back: |
 | T15 Vault rolling restart | t15 | failed leafs: ; max gap: ; slowest healthy: | | NLB out/back: |
-| T13 CA rotation, 100,000 cached | t13 | signing: switched ; root storm: s, peak /s | new-leaf p99: | failed: |
+| T13 signing CA rotation, 100,000 cached | t13 | switched: ; re-issued: | new-leaf p99: | agent: locked out? ; reconnected after server restart: |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
 
@@ -1259,6 +1271,9 @@ own idle windows and export.
 - **Planned failover** (`vault operator step-down`): an unplanned hang is the
   harder case and is covered by T3f, T11, T12 and T14; T15 covers planned
   restarts.
+- **Root CA rotation:** the root is the enterprise root CA's, and its lifecycle
+  sits with that CA. In this design Consul can't rotate an externally signed
+  root anyway (issue #12, closed).
 - **Full Vault outage and recovery backlog** (issue #2).
 - **Audit device cost, and audit metrics per step** (issue #3).
 - **Raft snapshots under load** (issue #4).

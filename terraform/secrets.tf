@@ -79,25 +79,6 @@ resource "aws_secretsmanager_secret_version" "mesh_ca" {
   })
 }
 
-# The next mesh intermediate bundle, for T13 (CA rotation; see tls.tf). Read by
-# the load generators, which mount it in Vault when T13 runs.
-resource "aws_secretsmanager_secret" "mesh_ca_next" {
-  name                    = "${var.name}/vault/mesh-ca-next"
-  description             = "Next mesh intermediate CA bundle (signed by the offline root), for the CA rotation test"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "mesh_ca_next" {
-  secret_id = aws_secretsmanager_secret.mesh_ca_next.id
-  secret_string = jsonencode({
-    pem_bundle = join("", [
-      tls_private_key.mesh_int_next.private_key_pem,
-      tls_locally_signed_cert.mesh_int_next.cert_pem,
-      tls_self_signed_cert.mesh_root.cert_pem,
-    ])
-  })
-}
-
 # Written by vault-0 after `vault operator init` (root token + recovery key).
 # Test environment only: operators and load generators read the root token.
 resource "aws_secretsmanager_secret" "vault_init" {

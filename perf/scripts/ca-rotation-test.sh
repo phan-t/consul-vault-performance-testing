@@ -34,6 +34,11 @@ PREFILL_RATE=${PREFILL_RATE:-350}
 CSR_LIMIT=${CSR_LIMIT:-350}
 WATCH=${WATCH:-5m}
 STORM_MAX=${STORM_MAX:-30m}
+# Which rotations to run: "signing root" (default), or one of them. plan-1 ran
+# the signing CA rotation alone first; afterwards a restarted client agent's
+# auto_encrypt certificate (signed by the new signing CA) was rejected by every
+# server ("tls: unknown certificate authority") until the rotation was undone.
+PHASES=${PHASES:-signing root}
 NEXT_INTER="connect_${CONSUL_DATACENTER}_next_inter"
 NEXT_ROOT="pki_mesh_int_next"
 ROOT_BEFORE=""
@@ -41,37 +46,49 @@ ROOT_BEFORE=""
 OUT="$RESULTS_DIR/$RUN_ID-$PERF_NODE-t13"
 mkdir -p "$OUT"
 cat > "$OUT/params.json" <<P
-{"tool":"ca-rotation-test","run_id":"$RUN_ID","node":"$PERF_NODE","rate":$RATE,"cached":$CACHED,"prefill_rate":$PREFILL_RATE,"csr_limit":$CSR_LIMIT,"watch":"$WATCH","storm_max":"$STORM_MAX","baseline":"$BASELINE","cooldown":"$COOLDOWN"}
+{"tool":"ca-rotation-test","run_id":"$RUN_ID","node":"$PERF_NODE","phases":"$PHASES","rate":$RATE,"cached":$CACHED,"prefill_rate":$PREFILL_RATE,"csr_limit":$CSR_LIMIT,"watch":"$WATCH","storm_max":"$STORM_MAX","baseline":"$BASELINE","cooldown":"$COOLDOWN"}
 P
 PROM=$(prom_url)
 
-# Total Vault signs on Consul's intermediates (old and new mounts) right now.
-signs_now() {
-  prom_query "$PROM" "sum(${SIGN_METRIC})" "$(date +%s)" | jq -r '.[0].value[1] // "0" | tonumber | floor'
+# Vault signs on Consul's intermediates (old and new mounts) in the last <s>
+# seconds. increase() copes with series appearing or resetting (a raw sum once
+# dropped by thousands when a series vanished).
+signs_in() {
+  prom_query "$PROM" "sum(increase(${SIGN_METRIC}[${1}s]))" "$(date +%s)" | jq -r '.[0].value[1] // "0" | tonumber | floor'
 }
 active_root() { curl -sf -H "X-Consul-Token: $CONSUL_HTTP_TOKEN" "${CONSUL_HTTP_ADDR:-http://127.0.0.1:8500}/v1/agent/connect/ca/roots" | jq -r .ActiveRootID; }
-# set_ca <jq filter on .Config>: change Consul's CA config, keeping everything else.
+# set_ca <jq filter on .Config> [force]: change Consul's CA config, keeping
+# everything else. "force" adds ForceWithoutCrossSigning (see the root rotation).
 set_ca() {
-  consul connect ca get-config | jq "{Provider, Config: (.Config | $1)}" > "$OUT/ca-config-new.json"
+  consul connect ca get-config | jq --arg f "${2:-}" \
+    "{Provider, Config: (.Config | $1)} + (if \$f == \"force\" then {ForceWithoutCrossSigning: true} else {} end)" > "$OUT/ca-config-new.json"
   consul connect ca set-config -config-file "$OUT/ca-config-new.json"
   rm -f "$OUT/ca-config-new.json"
 }
-# Let Consul's token use a new mount, like the bootstrap policy does for the originals.
+# Let Consul's token use a new mount, like the bootstrap policy does for the
+# originals. A root mount also gets root/sign-self-issued: on a root rotation
+# Consul has the OLD root cross-sign the new one (plan-1's first T13 failed
+# with 403 on pki_mesh_int/root/sign-self-issued).
 allow_path() { # allow_path <mount> root|intermediate
-  local pol
+  local pol line add=""
   pol=$(vault policy read consul-connect-ca)
   if [ "$2" = root ]; then
-    pol+="
-path \"/sys/mounts/$1\" { capabilities = [\"read\"] }
-path \"/$1/\" { capabilities = [\"read\"] }
-path \"/$1/root/sign-intermediate\" { capabilities = [\"update\"] }"
+    set -- "$1" "path \"/sys/mounts/$1\" { capabilities = [\"read\"] }" \
+      "path \"/$1/\" { capabilities = [\"read\"] }" \
+      "path \"/$1/root/sign-intermediate\" { capabilities = [\"update\"] }" \
+      "path \"/$1/root/sign-self-issued\" { capabilities = [\"sudo\", \"update\"] }"
   else
-    pol+="
-path \"/sys/mounts/$1\" { capabilities = [\"read\"] }
-path \"/sys/mounts/$1/tune\" { capabilities = [\"update\"] }
-path \"/$1/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }"
+    set -- "$1" "path \"/sys/mounts/$1\" { capabilities = [\"read\"] }" \
+      "path \"/sys/mounts/$1/tune\" { capabilities = [\"update\"] }" \
+      "path \"/$1/*\" { capabilities = [\"create\", \"read\", \"update\", \"delete\", \"list\"] }"
   fi
-  vault policy write consul-connect-ca - <<<"$pol" >/dev/null
+  shift
+  # Only paths the policy doesn't have yet (no duplicate path blocks).
+  for line in "$@"; do
+    grep -qF "${line%% \{*}" <<<"$pol" || add+=$'\n'"$line"
+  done
+  [ -n "$add" ] && vault policy write consul-connect-ca - <<<"$pol$add" >/dev/null
+  return 0
 }
 # switched: has the rotation taken effect? signing: the new mount has signs;
 # root: Consul's active root ID changed.
@@ -88,17 +105,16 @@ mount_once() { # mount_once <path> <description> <max lease ttl>
     vault secrets enable -path="$1" -description="$2" pki
   vault secrets tune -max-lease-ttl="$3" "$1"
 }
-# watch_phase <signing|root> <t0 ms> <signs at t0> <max s> <stop when re-issued >= this>:
+# watch_phase <signing|root> <t0 ms> <unused> <max s> <stop when re-issued >= this>:
 # polls every 15 s; prints JSON {switched_s, reissued_approx, peak_signs_per_s, duration_s, storm_seen}.
 watch_phase() {
-  local name=$1 t0=$2 s0=$3 max=$4 goal=$5 now s el reissued rate prev=$3 tprev=$2 peak=0 started=false quiet=0 sw=null
+  local name=$1 t0=$2 max=$4 goal=$5 now el reissued rate peak=0 started=false quiet=0 sw=null
   while :; do
     sleep 15
-    now=$(now_ms); s=$(signs_now)
+    now=$(now_ms)
     el=$(((now - t0) / 1000))
-    rate=$(((s - prev) * 1000 / (now - tprev > 0 ? now - tprev : 1)))
-    prev=$s; tprev=$now
-    reissued=$((s - s0 - RATE * el))
+    rate=$(($(signs_in 30) / 30))
+    reissued=$(($(signs_in "$((el > 15 ? el : 15))") - RATE * el))
     [ "$reissued" -lt 0 ] && reissued=0
     [ "$rate" -gt "$peak" ] && peak=$rate
     if [ "$sw" = null ] && switched "$name"; then sw=$el; fi
@@ -134,16 +150,19 @@ trap stop_k6 EXIT
 sleep 70
 
 # --- 1. signing CA rotation --------------------------------------------------
+A0=$(now_ms); A1=$A0; a='{"skipped": true}'
+if grep -qw signing <<<"$PHASES"; then
 root0=$(active_root)
 mount_once "$NEXT_INTER" "Consul signing CA after T13 rotation" 8760h
 allow_path "$NEXT_INTER" intermediate
-A0=$(now_ms); a_s0=$(signs_now)
+A0=$(now_ms)
 echo "$(date -u +%H:%M:%S) rotating the signing CA: IntermediatePKIPath -> $NEXT_INTER"
 set_ca "del(.intermediate_pki_path) | .IntermediatePKIPath = \"$NEXT_INTER\""
-a=$(watch_phase signing "$A0" "$a_s0" "$(to_secs "$WATCH")" 0)
+a=$(watch_phase signing "$A0" 0 "$(to_secs "$WATCH")" 0)
 A1=$(now_ms)
 a=$(jq -c --arg r0 "$root0" --arg r1 "$(active_root)" '. + {active_root_changed: ($r0 != $r1)}' <<<"$a")
 echo "  signing CA rotation: $a"
+fi
 
 # --- 2. root rotation --------------------------------------------------------
 mount_once "$NEXT_ROOT" "Next mesh intermediate CA (T13 root rotation)" 43800h
@@ -156,14 +175,25 @@ for id in $(vault list -format=json "$NEXT_ROOT/issuers" | jq -r '.[]'); do
     vault write "$NEXT_ROOT/config/issuers" default="$id" >/dev/null
 done
 allow_path "$NEXT_ROOT" root
+# Consul cross-signs the new root with the current one: allow that on the current root too.
+cur_root=$(consul connect ca get-config | jq -r '.Config.RootPKIPath // .Config.root_pki_path')
+allow_path "$cur_root" root
 root1=$(active_root)
 ROOT_BEFORE=$root1
-B0=$(now_ms); b_s0=$(signs_now)
-echo "$(date -u +%H:%M:%S) rotating the root: RootPKIPath -> $NEXT_ROOT"
-set_ca "del(.root_pki_path) | .RootPKIPath = \"$NEXT_ROOT\""
+B0=$(now_ms); b_s0=0
+# Without cross-signing: Consul cross-signs a new root with the old one through
+# Vault's root/sign-self-issued, which only accepts self-issued certificates.
+# Here (as in the HLD) Consul's root is a Vault intermediate under an offline
+# root, so is the new one, and Vault refuses ("given certificate is not
+# self-issued", plan-1). Rotating needs ForceWithoutCrossSigning, which Consul
+# documents can cause connection failures until every proxy has a new leaf.
+CROSS_SIGN=${CROSS_SIGN:-false}
+echo "$(date -u +%H:%M:%S) rotating the root: RootPKIPath -> $NEXT_ROOT (cross-signing: $CROSS_SIGN)"
+set_ca "del(.root_pki_path) | .RootPKIPath = \"$NEXT_ROOT\"" "$([ "$CROSS_SIGN" = true ] || echo force)"
 b=$(watch_phase root "$B0" "$b_s0" "$(to_secs "$STORM_MAX")" $((CACHED * 95 / 100)))
 B1=$(now_ms)
-b=$(jq -c --arg r0 "$root1" --arg r1 "$(active_root)" '. + {active_root_changed: ($r0 != $r1)}' <<<"$b")
+b=$(jq -c --arg r0 "$root1" --arg r1 "$(active_root)" --arg cs "$CROSS_SIGN" \
+  '. + {active_root_changed: ($r0 != $r1), cross_signed: ($cs == "true")}' <<<"$b")
 echo "  root rotation: $b"
 sleep 30
 

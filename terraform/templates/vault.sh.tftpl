@@ -216,6 +216,9 @@ path "/${mesh_pki_path}/" {
 path "/${mesh_pki_path}/root/sign-intermediate" {
   capabilities = ["update"]
 }
+path "/${mesh_pki_path}/root/sign-self-issued" {
+  capabilities = ["sudo", "update"]
+}
 path "/${inter_pki_path}/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }

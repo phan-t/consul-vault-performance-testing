@@ -539,7 +539,8 @@ t15() {
 t13() {
   limits_remove; trap limits_restore EXIT
   set +e
-  RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" ca-rotation-test.sh
+  RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" \
+    PHASES="${T13_PHASES:-signing root}" ca-rotation-test.sh
   local rc=$?
   set -e
   limits_restore; trap - EXIT
@@ -868,6 +869,7 @@ results_md() {
             + "slowest back to healthy \($r.healthy_s_max // "?") s, NLB out/back (median) \([$r.nodes[]?.nlb.out_s // empty] | sort | if length > 0 then .[length / 2 | floor] else "?" end)/"
             + "\([$r.nodes[]?.nlb.back_s // empty] | sort | if length > 0 then .[length / 2 | floor] else "?" end) s"
             + (if ($r.never_healthy // []) | length > 0 then "; **never healthy: \($r.never_healthy | join(", "))**" else "" end)
+         elif $k == "t13" and v("t13").note then v("t13").note
          elif $k == "t13" then v("t13") as $c | "CSR limit \($c.csr_limit // "?")/s, \($c.cached // "?") cached leafs. Signing CA rotation: switched \($c.signing_rotation.switched_s // "?") s, "
             + "re-issued ~\($c.signing_rotation.reissued_approx // "?"), \($c.signing_rotation.foreground.failed // "?") new-leaf failures. "
             + "Root rotation: storm \($c.root_rotation.duration_s // "?") s (expected ~\($c.root_rotation.expected_storm_s // "?") s at the limit), "
@@ -943,7 +945,7 @@ start)
   if systemctl is-active --quiet "$UNIT"; then echo "$UNIT is already running"; exit 1; fi
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
-    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT TARGET_RATE T13_CACHED T13_RATE T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
+    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
     P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done

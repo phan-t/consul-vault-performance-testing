@@ -817,7 +817,9 @@ results_md() {
     "# Results: \(.plan)\n",
     "| Test | Status | Minutes | Guardrails | Raft data (MB, growth) | Key result |", "|---|---|---:|---|---:|---|",
     (.tests | to_entries[] | . as $t | $t.key as $k
-      | "| \($k) | \($t.value.status) | \($t.value.minutes // "-") | \($t.value | g) | "
+      # A clean-up that failed after the measurement was saved is a warning, not a failed test (issue #10).
+      | (v($k).cleanup // null) as $cu
+      | "| \($k) | \($t.value.status)\(if $cu and ($cu.ok | not) then " (clean-up failed: \($cu.reason // "?"))" else "" end) | \($t.value.minutes // "-") | \($t.value | g) | "
         + ($t.value.raft_data // {} | if .data_mb then "\(.data_mb | round) (\(if (.data_growth_mb // 0) >= 0 then "+" else "" end)\(.data_growth_mb // 0 | round))" else "-" end) + " | " +
         (if $k == "t1" then "knee \(v("t1").knee.workers // "?") workers: \(v("t1").knee.rps // "?")/s, p99 \(v("t1").knee.p99_ms // "?") ms, \(v("t1").knee.vault_nodes_serving // "?") Vault node(s) serving (\(v("t1").knee.vault_nodes_busy // "?") busy)"
          elif $k == "t2" then "store @ \(v("t2").workers // "?") workers: \(v("t2").rps // "?")/s, p99 \(v("t2").p99_ms // "?") ms, \(v("t2").vault_nodes_serving // "?") Vault node(s) serving"

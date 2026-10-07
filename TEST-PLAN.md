@@ -106,7 +106,7 @@ See README → *Targets* for how these were sized.
 - **Mesh PKI:**
 
 ```
-offline root → Vault intermediate (pki_mesh_int) → Consul signing CA (connect_dc1_inter) → leafs
+enterprise root CA (simulated by Terraform) → Vault intermediate (pki_mesh_int) → Consul signing CA (connect_dc1_inter) → leafs
 ```
 
 Leafs are issued with `no_store`.

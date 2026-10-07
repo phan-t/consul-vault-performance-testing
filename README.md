@@ -32,7 +32,7 @@ through **HCP Terraform (TFC)**.
 | Vault non-voters | `vault_non_voter_count = 0` | Autopilot redundancy zone spares (Enterprise, `vault_redundancy_zones = true`): voter *i* is in `zone-i`, and `vault-nv-N` joins `zone-N` as a non-voter that Autopilot promotes if that zone's voter fails. With `vault_redundancy_zones = false`, permanent non-voters (`retry_join_as_non_voter`). Either way, they run as performance standbys |
 | Consul Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 data volume | `2.0.1+ent`, pinned (see [Consul version](#consul-version)). TLS, gossip encryption, ACLs (default deny), auto_encrypt for clients |
 | Consul read replicas | `consul_read_replica_count = 0` | `read_replica = true` (Enterprise non-voting servers) |
-| Connect CA | Vault provider, external root | Offline root → Vault intermediate (`pki_mesh_int`, Vault-managed) → Consul signing intermediate (`connect_<dc>_inter`) → leafs. The `leaf-cert` role uses `no_store=true`. Auth uses the Vault **AWS IAM auth method** (no static Vault token). See [Mesh PKI](#mesh-pki) |
+| Connect CA | Vault provider, external root | Enterprise root CA (simulated by Terraform) → Vault intermediate (`pki_mesh_int`, Vault-managed) → Consul signing intermediate (`connect_<dc>_inter`) → leafs. The `leaf-cert` role uses `no_store=true`. Auth uses the Vault **AWS IAM auth method** (no static Vault token). See [Mesh PKI](#mesh-pki) |
 | Load generators | 2 × `r7i.4xlarge` (memory for the client agent's leaf cache) | Consul client agent, k6 `2.3.0`, vault-benchmark `0.3.0`, Vault CLI |
 | Monitoring | 1 × `m7i.xlarge` | Prometheus (EC2 service discovery) and Grafana, with a provisioned dashboard |
 | Access | SSM Session Manager | No SSH and no public IPs on the nodes. By default, no inbound traffic from outside the VPC; an optional public ALB for Grafana (and the Vault and Consul UIs) is off unless `grafana_public_zone` is set |
@@ -59,15 +59,23 @@ by about 93% here. Note that 2.0.1 lacks the security fixes in 2.0.2–2.0.4.
 
 ## Mesh PKI
 
-This mirrors a typical enterprise PKI, where the root CA is offline and never
-in Vault:
+The hierarchy is **enterprise root CA → Vault intermediate → Consul**, as in a
+typical enterprise PKI: the root CA belongs to the organisation and is never in
+Vault. Terraform simulates the enterprise root CA here:
 
 ```
-Offline Mesh Root CA (ECDSA P-384, 10 yr)     Terraform; key only in TFC state
-  └─ Vault Mesh Intermediate (P-256, 5 yr)    pki_mesh_int (Vault-managed)
+Enterprise root CA (ECDSA P-384, 10 yr)       simulated by Terraform ("Offline Mesh Root CA");
+  │                                           key only in TFC state
+  └─ Vault intermediate (P-256, 5 yr)         pki_mesh_int (Vault-managed)
        └─ Consul signing CA (1 yr)            connect_<dc>_inter (managed by Consul)
-            └─ leaf certificates (72 h)       role leaf-cert, no_store=true
+            └─ leaf certificates (7 days)     role leaf-cert, no_store=true
 ```
+
+- **Replacing the root, or the Vault intermediate under it, belongs to the
+  enterprise root CA's lifecycle and is out of scope.** In this design Consul
+  also can't take over a new externally signed intermediate by rotation: Vault
+  refuses the cross-sign (issue #12). Only Consul's own signing CA rotation is
+  tested (T13).
 
 - **`pki_mesh_int` is Consul's `root_pki_path` in Vault-managed mode.**
   Consul can only read it and call `root/sign-intermediate`. It cannot mount,
@@ -81,7 +89,7 @@ Offline Mesh Root CA (ECDSA P-384, 10 yr)     Terraform; key only in TFC state
   signing CA, which it renews automatically, and the `leaf-cert` role.
 - **The trust anchor for verifying leaf chains** is `terraform output -raw mesh_root_ca_pem`.
 - **In production,** the Vault intermediate's key would be generated inside
-  Vault and its CSR signed in an offline ceremony. Terraform generating it
+  Vault and its CSR signed by the enterprise root CA. Terraform generating it
   here keeps the build single-pass, and doesn't change any signing path.
 
 ## Provisioning with HCP Terraform
@@ -302,9 +310,8 @@ public URL if enabled, and go to **Perf Testing → Consul + Vault Perf**.
 
 ### Consul leaf scenarios (no apps or Envoy needed)
 
-Root rotation isn't modelled. In an enterprise PKI the root is an external or
-offline CA and Vault holds an intermediate, so Consul never rotates the root
-itself.
+Root rotation isn't modelled. The root is the enterprise root CA and Vault
+holds an intermediate under it, so Consul never rotates the root itself.
 
 Consul signs a leaf through Vault whenever something in the mesh needs one. It
 does **not** sign one when you register a plain service. These scenarios generate

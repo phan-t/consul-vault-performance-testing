@@ -12,11 +12,11 @@
 | 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~1–1.3 h |
 | | T5r | Does T5's ceiling reproduce? The same boundary repeats | ~0.7 h |
 | | T6 | Where does signing land on Vault, directly, through Consul, and after an idle gap? | ~0.5 h |
-| | Soak | Does the target rate hold for 2 h at ≥ 99.99% success, with no memory or file descriptor growth? | ~2.2 h |
+| | Soak | Does the target rate hold for 2 h at ≥ 99.99% success, with no memory or file descriptor growth? (4 × 30 min segments) | ~2.4 h |
 | | Burst | With `csr_max_per_second` set to the target, do 20,000 leafs in 1 minute and 100,000 in 10 minutes arrive? | ~0.3 h |
 | | T3f | What do sidecars see when the Vault node Consul signs through hangs? | ~0.25 h |
 | | T14 | What do sidecars see when the Consul leader hangs (election plus the new leader's CA setup)? 3 runs | ~0.35 h |
-| | T2 | What does storing certificates cost compared with `no_store`? (Runs here: it leaves Raft state behind.) | ~0.4 h |
+| | T2 | What does storing certificates cost compared with `no_store`? (Runs here, late: it leaves Raft state behind. Signs with a 2-minute TTL so its clean-up can tidy them away.) | ~0.5 h |
 | 3: Vault scale-out | T9-V | Do 2 non-voters (redundancy zone spares, performance standbys) raise T3 and T3c? | ~1.5 h |
 | | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? 3 runs, plus 1 in the active node's zone | ~0.8 h |
 | | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
@@ -167,7 +167,7 @@ Each test's windows, and why some differ:
 | T3r, T5r (3 runs) | 5m first / 5m last, 1m between | 2m | 10m | — |
 | T3c (×2 in T9-V) | 5m / 5m | 15s per step | 60s per step | Compares connection modes, not sustained capacity |
 | T6 (4 runs) | 1m / 1m per run | 30s | 2m | Answers *where* signing lands; the gap between runs is the test (> 90 s idle) |
-| Soak | 5m / 5m | 2m | 2h | Long enough for drift and rare errors |
+| Soak (4 segments) | 5m first / 5m last, 1m between | 2m per segment | 4 × 30m | Long enough for drift and rare errors; segments keep the load generator's agent cache small (issue #8) |
 | Burst (2 runs) | 5m first / 5m last, 1m between | none | 60s, 10m | A burst has no ramp by definition |
 | T3f | 5m / 5m | 30s, then 2m steady before the freeze | freeze 60s + 2m after | An event under load, not a capacity measurement |
 | T14 | 5m / 5m | 30s, then 90s steady before the first freeze | 3 × (freeze 60s, until healthy, 60s gap) | An event under load |
@@ -423,19 +423,35 @@ minutes measured.
 the concurrency after which throughput stops rising (< 10% more) but p99 keeps
 climbing.
 
-### T2: Cost of storing certificates (~0.4 h)
+### T2: Cost of storing certificates (~0.5 h)
 
-*Runs after T3f, not here.* T2 stores about 1.2 million certificates (plan-1:
-1,637/s for 12 minutes) and then unmounts them. Raft's database files never
+*Runs after T14, not here.* T2 stores about 1.2 million certificates (plan-1:
+1,637/s for 12 minutes) and then removes them. Raft's database files never
 shrink, so that state would sit under every Vault measurement after it.
+
+**It signs with a 2-minute TTL** (`T2_LEAF_TTL`), so the stored certificates
+expire right after the run. The TTL doesn't change what's measured, the cost of
+writing each certificate to Raft. That lets the clean-up delete them:
+1. it waits for the TTL to pass;
+2. it runs a **PKI tidy on the active node directly** (`tidy_cert_store`).
+   The tidy runs server-side, so the client can't cancel it, and it only
+   deletes expired certificates, hence the short TTL;
+3. it unmounts the now near-empty mount.
+
+In plan-1 a plain unmount through the NLB never finished: every attempt was
+redirected, dropped and cancelled, which blocked the campaign for 4 h 20 min
+(issue #10). The clean-up now shows its errors and gives up after 60 minutes
+(`CLEANUP_DEADLINE`). A clean-up failure is recorded in `values.t2.cleanup`,
+and RESULTS.md shows it as "done (clean-up failed: …)": T2's measurement is
+already saved by then.
 
 Measures what `no_store` saves. Stored certificates are Raft writes, which
 performance standbys forward to the active node.
 
 ```bash
 MODES=multi LABEL="T2 store" CONCURRENCY=<T1 knee> MULTI_CONNS=32 STEP=10m STEP_WARMUP=2m \
-  SIGN_PATH=pki_perf/sign/leaf-store SIGN_TOKEN="$VAULT_TOKEN" RUN_ID=t2 connection-test.sh
-pki-perf-mount.sh destroy   # drop the stored certificates before T3
+  SIGN_PATH=pki_perf/sign/leaf-store SIGN_TOKEN="$VAULT_TOKEN" LEAF_TTL=2m RUN_ID=t2 connection-test.sh
+STORED_TTL=2m pki-perf-mount.sh destroy   # wait out the TTL, tidy, unmount
 summarise.sh t2
 ```
 
@@ -614,17 +630,28 @@ RUN_ID=t5r-r<rate> RATE=<rate> BASELINE=1m COOLDOWN=1m run-k6.sh /opt/perf/k6/co
 consul-ca-limits.sh 50 0
 ```
 
-### Soak: the target rate for 2 hours (~2.2 h)
+### Soak: the target rate for 2 hours (~2.4 h)
 
 The stress steps hold each rate for 10 minutes. That's long enough to find a
 ceiling, but too short to show slow memory growth or rare errors. The soak
 runs the **350/s target through Consul** (`consul-leaf.js`, CSR limits removed
 like T5) for **2 hours** on the 5 voters, before T9-V adds the non-voters.
 
+**It runs as 4 segments of 30 minutes** (`SOAK_SEGMENT`), with the load
+generator's Consul agent restarted before each. The agent caches every leaf it
+fetches. In plan-1's single 2-hour run, from about 600,000 cached leafs (28
+minutes in) it stalled every 5 minutes, and each stall was worse than the last.
+That took the client p99 to 9.2 s while the servers sat idle: 0 errors in 2.48
+million leafs and no growth (issue #8). Real agents, and Dataplane's servers,
+hold far fewer leafs. The Vault and Consul servers don't restart between
+segments, so growth, CPU and server-side latency are measured over the whole
+2 hours. RESULTS.md also records the agent's largest cache
+(`consul_leaf_certs_entries_count`).
+
 It **fails** on:
-- errors ≥ 0.01%, so success must be ≥ 99.99%;
-- p99 over 1 s;
-- less than 95% delivered;
+- errors ≥ 0.01% over the whole soak, so success must be ≥ 99.99%;
+- p99 over 1 s in any segment;
+- less than 95% delivered in any segment;
 - a Vault or Consul server's mean CPU over 80%.
 
 It **warns** in RESULTS.md when, between the hold's first and last 15 minutes,
@@ -636,17 +663,16 @@ any Vault or Consul server grows by more than 10%:
 These are warnings, not failures: a heap that grows and then levels off is
 normal, so read the Grafana memory panels before calling it a leak.
 
-The load generator's Consul agent caches every leaf it fetches: about 2.5
-million in 2 hours (~30 GB of the load generator's 128 GiB). Its memory grows,
-but that's the load generator, which the drift check doesn't measure.
-
 ```bash
 consul-ca-limits.sh 0 0
-RUN_ID=soak RATE=350 HOLD=2h MAX_ERROR_RATE=0.0001 run-k6.sh /opt/perf/k6/consul-leaf.js; summarise.sh soak
+for i in 1 2 3 4; do
+  sudo systemctl restart consul   # a fresh agent cache per segment
+  RUN_ID=soak-s$i RATE=350 HOLD=30m MAX_ERROR_RATE=0.0001 run-k6.sh /opt/perf/k6/consul-leaf.js
+done
 consul-ca-limits.sh 50 0
 ```
 
-Change it with `SOAK_RATE`, `SOAK_HOLD`, `SOAK_MAX_ERROR_RATE`,
+Change it with `SOAK_RATE`, `SOAK_HOLD`, `SOAK_SEGMENT`, `SOAK_MAX_ERROR_RATE`,
 `SOAK_CPU_MAX` and `SOAK_DRIFT_PCT`.
 
 **For a stronger leak check,** run a long soak as its own plan, for example

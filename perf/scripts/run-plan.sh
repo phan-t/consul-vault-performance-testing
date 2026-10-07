@@ -123,6 +123,7 @@ T1_WORKERS=${T1_WORKERS:-"32 64 128 256"}
 T1_CONNS=${T1_CONNS:-32}
 T1_STEP=${T1_STEP:-10m}
 T1_WARMUP=${T1_WARMUP:-2m}
+T2_LEAF_TTL=${T2_LEAF_TTL:-2m}
 T3C_CONCURRENCY=${T3C_CONCURRENCY:-"1 8 32 64 128 256 512"}
 T3C_MULTI_CONNS=${T3C_MULTI_CONNS:-16}
 T3C_STEP=${T3C_STEP:-60s}
@@ -137,6 +138,7 @@ TARGET_RATE=${TARGET_RATE:-350}
 T3_START=${T3_START:-$TARGET_RATE}
 SOAK_RATE=${SOAK_RATE:-$TARGET_RATE}
 SOAK_HOLD=${SOAK_HOLD:-2h}
+SOAK_SEGMENT=${SOAK_SEGMENT:-30m}
 SOAK_MAX_ERROR_RATE=${SOAK_MAX_ERROR_RATE:-0.0001}
 SOAK_CPU_MAX=${SOAK_CPU_MAX:-80}
 SOAK_DRIFT_PCT=${SOAK_DRIFT_PCT:-10}
@@ -307,12 +309,27 @@ t2() {
   w=$(sget '.values.t1.knee.workers')
   [ -n "$w" ] || { w=64; log "T2: no T1 knee recorded; using WORKERS=$w"; }
   pki-perf-mount.sh create
+  # A short TTL, so the stored certificates expire right after the run and the
+  # clean-up's tidy can delete them. It doesn't change the cost being measured.
   MODES=multi LABEL="T2 store" CONCURRENCY="$w" MULTI_CONNS="$T1_CONNS" STEP="$T1_STEP" STEP_WARMUP="$T1_WARMUP" \
-    SIGN_PATH=pki_perf/sign/leaf-store SIGN_TOKEN="$VAULT_TOKEN" RUN_ID="$PLAN-t2" connection-test.sh
+    SIGN_PATH=pki_perf/sign/leaf-store SIGN_TOKEN="$VAULT_TOKEN" LEAF_TTL="$T2_LEAF_TTL" RUN_ID="$PLAN-t2" connection-test.sh
   sset '.values.t2' "$(jq -c --argjson w "$w" '.multi_max // {} | {workers: $w, rps: ((.rps // 0) | . * 10 | round / 10),
       p99_ms: .p99, vault_nodes_serving}' "$RESULTS_DIR/$PLAN-t2-$PERF_NODE-connection-test/connection-test.json")"
   # Drop the stored certificates so later tests start from the same Raft state.
-  pki-perf-mount.sh destroy | tee -a "$DIR/run.log"
+  # A clean-up failure is recorded as a warning, not a failed test: the
+  # measurement above is already saved (issue #10).
+  local out rc
+  set +e
+  out=$(STORED_TTL="$T2_LEAF_TTL" pki-perf-mount.sh destroy 2>&1)
+  rc=$?
+  set -e
+  echo "$out" >> "$DIR/run.log"
+  if [ "$rc" -eq 0 ]; then
+    sset '.values.t2.cleanup' '{"ok": true}'
+  else
+    log "T2: clean-up failed (pki_perf may still be mounted): $(tail -1 <<<"$out")"
+    sset '.values.t2.cleanup' "$(jq -n -c --arg r "$(tail -1 <<<"$out")" '{ok: false, reason: $r}')"
+  fi
 }
 
 t3() {
@@ -420,38 +437,64 @@ t5r() { refine t5r t5 /opt/perf/k6/consul-leaf.js yes; }
 
 # soak: the target rate through Consul for hours on the 5 voters. Catches what a
 # 10-minute step can't: memory or file descriptor growth, and rare errors
-# (DBS: >= 99.99% success).
+# (DBS: >= 99.99% success). Run as SOAK_HOLD / SOAK_SEGMENT segments (2h as
+# 4 x 30m) with the local Consul agent restarted before each: it caches every
+# leaf it fetches, and past ~600,000 (plan-1: ~28 min at 350/s) it stalled
+# every 5 minutes, taking the client p99 to 9 s while the servers were idle
+# (issue #8). Real agents and Dataplane servers hold far fewer. The servers
+# don't restart, so drift, CPU and server-side latency cover the whole soak.
 soak() {
-  local dir rc prom s e drift
+  local seg_s hold_s n i b c h dir rc segs='[]' prom s0 e0 s e drift lat scpu cache
+  hold_s=$(to_secs "$SOAK_HOLD"); seg_s=$(to_secs "$SOAK_SEGMENT")
+  [ "$seg_s" -gt 0 ] && [ "$seg_s" -lt "$hold_s" ] || seg_s=$hold_s
+  n=$(((hold_s + seg_s - 1) / seg_s))
   limits_remove; trap limits_restore EXIT
-  restart_consul_agent
-  set +e
-  RUN_ID="$PLAN-soak" RATE="$SOAK_RATE" HOLD="$SOAK_HOLD" MAX_ERROR_RATE="$SOAK_MAX_ERROR_RATE" run-k6.sh /opt/perf/k6/consul-leaf.js
-  rc=$?
-  set -e
+  for i in $(seq 1 "$n"); do
+    h=$((i < n ? seg_s : hold_s - seg_s * (n - 1)))
+    read -r b c < <(group_idle "$i" "$n")
+    restart_consul_agent
+    set +e
+    RUN_ID="$PLAN-soak-s$i" RATE="$SOAK_RATE" HOLD="${h}s" BASELINE="$b" COOLDOWN="$c" \
+      MAX_ERROR_RATE="$SOAK_MAX_ERROR_RATE" run-k6.sh /opt/perf/k6/consul-leaf.js
+    rc=$?
+    set -e
+    dir="$RESULTS_DIR/$PLAN-soak-s$i-$PERF_NODE-k6-consul-leaf"
+    segs=$(jq -c --slurpfile m "$dir/summary.json" --argjson i "$i" --argjson rc "$rc" --argjson min "${MIN_ACHIEVED:-0.95}" \
+      --argjson w "$(steady_window "$dir" | jq -R -c 'split(" ") | map(tonumber)' 2>/dev/null || echo null)" '. + [$m[0].metrics as $mm
+      | ([$mm | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
+      | ([$mm | to_entries[] | select(.key | startswith("http_req_failed{name:"))][0].value.values) as $f
+      | ($mm.iterations.values.count // 0) as $it | ($mm.dropped_iterations.values.count // 0) as $dr
+      | {segment: $i, window: $w, requests: $it, failed: ($f.passes // 0),
+         thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
+         delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
+         p95_ms: ($d["p(95)"] | . * 100 | round / 100), p99_ms: ($d["p(99)"] | . * 100 | round / 100)}
+      | .pass = (.thresholds == "pass" and .delivered >= $min)]' <<<"$segs")
+    log "soak segment $i/$n: $(jq -c '.[-1] | {requests, failed, p99_ms, delivered, pass}' <<<"$segs")"
+  done
   limits_restore; trap - EXIT
-  dir="$RESULTS_DIR/$PLAN-soak-$PERF_NODE-k6-consul-leaf"
-  drift=null
-  if prom=$(prom_url 2>/dev/null) && read -r s e < <(steady_window "$dir"); then
-    drift=$(soak_drift "$prom" "$s" "$e")
+  # The whole soak: from the first segment's steady start to the last one's end.
+  drift=null; lat=null; scpu=null; cache=null
+  s0=$(jq -r '.[0].window[0] // empty' <<<"$segs"); e0=$(jq -r '.[-1].window[1] // empty' <<<"$segs")
+  if prom=$(prom_url 2>/dev/null) && [ -n "$s0" ] && [ -n "$e0" ]; then
+    drift=$(soak_drift "$prom" "$s0" "$e0")
+    lat=$(server_latency "$prom" "$s0" "$e0")
+    scpu=$(server_cpu "$prom" "$s0" "$e0")
+    # The agent's cache at its largest: what the segments keep bounded.
+    cache=$(prom_num "$prom" "max(max_over_time(consul_leaf_certs_entries_count{instance=~\"$PERF_NODE.*\"}[$((e0 - s0))s]))" "$e0")
   fi
-  sset '.values.soak' "$(jq -c --argjson rate "$SOAK_RATE" --arg hold "$SOAK_HOLD" --argjson rc "$rc" \
-    --argjson min "${MIN_ACHIEVED:-0.95}" --argjson scpu "$(steady_server_cpu "$dir")" --argjson cmax "$SOAK_CPU_MAX" \
-    --argjson drift "${drift:-null}" --argjson dmax "$SOAK_DRIFT_PCT" '.metrics as $m
-    | ([$m | to_entries[] | select(.key | startswith("http_req_duration{name:"))][0].value.values) as $d
-    | ([$m | to_entries[] | select(.key | startswith("http_req_failed{name:"))][0].value.values) as $f
-    | ($m.iterations.values.count // 0) as $it | ($m.dropped_iterations.values.count // 0) as $dr
-    | {rate: $rate, hold: $hold,
-       thresholds: (if $rc == 0 then "pass" elif $rc == 99 then "fail" elif $rc == 98 then "invalid" else "error" end),
-       requests: $it, failed: ($f.passes // 0), success_pct: ((1 - ($f.rate // 0)) * 100 * 10000 | round / 10000),
-       delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
-       p95_ms: ($d["p(95)"] | . * 100 | round / 100), p99_ms: ($d["p(99)"] | . * 100 | round / 100),
+  sset '.values.soak' "$(jq -n -c --argjson segs "$segs" --argjson rate "$SOAK_RATE" --arg hold "$SOAK_HOLD" --arg seg "$SOAK_SEGMENT" \
+    --argjson maxerr "$SOAK_MAX_ERROR_RATE" --argjson scpu "${scpu:-null}" --argjson cmax "$SOAK_CPU_MAX" \
+    --argjson drift "${drift:-null}" --argjson dmax "$SOAK_DRIFT_PCT" --argjson lat "${lat:-null}" --argjson cache "${cache:-null}" '
+    ($segs | map(.requests) | add // 0) as $req | ($segs | map(.failed) | add // 0) as $fail
+    | {rate: $rate, hold: $hold, segment: $seg, segments: $segs, requests: $req, failed: $fail,
+       success_pct: (if $req > 0 then ((1 - $fail / $req) * 100 * 10000 | round / 10000) else null end),
+       p99_ms: ($segs | map(.p99_ms) | max), delivered: ($segs | map(.delivered) | min),
        server_cpu_mean: $scpu, cpu_over: ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax),
-       drift: $drift,
+       server_latency: $lat, agent_cache_max: $cache, drift: $drift,
        drift_warnings: [($drift // {}) | to_entries[] | .key as $r | .value | to_entries[]
          | select((.value.growth_pct // 0) > $dmax) | "\($r) \(.key) +\(.value.growth_pct)% (\(.value.instance))"]}
-    | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_over | not))' "$dir/summary.json")"
-  log "soak: $(sget '.values.soak | {success_pct, p99_ms, server_cpu_mean, drift_warnings, pass} | tojson')"
+    | .pass = (($segs | all(.pass)) and $req > 0 and ($fail / $req) < $maxerr and (.cpu_over | not))')"
+  log "soak: $(sget '.values.soak | {success_pct, p99_ms, server_cpu_mean, agent_cache_max, drift_warnings, pass} | tojson')"
   [ "$(sget '.values.soak.pass')" = true ]
 }
 
@@ -845,8 +888,11 @@ results_md() {
             + "; warnings: " + ([$c.soft // {} | to_entries[] | select(.value | not) | .key] | if length == 0 then "none" else join(", ") end)
             + "; leader \($c.leader_kb_per_write // "?") KB/write at 200/s"
          elif ($k | startswith("t11v")) then "\(v($k).cluster.voters // "?") voters (AZ \(v($k).cluster.az_spread // {} | [.[]] | map(tostring) | join("/")), failure tolerance \(v($k).cluster.failure_tolerance // "?")): KV last pass \(v($k).kv.runs // [] | map(.last_pass // "-" | tostring) | join(", "))/s; leader \(v($k).cluster.leader // "?") (\(v($k).cluster.leader_az_peers // "?") same-AZ voters); failover: new active \(v($k).failover.new_active_s.median // "?") s, write gap \(v($k).failover.write_gap_s.median // "?") s (median)"
-         elif $k == "soak" then "\(v("soak").rate // "?")/s for \(v("soak").hold // "?"): **\(if v("soak").pass then "PASS" else "FAIL" end)**, "
-            + "success \(v("soak").success_pct // "?")% (\(v("soak").failed // "?") of \(v("soak").requests // "?") failed), p99 \(v("soak").p99_ms // "?") ms, "
+         elif $k == "soak" then "\(v("soak").rate // "?")/s for \(v("soak").hold // "?")\(if v("soak").segments then " (\(v("soak").segments | length) × \(v("soak").segment), agent restarted between)" else "" end): "
+            + "**\(if v("soak").pass then "PASS" else "FAIL" end)**, "
+            + "success \(v("soak").success_pct // "?")% (\(v("soak").failed // "?") of \(v("soak").requests // "?") failed), "
+            + "p99 \(if v("soak").segments then "worst segment " else "" end)\(v("soak").p99_ms // "?") ms, "
+            + (v("soak").server_latency.vault_sign.p99_ms // null | if . then "Vault sign p99 \(.) ms, " else "" end)
             + "server CPU \(v("soak").server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end); "
             + "growth: \(v("soak").drift_warnings // [] | if length == 0 then "none over threshold" else "⚠️ " + join(", ") end)"
          elif $k == "t12" and v("t12").skipped then "skipped (no redundancy zones)"
@@ -948,8 +994,8 @@ case "$CMD" in
 start)
   if systemctl is-active --quiet "$UNIT"; then echo "$UNIT is already running"; exit 1; fi
   env_args=()
-  for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
-    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
+  for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T2_LEAF_TTL T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
+    T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT SOAK_SEGMENT TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
     P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done

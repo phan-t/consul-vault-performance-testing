@@ -32,6 +32,9 @@ SIGN_PATH=${SIGN_PATH:-connect_${CONSUL_DATACENTER}_inter/sign/leaf-cert}
 MODES=${MODES:-"single multi"}
 LABEL=${LABEL:-T3c connection test}
 SIGN_TOKEN=${SIGN_TOKEN:-$SIGN_VAULT_TOKEN}
+# Leaf TTL. T2 uses a short one so its stored certificates expire right after
+# the run and a PKI tidy can delete them (tidy only removes expired ones).
+LEAF_TTL=${LEAF_TTL:-168h}
 # Signs per Vault node come from the route metric of SIGN_PATH's mount
 # (vault_route_update_<mount>__count), not lib.sh's Consul-only SIGN_METRIC.
 # Matched by regex: plan-1's T1 found no series under the exact name for
@@ -70,7 +73,7 @@ for mode in $MODES; do
     echo "$(date -u +%H:%M:%S) step: mode=$mode concurrency=$c"
     SID=$(annotate "${LABEL%% *} $mode c=$c" "perf,connection-test-step,$RUN_ID")
     vault-sign-load -addr "$VAULT_ADDR" -token "$SIGN_TOKEN" -cacert "$VAULT_CACERT" \
-      -path "$SIGN_PATH" -csr "$OUT/leaf.csr" -ttl 168h -nodes "$NODES" \
+      -path "$SIGN_PATH" -csr "$OUT/leaf.csr" -ttl "$LEAF_TTL" -nodes "$NODES" \
       -conns "$conns" -concurrency "$c" -warmup "$STEP_WARMUP" -duration "$STEP" \
       -out "$OUT/step.json" || { echo "step failed: mode=$mode c=$c"; continue; }
     annotate_end "$SID"

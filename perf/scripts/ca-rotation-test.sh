@@ -23,7 +23,7 @@
 #      AGENT_WAIT (90s); then restarts the Consul servers one at a time
 #      (followers first, leader last, each until Autopilot is healthy), restarts
 #      the agent again and records how long it takes to reconnect.
-# PHASES="signing root" also runs a root rotation (RootPKIPath to the next mesh
+# ROTATIONS="signing root" also runs a root rotation (RootPKIPath to the next mesh
 # intermediate). It needs a next intermediate bundle in <name>/vault/mesh-ca-next,
 # which the build no longer creates, and in this design Vault refuses the
 # cross-sign (issue #12), so it's kept only for reference.
@@ -42,7 +42,9 @@ CSR_LIMIT=${CSR_LIMIT:-350}
 WATCH=${WATCH:-5m}
 STORM_MAX=${STORM_MAX:-30m}
 # Which rotations to run: "signing" (default) or "signing root" (see above).
-PHASES=${PHASES:-signing}
+# Not PHASES: lib.sh uses that name for the export's phase list (it starts as
+# "[]", which made plan-2's T13 skip the rotation).
+ROTATIONS=${ROTATIONS:-signing}
 AGENT_WAIT=${AGENT_WAIT:-90}
 NEXT_INTER="connect_${CONSUL_DATACENTER}_next_inter"
 NEXT_ROOT="pki_mesh_int_next"
@@ -51,7 +53,7 @@ ROOT_BEFORE=""
 OUT="$RESULTS_DIR/$RUN_ID-$PERF_NODE-t13"
 mkdir -p "$OUT"
 cat > "$OUT/params.json" <<P
-{"tool":"ca-rotation-test","run_id":"$RUN_ID","node":"$PERF_NODE","phases":"$PHASES","rate":$RATE,"cached":$CACHED,"prefill_rate":$PREFILL_RATE,"csr_limit":$CSR_LIMIT,"watch":"$WATCH","storm_max":"$STORM_MAX","baseline":"$BASELINE","cooldown":"$COOLDOWN"}
+{"tool":"ca-rotation-test","run_id":"$RUN_ID","node":"$PERF_NODE","rotations":"$ROTATIONS","rate":$RATE,"cached":$CACHED,"prefill_rate":$PREFILL_RATE,"csr_limit":$CSR_LIMIT,"watch":"$WATCH","storm_max":"$STORM_MAX","baseline":"$BASELINE","cooldown":"$COOLDOWN"}
 P
 PROM=$(prom_url)
 
@@ -199,7 +201,7 @@ consul_rolling_restart() {
 
 # --- 1. signing CA rotation --------------------------------------------------
 A0=$(now_ms); A1=$A0; AG1=$A0; a='{"skipped": true}'
-if grep -qw signing <<<"$PHASES"; then
+if grep -qw signing <<<"$ROTATIONS"; then
 root0=$(active_root)
 mount_once "$NEXT_INTER" "Consul signing CA after T13 rotation" 8760h
 allow_path "$NEXT_INTER" intermediate
@@ -228,7 +230,7 @@ fi
 
 # --- 3. root rotation (out of scope by default; see the header) -----------------
 B0=$(now_ms); B1=$B0; b='{"skipped": true, "reason": "out of scope: enterprise root CA (issue #12)"}'
-if grep -qw root <<<"$PHASES"; then
+if grep -qw root <<<"$ROTATIONS"; then
 mount_once "$NEXT_ROOT" "Next mesh intermediate CA (T13 root rotation)" 43800h
 aws secretsmanager get-secret-value --secret-id "$PERF_NAME/vault/mesh-ca-next" --query SecretString --output text |
   jq -r .pem_bundle > "$OUT/bundle.pem"
@@ -310,5 +312,7 @@ jq -n --argjson t0 "$T0" --argjson t1 "$T1" --argjson p1 "$P1" --argjson a0 "$A0
     {name: "rotate-signing", start: $a0, end: $a1}, {name: "agent-check", start: $a1, end: $ag1},
     {name: "rotate-root", start: $b0, end: $b1},
     {name: "cooldown", start: $t3, end: $t4}] | map(select(.end > .start))' > "$OUT/phases.json"
+# export_grafana exports lib.sh's PHASES (and rewrites phases.json from it).
+PHASES=$(jq -c . "$OUT/phases.json")
 export_grafana "$OUT" "T13 CA rotation ($RUN_ID)"
 upload_results "$OUT"

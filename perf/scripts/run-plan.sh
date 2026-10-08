@@ -585,7 +585,7 @@ t13() {
   limits_remove; trap limits_restore EXIT
   set +e
   RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" \
-    PHASES="${T13_PHASES:-signing}" ca-rotation-test.sh
+    ROTATIONS="${T13_PHASES:-signing}" ca-rotation-test.sh
   local rc=$?
   set -e
   limits_restore; trap - EXIT

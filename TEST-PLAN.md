@@ -942,7 +942,7 @@ not, how long the server restarts took, and reconnect time after them.
 RUN_ID=t13 CACHED=100000 CSR_LIMIT=350 RATE=50 ca-rotation-test.sh
 ```
 
-`PHASES="signing root"` also runs the root rotation, kept for reference only.
+`ROTATIONS="signing root"` (`T13_PHASES` in `run-plan.sh`) also runs the root rotation, kept for reference only.
 It needs a next mesh intermediate in `<name>/vault/mesh-ca-next`, which the
 build no longer creates, and in this design Vault refuses its cross-sign.
 

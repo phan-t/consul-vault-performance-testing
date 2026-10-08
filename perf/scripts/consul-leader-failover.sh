@@ -136,5 +136,7 @@ idle cooldown "$COOLDOWN"
 T4=$(now_ms)
 jq -n --argjson t0 "$T0" --argjson t1 "$T1" --argjson t3 "$T3" --argjson t4 "$T4" --argjson f "$PHASE_LIST" \
   '[{name: "baseline", start: $t0, end: $t1}] + $f + [{name: "cooldown", start: $t3, end: $t4}] | map(select(.end > .start))' > "$OUT/phases.json"
+# export_grafana exports lib.sh's PHASES (and rewrites phases.json from it).
+PHASES=$(jq -c . "$OUT/phases.json")
 export_grafana "$OUT" "T14 Consul leader frozen ($RUN_ID)"
 upload_results "$OUT"

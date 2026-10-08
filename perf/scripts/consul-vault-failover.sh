@@ -122,5 +122,7 @@ jq -n --argjson t0 "$T0" --argjson t1 "$T1" --argjson f "$fms" --argjson fe $((f
   --argjson t3 "$T3" --argjson t4 "$T4" \
   '[{name: "baseline", start: $t0, end: $t1}, {name: "freeze", start: $f, end: $fe}, {name: "cooldown", start: $t3, end: $t4}]
    | map(select(.end > .start))' > "$OUT/phases.json"
+# export_grafana exports lib.sh's PHASES (and rewrites phases.json from it).
+PHASES=$(jq -c . "$OUT/phases.json")
 export_grafana "$OUT" "T3f Consul's Vault node frozen ($RUN_ID)"
 upload_results "$OUT"

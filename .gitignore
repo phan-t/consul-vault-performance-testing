@@ -34,3 +34,6 @@ results/
 
 # Archived campaign results (kept locally for comparison)
 results-archive/
+
+# macOS Finder metadata
+.DS_Store

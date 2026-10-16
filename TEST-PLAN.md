@@ -708,7 +708,7 @@ consul-ca-limits.sh 50 0
 ### T3f: The Vault node Consul signs through hangs (~0.25 h)
 
 Consul's leader signs through one connection, so one Vault node (T3c, T6).
-This is the failure sidecars actually see, and DBS's "failover under load" on
+This is the failure sidecars actually see, and the agreed plan's "failover under load" on
 the leaf path. Under 350/s of leafs through Consul (`T3F_RATE`, CSR limits
 removed), `consul-vault-failover.sh`:
 1. finds the Vault node Consul signs through: the most signs on Consul's
@@ -855,7 +855,7 @@ the active node's zone has no spare, that run is skipped.
 **Zones aren't AZs here.** Nodes are placed in subnets by index, so
 `vault-nv-0` is in a different AZ from `zone-0`'s voter, `vault-0`. T12 tests
 Autopilot's zone mechanism, not losing an AZ, where a zone's voter and spare
-would fail together. Whether DBS's zones map to AZs decides which of those
+would fail together. Whether the production zones map to AZs decides which of those
 matters.
 
 **Promotion isn't instant by design.** Autopilot waits until the voter has been
@@ -1306,7 +1306,7 @@ own idle windows and export.
 - **Network degradation between the Consul leader and Vault** (issue #5).
 - **Go runtime metrics and Consul CA expiry gauges** (issue #6).
 - **Leaf correctness under load:** SPIFFE SAN, TTL, chain (issue #7).
-- **Performance Replication lag** to a secondary cluster (DBS's plan): this
+- **Performance Replication lag** to a secondary cluster (in the agreed plan): this
   build is one cluster in one region.
 - **T5 with non-voters:** would measure, not infer, that non-voters don't raise
   Consul's ceiling.

@@ -437,7 +437,7 @@ t5r() { refine t5r t5 /opt/perf/k6/consul-leaf.js yes; }
 
 # soak: the target rate through Consul for hours on the 5 voters. Catches what a
 # 10-minute step can't: memory or file descriptor growth, and rare errors
-# (DBS: >= 99.99% success). Run as SOAK_HOLD / SOAK_SEGMENT segments (2h as
+# (agreed plan: >= 99.99% success). Run as SOAK_HOLD / SOAK_SEGMENT segments (2h as
 # 4 x 30m) with the local Consul agent restarted before each: it caches every
 # leaf it fetches, and past ~600,000 (plan-1: ~28 min at 350/s) it stalled
 # every 5 minutes, taking the client p99 to 9 s while the servers were idle

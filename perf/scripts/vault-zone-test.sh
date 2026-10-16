@@ -1,5 +1,5 @@
 #!/bin/bash
-# T12: Autopilot redundancy zones under load (DBS scenario 4, the HLD's design:
+# T12: Autopilot redundancy zones under load (agreed scenario 4, the HLD's design:
 # one voter per zone, non-voter spares added as scale demands).
 #   RUN_ID=t12 RATE=3200 vault-zone-test.sh
 #

@@ -32,6 +32,7 @@ through **HCP Terraform (TFC)**.
 | Vault non-voters | `vault_non_voter_count = 0` | Autopilot redundancy zone spares (Enterprise, `vault_redundancy_zones = true`): voter *i* is in `zone-i`, and `vault-nv-N` joins `zone-N` as a non-voter that Autopilot promotes if that zone's voter fails. With `vault_redundancy_zones = false`, permanent non-voters (`retry_join_as_non_voter`). Either way, they run as performance standbys |
 | Consul Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 data volume | `2.0.1+ent`, pinned (see [Consul version](#consul-version)). TLS, gossip encryption, ACLs (default deny), auto_encrypt for clients |
 | Consul read replicas | `consul_read_replica_count = 0` | `read_replica = true` (Enterprise non-voting servers) |
+| Vault ALB (T16) | `vault_alb = false` | Opt-in, for T16 path C (TEST-PLAN *Stage 5*): an internal ALB, `alb.vault.<domain>:443`, with HTTP/2 to a second Vault listener on 8202. The NLB and 8200 are unchanged. `run-campaign.sh --with-t16` sets it |
 | Connect CA | Vault provider, external root | Enterprise root CA (simulated by Terraform) → Vault intermediate (`pki_mesh_int`, Vault-managed) → Consul signing intermediate (`connect_<dc>_inter`) → leafs. The `leaf-cert` role uses `no_store=true`. Auth uses the Vault **AWS IAM auth method** (no static Vault token). See [Mesh PKI](#mesh-pki) |
 | Load generators | 2 × `r7i.4xlarge` (memory for the client agent's leaf cache) | Consul client agent, k6 `2.3.0`, vault-benchmark `0.3.0`, Vault CLI |
 | Monitoring | 1 × `m7i.xlarge` | Prometheus (EC2 service discovery) and Grafana, with a provisioned dashboard |
@@ -418,6 +419,24 @@ too sparse to keep the connection open. Then compare capacity with and without n
 Run the distribution test with the non-voters in place so there are more
 nodes for the traffic to spread across.
 
+**Spreading it (T16).** Consul's Vault provider has no pool or HTTP version
+setting, and `vault/api` enables HTTP/2 itself, so `GODEBUG=http2client=0`
+doesn't help. T16 (TEST-PLAN *Stage 5*, issue #14) points the provider's
+`Address` at a path that balances per request instead, one test each:
+HAProxy on each Consul server (`127.0.0.1:8211`), Vault Proxy with keep-alives
+off (`127.0.0.1:8210`, a connection per sign) and an ALB (`vault_alb`). It
+reruns T6's mesh runs, expecting `spread`, and a T5-style grid from T5's last
+pass:
+
+```bash
+RUN_ID=t16-haproxy signing-path.sh up haproxy     # start it on every Consul server, switch Consul to it
+RUN_ID=t16-haproxy RUNS="mesh-1 mesh-2" EXPECT=spread RATE=100 signing-distribution.sh
+RUN_ID=t16-haproxy signing-path.sh down           # switch back to the NLB, stop it
+```
+
+`signing-path.sh` checks that Consul's root and intermediate don't change on
+the switch (it's the same PKI paths, so it shouldn't rotate).
+
 ### Single connection vs many (T3c)
 
 The Consul leader is Vault's only Consul client. It sends every signing request
@@ -484,7 +503,8 @@ Reading it, with T5 (Consul's own ceiling):
   therefore spread across every node behind the NLB. Consul's leader reuses a
   pooled HTTP/2 connection to Vault, so its traffic is expected to land on a
   single Vault node at a time. Watch *Vault sign requests (Consul
-  intermediate)* per node, or run `signing-distribution.sh`.
+  intermediate)* per node, or run `signing-distribution.sh`. T16 tests three
+  ways around it (see *Consul signing distribution*).
 - **Audit device.** It is on by default (`vault_audit_enabled`) to keep things
   realistic, with log rotation every 5 minutes at 1 GB. Turn it off to measure
   the audit overhead.
@@ -526,6 +546,8 @@ Reading it, with T5 (Consul's own ceiling):
   this setup for production.
 - Secrets use `recovery_window_in_days = 0`, and the S3 bucket uses
   `force_destroy`, so `terraform destroy` really cleans up.
+- With `vault_alb` (T16), the Vault TLS key is also imported into ACM for the
+  ALB's listener.
 
 ## Layout
 
@@ -538,7 +560,8 @@ perf/
   k6/                   consul-leaf.js, vault-sign-consul-mount.js, lib/common.js
   vault-benchmark/      pki_sign profiles (no_store vs store)
   scripts/              run-k6.sh, run-vault-benchmark.sh, stress-k6.sh, signing-distribution.sh,
-                        connection-test.sh, consul-ca-limits.sh, run-everywhere.sh, summarise.sh
+                        connection-test.sh, consul-ca-limits.sh, run-everywhere.sh, summarise.sh,
+                        signing-path.sh + signing-path-node.sh (T16 signing paths)
   tools/vault-sign-load Go load tool using Consul's Vault client (single vs multi connection)
 ```
 

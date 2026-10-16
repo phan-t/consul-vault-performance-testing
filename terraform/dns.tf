@@ -57,3 +57,17 @@ resource "aws_route53_record" "consul_node" {
   ttl      = 60
   records  = [each.value.private_ip]
 }
+
+# T16 path C (var.vault_alb). Covered by the *.vault certificate SAN.
+resource "aws_route53_record" "vault_alb" {
+  count   = var.vault_alb ? 1 : 0
+  zone_id = aws_route53_zone.private.zone_id
+  name    = "alb.${local.vault_fqdn}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.vault_alb[0].dns_name
+    zone_id                = aws_lb.vault_alb[0].zone_id
+    evaluate_target_health = true
+  }
+}

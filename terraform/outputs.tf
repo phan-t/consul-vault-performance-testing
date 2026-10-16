@@ -7,6 +7,11 @@ output "vault_addr" {
   value       = "https://${local.vault_fqdn}:8200"
 }
 
+output "vault_alb_addr" {
+  description = "T16 path C: Vault through the ALB (empty unless var.vault_alb)."
+  value       = var.vault_alb ? "https://alb.${local.vault_fqdn}" : ""
+}
+
 output "consul_https_addr" {
   description = "Consul HTTPS API / UI via internal NLB."
   value       = "https://${local.consul_fqdn}:8501"

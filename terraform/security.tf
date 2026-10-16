@@ -103,3 +103,43 @@ resource "aws_vpc_security_group_ingress_rule" "monitoring" {
   from_port         = each.value
   to_port           = each.value
 }
+
+# T16 path C (var.vault_alb): the ALB takes HTTPS from the VPC and reaches
+# Vault's second listener (8202).
+resource "aws_security_group" "vault_alb" {
+  count       = var.vault_alb ? 1 : 0
+  name        = "${var.name}-vault-alb"
+  description = "Vault ALB (T16 path C)"
+  vpc_id      = aws_vpc.this.id
+  tags        = { Name = "${var.name}-vault-alb" }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "vault_alb_https" {
+  count             = var.vault_alb ? 1 : 0
+  security_group_id = aws_security_group.vault_alb[0].id
+  description       = "HTTPS (Consul CA provider)"
+  cidr_ipv4         = var.vpc_cidr
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
+resource "aws_vpc_security_group_egress_rule" "vault_alb_targets" {
+  count                        = var.vault_alb ? 1 : 0
+  security_group_id            = aws_security_group.vault_alb[0].id
+  description                  = "Vault ALB listener and health checks"
+  referenced_security_group_id = aws_security_group.vault.id
+  ip_protocol                  = "tcp"
+  from_port                    = 8202
+  to_port                      = 8202
+}
+
+resource "aws_vpc_security_group_ingress_rule" "vault_alb_listener" {
+  count                        = var.vault_alb ? 1 : 0
+  security_group_id            = aws_security_group.vault.id
+  description                  = "Vault ALB listener (T16 path C)"
+  referenced_security_group_id = aws_security_group.vault_alb[0].id
+  ip_protocol                  = "tcp"
+  from_port                    = 8202
+  to_port                      = 8202
+}

@@ -18,7 +18,8 @@
 #
 # Options: --yes (terraform -auto-approve), --destroy (finish: destroy without asking),
 #          --t11 (start: the T11 campaign, see below),
-#          --with-t11 (start: the main campaign plus Stage 4, T11 on the same build).
+#          --with-t11 (start: the main campaign plus Stage 4, T11 on the same build),
+#          --with-t16 (start: T16, Consul's signing through other paths, see below).
 # run-plan.sh settings set in your environment are passed through to the
 # campaign (start, continue, resume), e.g. only T5 and T5r, from 800/s:
 #   PLAN_TESTS="settle t5 t5r" T5_START=800 scripts/run-campaign.sh start plan-2
@@ -35,6 +36,14 @@
 # --t11 writes terraform/raft.auto.tfvars (7 voters, no non-voters) and defaults
 # PLAN_TESTS to the T11 sequence; a start without --t11 removes that profile, and
 # finish removes it after a destroy.
+#
+# T16 (Stage 5, issue #14) as its own run, on the same build as the main
+# campaign plus the opt-in ALB, with T5 and T6 unchanged as its reference:
+#   scripts/run-campaign.sh start plan-3 --with-t16   # settle -> t5 -> t6 -> t16haproxy -> t16proxy -> t16alb
+# --with-t16 writes terraform/signing.auto.tfvars (vault_alb = true) and defaults
+# PLAN_TESTS to that sequence; a start without it removes the profile, and
+# finish removes it after a destroy. HAProxy and Vault Proxy aren't in
+# Terraform: T16 installs and starts them on the Consul servers itself.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -48,12 +57,14 @@ YES=false
 DESTROY=false
 T11=false
 WITH_T11=false
+WITH_T16=false
 for a in "$@"; do
   case "$a" in
   --yes) YES=true ;;
   --destroy) DESTROY=true ;;
   --t11) T11=true ;;
   --with-t11) WITH_T11=true ;;
+  --with-t16) WITH_T16=true ;;
   -*) echo "unknown option $a" >&2; exit 1 ;;
   *) PLAN=$a ;;
   esac
@@ -88,7 +99,8 @@ plan_env() {
     T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE MEM_GUARD_PCT SETTLE_IDLE SETTLE_SCANNER_WAIT \
     SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT SOAK_SEGMENT T2_LEAF_TTL TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX \
     BASELINE COOLDOWN RAMP HOLD \
-    T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE; do
+    T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE \
+    T16_START T16_MAX; do
     [ -n "${!v:-}" ] && out+="$v='${!v}' "
   done
   printf '%s' "$out"
@@ -113,6 +125,7 @@ preflight() {
   echo "HCP Terraform workspace: reachable"
   if [ -f "$TF/smoke.auto.tfvars" ]; then echo "smoke profile: present (start removes it → full size)"; else echo "smoke profile: absent (full size)"; fi
   if [ -f "$TF/raft.auto.tfvars" ]; then echo "raft profile: $(grep -E '^vault_voter_count' "$TF/raft.auto.tfvars" | tr -s ' ')"; fi
+  if [ -f "$TF/signing.auto.tfvars" ]; then echo "signing profile: present (T16: vault_alb = true)"; fi
   if [ -f "$TF/campaign.auto.tfvars" ]; then
     echo "campaign profile: $(grep -E '^vault_non_voter' "$TF/campaign.auto.tfvars" | tr -s ' ' | paste -sd ';' -)"
   else
@@ -131,6 +144,17 @@ t11_profile() {
   echo "wrote terraform/raft.auto.tfvars (7 Vault voters, no non-voters)"
   PLAN_TESTS=${PLAN_TESTS:-$T11_TESTS}
   export PLAN_TESTS
+}
+
+# T16 profile: the opt-in ALB for path C. Everything else is the main campaign's build.
+SIGNING_PROFILE="$TF/signing.auto.tfvars"
+T16_TESTS="settle t5 t6 t16haproxy t16proxy t16alb"
+t16_profile() {
+  printf '# T16 (TEST-PLAN.md, issue #14): the ALB for signing path C. Remove for the main campaign.\nvault_alb = true\n' > "$SIGNING_PROFILE"
+  echo "wrote terraform/signing.auto.tfvars (vault_alb = true)"
+}
+with_t16() {
+  if $WITH_T16 || [ -f "$SIGNING_PROFILE" ]; then PLAN_TESTS=${PLAN_TESTS:-$T16_TESTS}; export PLAN_TESTS; fi
 }
 
 replace_args() {
@@ -210,6 +234,11 @@ start() {
   elif [ -f "$RAFT_PROFILE" ]; then
     rm "$RAFT_PROFILE"; echo "removed terraform/raft.auto.tfvars (start without --t11 builds the 5-voter plan)"
   fi
+  if $WITH_T16; then
+    t16_profile
+  elif [ -f "$SIGNING_PROFILE" ]; then
+    rm "$SIGNING_PROFILE"; echo "removed terraform/signing.auto.tfvars (start without --with-t16 builds no ALB)"
+  fi
   if [ ! -f "$TF/campaign.auto.tfvars" ]; then
     printf '# Test campaign: T9-V non-voters provisioned but held (see TEST-PLAN.md)\nvault_non_voter_count  = 2\nvault_non_voters_start = false\n' > "$TF/campaign.auto.tfvars"
     echo "created terraform/campaign.auto.tfvars"
@@ -229,6 +258,7 @@ start() {
 
 after_apply() {
   with_t11
+  with_t16
   if $T11 || [ -f "$RAFT_PROFILE" ]; then PLAN_TESTS=${PLAN_TESTS:-$T11_TESTS}; export PLAN_TESTS; fi
   wait_bootstrap
   verify
@@ -248,6 +278,7 @@ EOF
 
 resume() {
   with_t11
+  with_t16
   if $T11 || [ -f "$RAFT_PROFILE" ]; then PLAN_TESTS=${PLAN_TESTS:-$T11_TESTS}; export PLAN_TESTS; fi
   # Syncing while run-plan.sh runs would change scripts under it: only resume a stopped plan.
   if on_loadgen "systemctl is-active perf-plan-$PLAN" 30 | grep -qx active; then
@@ -292,6 +323,7 @@ finish() {
   fi
   if $YES || $DESTROY; then terraform -chdir="$TF" destroy -auto-approve; else terraform -chdir="$TF" destroy; fi
   if [ -f "$RAFT_PROFILE" ]; then rm "$RAFT_PROFILE"; echo "removed terraform/raft.auto.tfvars (the next build is the 5-voter plan)"; fi
+  if [ -f "$SIGNING_PROFILE" ]; then rm "$SIGNING_PROFILE"; echo "removed terraform/signing.auto.tfvars (the next build has no ALB)"; fi
 }
 
 case "$CMD" in

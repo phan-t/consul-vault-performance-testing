@@ -22,13 +22,15 @@
 | | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
 | | T13 | What does rotating Consul's signing CA under load do to sidecars and to client agents that restart? (Root rotation is out of scope.) Runs last: it leaves the signing CA rotated | ~0.5 h |
 | *Own campaign* | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~9–11 h |
+| *Own run* (Stage 5) | T16 | Does sending Consul's signing through HAProxy, Vault Proxy (keep-alives off) or an ALB spread it across Vault nodes and raise T5's ceiling? With T5 and T6 rerun as the reference | ~3.7–4.7 h, plus Stage 0 and T5/T6 |
 
 The tests run in the order of this table, as one unattended campaign
 (`plan-1`, ~13.5–14.5 h). T11 shrinks Vault for good, so it runs as its own
 unattended campaign on a fresh 7-voter build (`raft-1`, `--t11`). Moving
 between the two campaigns needs a `terraform apply`, so fresh credentials.
 `--with-t11` instead appends T11 to `plan-1` as Stage 4 (~21–25 h in one
-run; see *Stage 4*).
+run; see *Stage 4*). T16 (Stage 5) runs on its own build, with T5 and T6
+rerun beside it (`plan-3`, `--with-t16`; see *Stage 5*).
 *Read-out* explains how to interpret the comparisons, and *Results* records
 the outcome of each test.
 
@@ -52,7 +54,8 @@ scripts/run-campaign.sh finish raft-1
 
 To run both in one unattended campaign instead, start with
 `scripts/run-campaign.sh start plan-1 --with-t11` (see *Stage 4* for the
-trade-offs).
+trade-offs). T16 runs the same way, as `scripts/run-campaign.sh start plan-3
+--with-t16` (see *Stage 5*).
 
 **What `start` does:**
 1. Runs the preflight checks.
@@ -177,6 +180,7 @@ Each test's windows, and why some differ:
 | T13 | 5m / 5m | the cache fill (~5m at 350/s), then 60s of foreground | signing CA 5m, then the agent check (up to ~5m with server restarts) | An event under load |
 | T11, per size | 5m / 5m once per size | 2m per step | 5m | The repeats measure noise; repeat spread in raft-1 was tiny |
 | t11smoke | 1m / 1m | 30s | 1m | A check that the measurements work, not a measurement |
+| T16 (per path) | 5m first / 5m last, 1m between | Mesh runs: 30s. Grid: 2m per step, from the previous rate | Mesh: 2m each, T6's idle gap between. Grid: 10m every step | Distribution reuses T6's windows so verdicts compare; the grid starts at T5's last pass, already near the old ceiling, like the T9-V rerun |
 
 **Server-side metrics, per stress step** (in `stress.json`, and at the last
 passing rate in RESULTS.md), so the client's latency can be split without
@@ -1216,6 +1220,113 @@ size, then four tables. Each column is a voter count:
 - **Count a difference only when it's bigger than the ± spread.** Check the
   leader placement before blaming the voter count.
 
+## Stage 5: Consul's signing across Vault nodes (T16)
+
+The Consul leader's Vault CA provider sends every sign over one pooled HTTP/2
+connection, and the NLB balances per connection, so Consul's signing lands on
+one Vault node at a time: T6, T5 (vault-2 at 91% at 2,100/s, the leader at
+25%), T3c (one connection 2,281/s against 10,778/s with many) and T9-V (spares
+raise many-connection capacity, not one connection). Nothing in the stack
+changes that: Consul's provider has no pool or HTTP setting, `vault/api`
+enables HTTP/2 itself (so `GODEBUG=http2client=0` has no effect), and Vault's
+listener has no stream limit setting. T16 tests three paths that do, one test
+each (issue #14).
+
+**T16 adds to plan-1 and changes nothing in it.** It runs as its own plan
+(`plan-3`) on the same build definition, with T5 and T6 rerun unchanged
+beside it as the reference: a single T5 doesn't compare across builds (at
+1,600/s its p99 was 176 ms in plan-1 and 35 ms in plan-2), and T16's grid
+starts at this plan's T5 last pass. Everything it adds is opt-in or idle by
+default:
+- HAProxy and Vault Proxy aren't in Terraform. T16 installs and starts them on
+  the Consul servers itself, over SSM (`signing-path-node.sh`, fetched from
+  the perf assets), and stops them afterwards.
+- The ALB, its ACM certificate and Vault's second listener (8202) exist only
+  with `vault_alb = true`. The 8200 listener and the NLB are unchanged.
+- Script changes keep their defaults: `consul-ca-limits.sh --address`, and
+  `signing-distribution.sh`'s `RUNS`, `EXPECT`, `FIRST_BASELINE` and
+  `LAST_COOLDOWN`. T6 runs as before.
+- The metrics are new series (`perf_signing_connections`,
+  `perf_process_cpu_seconds_total`); `perf_vault_connections` is unchanged.
+- No T13 in this plan: an accidental CA change plus the grid's agent restarts
+  would lock the agent out (issue #11).
+
+```bash
+# refresh AWS credentials locally and in the HCP Terraform workspace (README, step 2)
+scripts/run-campaign.sh start plan-3 --with-t16   # settle -> t5 -> t6 -> t16haproxy -> t16proxy -> t16alb
+scripts/run-campaign.sh finish plan-3
+```
+
+`--with-t16` writes `terraform/signing.auto.tfvars` (`vault_alb = true`) and
+defaults `PLAN_TESTS` to that sequence; `finish` removes the profile after the
+destroy, and a `start` without it removes it too.
+
+### T16: Consul's signing through HAProxy, Vault Proxy and an ALB (~1.2–1.6 h per path)
+
+| Path | Test | Address | How it spreads | Cost to watch |
+|---|---|---|---|---|
+| B. HAProxy | `t16haproxy` | `https://127.0.0.1:8211` on each Consul server | Balances each HTTP/2 request round-robin over long-lived HTTP/2 connections to every Vault node (per-node names, health-checked like the NLB) | The proxy's CPU on the leader's host |
+| A. Vault Proxy | `t16proxy` | `https://127.0.0.1:8210` on each Consul server | A pure forwarder to the NLB with `disable_keep_alives = ["proxying"]`: each sign opens a connection, and the NLB picks a node for each | A TLS handshake per sign on Vault; TIME_WAIT sockets on the leader |
+| C. ALB | `t16alb` | `https://alb.vault.<domain>` | Terminates TLS and balances each request, HTTP/2 to Vault's 8202 listener | An extra hop; needs `vault_alb` (skipped without it) |
+
+HAProxy runs first: it tests the idea most cleanly, with no handshake or port
+cost. If it doesn't raise the ceiling, the leader is the limit, and the
+others won't do better. Both local paths listen with the Consul server
+certificate (it has `localhost` and `127.0.0.1` SANs), and the ALB with the
+Vault certificate (`*.vault`), so Consul's `ca_file` trusts all three as it
+is. Idle timeouts are 120 s (HAProxy's `timeout client`, the ALB's
+`idle_timeout`), longer than Go's 90 s idle-connection timeout, so Consul
+closes idle connections first: a sign is a POST, which Go doesn't retry on a
+connection the server already closed. HAProxy allows Vault's 250 concurrent
+streams per connection, not its default 100.
+
+Each test, with Consul's CSR limits removed (`signing-path.sh` and
+`signing-distribution.sh`):
+1. **Starts the path** on every Consul server (any can become leader) and
+   checks Vault answers through it. A path that doesn't come up is
+   **skipped**, with the reason in RESULTS.md, and Consul isn't touched.
+2. **Switches** the CA provider's `Address` to it with `consul connect ca
+   set-config`, keeping the PKI paths, and checks one leaf signs through it.
+3. **Distribution:** T6's mesh runs at `T6_RATE` (mesh-1, 150 s idle,
+   mesh-2), with no control run, expecting **spread**: every Vault node takes
+   at least 1% of signs. Mesh-2 also checks the path after more than 90 s idle.
+4. **Rate grid:** `consul-leaf.js` from this plan's T5 last pass (`T16_START`),
+   with T5's pass criteria: p99 ≤ 1 s, errors < 0.1%, ≥ 95% delivered, mean
+   CPU ≤ 90% on every Vault and Consul server (the proxy runs on a Consul
+   server, so the rule covers it), and the step guardrails. The agent restarts
+   between steps, as in T5.
+5. **Switches back** to the NLB after the cooldown and stops the path.
+
+**Guard:** Consul's active root ID, signing key ID and intermediates must be
+the same before the switch, after it and after switching back. A change fails
+the test: the switch was a rotation. Check it by hand once before relying on
+it (`consul connect ca roots` before and after `consul-ca-limits.sh --address`).
+
+**Record,** per path, in `values.t16<path>` and RESULTS.md:
+- **Distribution:** `expected_behaviour` (`confirmed` = both mesh runs
+  spread), each run's verdict and nodes serving, and T6's for comparison.
+- **Grid:** last pass and first fail (against this plan's T5), stop reason,
+  p99, and per step: the busiest Vault node's mean CPU and signs per node.
+- **Cost on the Consul servers** (`path_stats`, the busiest server, the
+  leader): Consul's and the proxy's CPU in cores, Consul's connections to the
+  path, the path's connections to Vault, and TIME_WAIT sockets (path A).
+- **`ca_unchanged`.**
+
+Run one path by hand:
+
+```bash
+RUN_ID=t16-haproxy signing-path.sh up haproxy      # or: proxy, alb
+RUN_ID=t16-haproxy RATE=100 BASELINE=1m COOLDOWN=1m RAMP=30s HOLD=2m RUNS="mesh-1 mesh-2" EXPECT=spread signing-distribution.sh
+START=<T5 last pass> LOW_HOLD=10m RUN_ID=t16-haproxy-grid stress-k6.sh /opt/perf/k6/consul-leaf.js
+RUN_ID=t16-haproxy signing-path.sh down
+```
+
+**Not tested:** TLS certificate auth through the paths. HAProxy and the ALB
+start their own TLS to Vault, so a client certificate would need HAProxy's
+`crt` on the server lines, or the ALB's mTLS `passthrough` mode with Vault's
+`x_forwarded_for_client_cert_header` options (the right decoders for the
+ALB's header aren't verified). Consul authenticates with AWS IAM here.
+
 ---
 
 ## Read-out
@@ -1236,6 +1347,10 @@ size, then four tables. Each column is a voter count:
 | T11 7 vs 5 vs 3 voters | Commit time and KV ceiling flat | Voter count is free for Vault writes: choose it for failure tolerance |
 | T11 7 vs 5 vs 3 voters | Commit p99 rises with voters | Each voter pair costs that much on every write: weigh it against the extra failure tolerance |
 | T11 failover | Write gap differs by voter count | Election time depends on cluster size; otherwise it's the heartbeat/election timeout, whatever the size |
+| T16 distribution vs T6 | T16 mesh runs spread, T6's concentrated | The path spreads Consul's signing across Vault nodes |
+| T16 grid vs T5 (same plan) | Ceiling rises towards T3's, busiest Vault node below 90% | One connection was Consul's limit: the path lifts it |
+| T16 grid vs T5 | Spread, but the leader's or the proxy's CPU stops it | Consul's leader is the next limit; compare the proxy's cores with Consul's |
+| T16 path A vs B | A's ceiling lower, TIME_WAIT high | A connection per sign costs more than balancing requests over long-lived connections |
 
 The **recommended `csr_max_per_second`** is the lower of Consul's confirmed
 ceiling from T5r (the low end of its range) and Vault's single-connection rate
@@ -1265,6 +1380,9 @@ test with that limit set. The report should also state the headroom above
 | T13 signing CA rotation, 100,000 cached | t13 | switched: ; re-issued: | new-leaf p99: | agent: locked out? ; reconnected after server restart: |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
 | T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
+| T16 HAProxy | t16haproxy | distribution: ; last pass: (T5: ) | | Consul / proxy cores: ; CA unchanged: |
+| T16 Vault Proxy, keep-alives off | t16proxy | distribution: ; last pass: (T5: ) | | Consul / proxy cores: ; TIME_WAIT: ; CA unchanged: |
+| T16 ALB | t16alb | distribution: ; last pass: (T5: ) | | CA unchanged: |
 
 ## Time and cost
 
@@ -1277,6 +1395,7 @@ test with that limit set. The report should also state the headroom above
 | **Main campaign** (`plan-1`) | **~13.5–14.5 h (~US$125–145 at ~US$9–10/h)** |
 | T11 as its own campaign (`raft-1 --t11`): Stage 0, smoke check, T11 at 7, 5, 3 voters | ~9–11 h (~US$85–105) |
 | *Or Stage 4 on the main build* (`--with-t11`): T11 grow, smoke check, T11 | *+7.7–10.7 h, ~21–25 h in one run* |
+| T16 as its own run (`plan-3 --with-t16`): Stage 0, settle, T5, T6, then T16 for 3 paths | ~6.2–7.5 h (T16 itself ~3.7–4.7 h); the ALB bills only while the environment is up |
 
 Against the previous plan (~10–11 h without Stage 4), the boundary repeats
 (+1.4 h), burst, T3f, T14, T15, T13, T12 repeats and 5 failover repeats add

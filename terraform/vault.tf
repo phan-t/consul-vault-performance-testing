@@ -52,6 +52,7 @@ resource "aws_instance" "vault" {
     init_secret_id      = aws_secretsmanager_secret.vault_init.arn
     bootstrap_param     = aws_ssm_parameter.vault_bootstrap.name
     audit_enabled       = var.vault_audit_enabled
+    alb_listener        = var.vault_alb
     consul_role_arn     = aws_iam_role.node["consul"].arn
     mesh_pki_path       = local.mesh_pki_path
     mesh_ca_secret_id   = aws_secretsmanager_secret.mesh_ca.arn
@@ -135,4 +136,72 @@ resource "aws_lb_target_group_attachment" "vault" {
   target_group_arn = aws_lb_target_group.vault.arn
   target_id        = each.value.id
   port             = 8200
+}
+
+# --- T16 path C (opt-in, var.vault_alb): internal ALB, HTTP/2 to targets -----
+# The NLB above balances per TCP connection, so the Consul leader's one pooled
+# HTTP/2 connection lands on one Vault node. An ALB terminates TLS and balances
+# each HTTP/2 request, so the same connection can reach every node (issue #14).
+# Its target is a second Vault listener (8202): 8200 and the NLB are unchanged.
+
+resource "aws_acm_certificate" "vault_alb" {
+  count             = var.vault_alb ? 1 : 0
+  private_key       = tls_private_key.vault.private_key_pem
+  certificate_body  = tls_locally_signed_cert.vault.cert_pem
+  certificate_chain = tls_self_signed_cert.ca.cert_pem
+  tags              = { Name = "${var.name}-vault-alb" }
+}
+
+resource "aws_lb" "vault_alb" {
+  count              = var.vault_alb ? 1 : 0
+  name               = "${var.name}-vault-alb"
+  internal           = true
+  load_balancer_type = "application"
+  subnets            = aws_subnet.private[*].id
+  security_groups    = [aws_security_group.vault_alb[0].id]
+  # Longer than Go's 90 s idle-connection timeout, so the client closes idle
+  # connections first: a sign (a POST) sent on a connection the ALB already
+  # closed isn't retried.
+  idle_timeout = 120
+}
+
+resource "aws_lb_target_group" "vault_alb" {
+  count                = var.vault_alb ? 1 : 0
+  name                 = "${var.name}-vault-alb"
+  port                 = 8202
+  protocol             = "HTTPS"
+  protocol_version     = "HTTP2"
+  vpc_id               = aws_vpc.this.id
+  deregistration_delay = 30
+
+  health_check {
+    protocol            = "HTTPS"
+    port                = "8202"
+    path                = "/v1/sys/health?standbyok=true&perfstandbyok=true"
+    matcher             = "200"
+    interval            = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_listener" "vault_alb" {
+  count             = var.vault_alb ? 1 : 0
+  load_balancer_arn = aws_lb.vault_alb[0].arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = aws_acm_certificate.vault_alb[0].arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.vault_alb[0].arn
+  }
+}
+
+resource "aws_lb_target_group_attachment" "vault_alb" {
+  for_each         = { for k, v in aws_instance.vault : k => v.id if var.vault_alb }
+  target_group_arn = aws_lb_target_group.vault_alb[0].arn
+  target_id        = each.value
+  port             = 8202
 }

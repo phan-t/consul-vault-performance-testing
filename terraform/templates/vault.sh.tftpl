@@ -45,6 +45,18 @@ listener "tcp" {
     unauthenticated_metrics_access = true
   }
 }
+%{ if alb_listener ~}
+
+# T16 path C (var.vault_alb): the ALB's HTTP/2 target. A second listener so
+# 8200, the NLB and every other test are unchanged.
+listener "tcp" {
+  address         = "0.0.0.0:8202"
+  cluster_address = "0.0.0.0:8203"
+  tls_cert_file   = "/opt/vault/tls/vault.crt"
+  tls_key_file    = "/opt/vault/tls/vault.key"
+  tls_min_version = "tls12"
+}
+%{ endif ~}
 
 storage "raft" {
   path    = "/opt/vault/data"

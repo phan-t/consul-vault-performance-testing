@@ -6,6 +6,7 @@
 #                               -> soak -> burst -> T3f -> T14 -> T2 -> T9-V -> T12
 #                               -> T15 -> T13
 #                               (Stage 4, opt-in: t11grow -> t11smoke -> t11v7 -> t11v5 -> t11v3)
+#                               (Stage 5, opt-in: t16haproxy -> t16proxy -> t16alb)
 #   run-plan.sh status [PLAN]   progress, key numbers, RESULTS.md
 #   run-plan.sh stop [PLAN]     stop (Consul CSR limits are restored)
 #   run-plan.sh t9v|t12 [PLAN]  run (or re-run) only T9-V or T12
@@ -78,8 +79,22 @@
 #   PLAN_TESTS="settle t11smoke t11v7 t11v5 t11v3" run-plan.sh start raft-1
 # (scripts/run-campaign.sh start raft-1 --t11 builds and starts exactly this.)
 #
+# Stage 5 (opt-in like Stage 4; issue #14): T16 sends Consul's signing through
+# a path that balances it across Vault nodes, one test per path: t16haproxy
+# (HAProxy on each Consul server), t16proxy (Vault Proxy, keep-alives off),
+# t16alb (an ALB: needs var.vault_alb). Each starts the path (signing-path.sh
+# up: the Consul CA provider's Address switches, same PKI paths, with a guard
+# that the root and intermediate don't change), runs T6's mesh runs at T6_RATE
+# (EXPECT=spread, no control run) and a consul-leaf.js stress from this plan's
+# T5 last pass (T16_START) with every step holding the full HOLD, like T9-V's
+# T3 rerun, then switches back. Windows follow the plan: the full BASELINE
+# first, the full COOLDOWN last, GROUP_GAP between. It compares with T5 and T6,
+# so run them in the same plan, on a build with no other change:
+#   PLAN_TESTS="settle t5 t6 t16haproxy t16proxy t16alb" run-plan.sh start plan-3
+# (scripts/run-campaign.sh start plan-3 --with-t16 builds and starts exactly this.)
+#
 # PLAN_TESTS="settle t1 ..." runs only the listed tests (in plan order); empty
-# runs every test except Stage 4.
+# runs every test except Stages 4 and 5 (opt-in).
 #   run-plan.sh run [PLAN]      run in the foreground (what `start` launches)
 #
 # PLAN defaults to plan-<UTC date>. RUN_IDs are <PLAN>-t1, <PLAN>-t3, ...
@@ -188,7 +203,7 @@ PLAN_TESTS=${PLAN_TESTS:-}
 # Stage 4 (T11 on this build) runs only when PLAN_TESTS names it: its shrink
 # is one-way, so a failure there costs a rebuild, and a fresh 7-voter build
 # (run-campaign.sh start raft-1 --t11) is the cleaner T11 baseline.
-OPT_IN_TESTS="t11grow t11smoke t11v7 t11v5 t11v3"
+OPT_IN_TESTS="t11grow t11smoke t11v7 t11v5 t11v3 t16haproxy t16proxy t16alb"
 
 # --- state helpers ------------------------------------------------------------
 sget() { jq -r "$1 // empty" "$STATE"; }
@@ -676,6 +691,86 @@ t12() {
      measure_end_ms: $mend, expected_failure_tolerance: $ft}')"
 }
 
+# --- T16 (Stage 5, opt-in; issue #14) ------------------------------------------
+# path_stats <stress dir>: per steady step, what the signing path costs on the
+# Consul servers (the busiest one: the leader): Consul's and the proxy's CPU in
+# cores, and its connections (signing-path-node.sh's textfile metric).
+path_stats() {
+  local prom ph
+  prom=$(prom_url 2>/dev/null) || { echo '[]'; return; }
+  ph="$1/phases.json"
+  [ -f "$ph" ] || { echo '[]'; return; }
+  jq -r '.[] | select(.name | startswith("steady-r")) | "\(.name | ltrimstr("steady-r")) \(.start / 1000 | floor) \(.end / 1000 | floor)"' "$ph" |
+    while read -r rate st en; do
+      local w=$((en - st)) cpu='rate(perf_process_cpu_seconds_total{role="consul",process=~"%s"}[1m])' conns='perf_signing_connections{role="consul",kind="%s"}'
+      jq -n -c --argjson rate "$rate" \
+        --argjson cc "$(prom_num "$prom" "max(avg_over_time($(printf "$cpu" consul)[${w}s:15s]))" "$en")" \
+        --argjson pc "$(prom_num "$prom" "max(avg_over_time(sum by (instance) ($(printf "$cpu" 'vault|haproxy'))[${w}s:15s]))" "$en")" \
+        --argjson c2p "$(prom_num "$prom" "max(max_over_time($(printf "$conns" consul_to_path)[${w}s]))" "$en")" \
+        --argjson p2v "$(prom_num "$prom" "max(max_over_time($(printf "$conns" path_to_vault)[${w}s]))" "$en")" \
+        --argjson tw "$(prom_num "$prom" "max(max_over_time($(printf "$conns" time_wait_to_vault)[${w}s]))" "$en")" \
+        '{rate: $rate, consul_cores: $cc, proxy_cores: $pc, consul_to_path_conns_max: $c2p, path_to_vault_conns_max: $p2v, time_wait_max: $tw}'
+    done | jq -s -c .
+}
+t16_down() { RUN_ID="$PLAN-$1" signing-path.sh down 2>&1 | tee -a "$DIR/run.log"; }
+t16() { # t16 <haproxy|proxy|alb>
+  local path=$1 id=t16$1 start rc out dist grid f
+  start=${T16_START:-$(sget '.values.t5.last_pass')}
+  if [ -z "$start" ]; then
+    log "$id: no T5 last pass in $PLAN to start from: run t5 in the same plan (or set T16_START)"
+    return 1
+  fi
+  limits_remove
+  trap 't16_down '"$id"'; limits_restore' EXIT
+  set +e
+  out=$(RUN_ID="$PLAN-$id" signing-path.sh up "$path" 2>&1)
+  rc=$?
+  set -e
+  echo "$out" >> "$DIR/run.log"
+  if [ "$rc" -eq 3 ]; then
+    log "$id: path unavailable, skipped: $(tail -1 <<<"$out")"
+    t16_down "$id" >/dev/null || true
+    limits_restore; trap - EXIT
+    sset ".values.$id" "$(jq -n -c --arg r "$(tail -1 <<<"$out")" '{skipped: true, reason: $r}')"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then log "$id: switching Consul's signing to $path failed (exit $rc): $(tail -1 <<<"$out")"; return 1; fi
+  log "$id: $(tail -1 <<<"$out")"
+  # T6's mesh runs and windows (no control run: it doesn't go through Consul);
+  # the test's first idle window is the full BASELINE.
+  RUN_ID="$PLAN-$id" RATE="$T6_RATE" BASELINE="${T6_BASELINE:-1m}" COOLDOWN="${T6_COOLDOWN:-1m}" \
+    RAMP="${T6_RAMP:-30s}" HOLD="${T6_HOLD:-2m}" IDLE="${T6_IDLE:-150s}" \
+    RUNS="mesh-1 mesh-2" EXPECT=spread FIRST_BASELINE="$BASELINE" LAST_COOLDOWN="$GROUP_GAP" signing-distribution.sh
+  # From T5's last pass, already near the old ceiling: every step holds the
+  # full HOLD, like T9-V's T3 rerun. The test's last idle window is the full COOLDOWN.
+  env START="$start" ${T16_MAX:+MAX=$T16_MAX} LOW_HOLD="${HOLD:-10m}" BASELINE="$GROUP_GAP" COOLDOWN="$COOLDOWN" \
+    RUN_ID="$PLAN-$id-grid" stress-k6.sh /opt/perf/k6/consul-leaf.js
+  set +e
+  t16_down "$id" # pipefail: signing-path.sh's exit status
+  rc=$?
+  set -e
+  limits_restore; trap - EXIT
+  dist="$RESULTS_DIR/$PLAN-$id-$PERF_NODE-signing-distribution/distribution.json"
+  f=$(stress_file "$PLAN-$id-grid" consul-leaf)
+  grid=$(jq -c --argjson v "$(stress_values "$f")" '$v + {
+      loadgen_min_mem_pct: ([.steps[].loadgen_min_mem_pct // empty] | min),
+      steps: [.steps[] | {rate, pass, p99_ms, delivered, server_cpu_mean, sign_nodes}]}' "$f")
+  sset ".values.$id" "$(jq -n -c --arg p "$path" --argjson start "$start" --argjson grid "$grid" \
+    --argjson stats "$(path_stats "$(dirname "$f")")" --slurpfile d "$dist" \
+    --slurpfile sp "$RESULTS_DIR/$PLAN-$id-$PERF_NODE-signing-path/path.json" \
+    --argjson t5 "$(sget '.values.t5.last_pass // null')" --arg t6 "$(sget '.values.t6.expected_behaviour')" '
+    {path: $p, address: $sp[0].address, start: $start,
+     distribution: {expected_behaviour: $d[0].expected_behaviour, runs: [$d[0].runs[] | {label, verdict, nodes_serving, min_busiest_share}]},
+     grid: $grid, path_stats: $stats,
+     at_last_pass: ([$stats[] | select(.rate == $grid.last_pass)] | first),
+     ca_unchanged: $sp[0].ca_unchanged,
+     compare: {t5_last_pass: $t5, t6_expected_behaviour: (if $t6 == "" then null else $t6 end)}}')"
+  [ "$rc" -eq 0 ] || { log "$id: switching back failed or Consul's CA changed (exit $rc); see $PLAN-$id-$PERF_NODE-signing-path/path.json"; return 1; }
+}
+t16haproxy() { t16 haproxy; }
+t16proxy() { t16 proxy; }
+t16alb() { t16 alb; }
+
 # jq def shared by T11: one stress.json -> the fields T11 keeps per run.
 T11_JQ="$DIR/t11.jq"
 cat > "$T11_JQ" <<'JQ'
@@ -929,6 +1024,15 @@ results_md() {
          elif $k == "t11grow" and v("t11grow").skipped then "skipped (already 7 voters)"
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
+         elif ($k | startswith("t16")) and v($k).skipped then "skipped: \(v($k).reason // "path unavailable")"
+         elif ($k | startswith("t16")) then v($k) as $p | ($p.at_last_pass // {}) as $a
+            | "\($p.path // "?") (\($p.address // "?")): distribution \($p.distribution.expected_behaviour // "?") for spread ("
+            + ($p.distribution.runs // [] | map("\(.label) \(.verdict), \(.nodes_serving) node(s)") | join("; "))
+            + "; T6: \($p.compare.t6_expected_behaviour // "-")). Grid from \($p.start // "?")/s: last pass **\($p.grid.last_pass // "-")/s** "
+            + "(T5: \($p.compare.t5_last_pass // "-")/s), first fail \($p.grid.first_fail // "-")/s, \($p.grid.stop_reason // "")"
+            + "; at last pass: Consul \($a.consul_cores // "?") cores, proxy \($a.proxy_cores // "-") cores, Consul→path conns \($a.consul_to_path_conns_max // "?"), "
+            + "path→Vault conns \($a.path_to_vault_conns_max // "-"), TIME_WAIT \($a.time_wait_max // "-")"
+            + "; CA unchanged: \(b($p.ca_unchanged))"
          elif $k == "t9v" and v("t9v").skipped then "skipped (no non-voters)"
          elif $k == "t9v" then "T3 last pass \(v("t9v").t3.last_pass // "-")/s (was \(v("t3").last_pass // "-")); T3c multi \(v("t9v").t3c.multi_max.rps // 0 | round)/s, single \(v("t9v").t3c.single_max.rps // 0 | round)/s"
          else "" end) + " |"),
@@ -996,7 +1100,7 @@ start)
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T2_LEAF_TTL T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
     T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT SOAK_SEGMENT TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
-    P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT; do
+    P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT T16_START T16_MAX; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done
   sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
@@ -1025,7 +1129,10 @@ run)
     "t11grow:Stage 4: convert the Vault non-voters to voters (7 voters)" \
     "t11smoke:T11 smoke check (short run at the current size, no shrink)" \
     "t11v7:Vault Raft latency, 7 voters" "t11v5:Vault Raft latency, 5 voters (shrinks Vault)" \
-    "t11v3:Vault Raft latency, 3 voters (shrinks Vault)"; do
+    "t11v3:Vault Raft latency, 3 voters (shrinks Vault)" \
+    "t16haproxy:Stage 5: Consul's signing through HAProxy (each request balanced across Vault)" \
+    "t16proxy:Stage 5: Consul's signing through Vault Proxy with keep-alives off (a connection per sign)" \
+    "t16alb:Stage 5: Consul's signing through an ALB with HTTP/2 to Vault (var.vault_alb)"; do
     if [ -n "$PLAN_TESTS" ] && ! grep -qw -- "${t%%:*}" <<<"$PLAN_TESTS"; then continue; fi
     if [ -z "$PLAN_TESTS" ] && grep -qw -- "${t%%:*}" <<<"$OPT_IN_TESTS"; then continue; fi
     run_test "${t%%:*}" "${t#*:}"

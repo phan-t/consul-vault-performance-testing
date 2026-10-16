@@ -172,6 +172,17 @@ variable "vault_audit_enabled" {
   default     = true
 }
 
+variable "vault_alb" {
+  description = <<-EOT
+    T16 path C (opt-in, issue #14): an internal ALB (alb.vault.<domain>:443)
+    that balances each HTTP/2 request across the Vault nodes, through a second
+    Vault listener on 8202. The 8200 listener and the NLB are unchanged. Costs
+    only while the environment is up. run-campaign.sh --with-t16 sets it.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # ---------------------------------------------------------------------------
 # Consul
 # ---------------------------------------------------------------------------

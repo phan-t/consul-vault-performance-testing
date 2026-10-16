@@ -103,6 +103,13 @@ data "aws_iam_policy_document" "consul" {
     actions   = ["ssm:GetParameter"]
     resources = [aws_ssm_parameter.vault_bootstrap.arn]
   }
+
+  # T16 (issue #14): run-plan.sh has each server fetch signing-path-node.sh
+  # from the perf assets over SSM, to start a local signing proxy for the test.
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.perf.arn}/assets/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "consul" {

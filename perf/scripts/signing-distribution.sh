@@ -25,6 +25,14 @@
 # runs are concentrated. Then compare capacity with and without non-voters
 # using stress-k6.sh (see README).
 #
+# T16 (issue #14) reuses it through a signing path meant to spread Consul's
+# signing: RUNS="mesh-1 mesh-2" (no control: it doesn't go through Consul) and
+# EXPECT=spread, so the expected behaviour is confirmed when both mesh runs are
+# spread and refuted when one is concentrated. FIRST_BASELINE and LAST_COOLDOWN
+# override the first run's baseline and the last run's cooldown, so the test's
+# first and last idle windows can be the plan's full 5 minutes. Defaults keep
+# T6 as it is.
+#
 # Writes <RUN_ID>-<node>-signing-distribution/distribution.json.
 . /opt/perf/scripts/lib.sh
 
@@ -32,6 +40,10 @@ RATE=${RATE:-100}
 SHARE=${SHARE:-0.9}
 IDLE=${IDLE:-150s}
 HOLD=${HOLD:-10m}
+RUNS=${RUNS:-control mesh-1 mesh-2}
+EXPECT=${EXPECT:-concentrated}
+FIRST_BASELINE=${FIRST_BASELINE:-$BASELINE}
+LAST_COOLDOWN=${LAST_COOLDOWN:-$COOLDOWN}
 export RATE HOLD
 HOLD_S=$(dur_s "$HOLD")
 PROM=$(prom_url)
@@ -55,10 +67,12 @@ node_count=$(jq length <<<"$nodes")
 echo "Vault nodes up: $(jq -r 'map("\(.instance) (voter=\(.voter))") | join(", ")' <<<"$nodes")"
 
 run_and_measure() {
-  local label=$1 script=$2 step=$RUN_ID-$1 rc t_end t_start overall minutes
+  local label=$1 script=$2 step=$RUN_ID-$1 rc t_end t_start overall minutes b=$BASELINE c=$COOLDOWN
+  [ "$label" = "$(first_run)" ] && b=$FIRST_BASELINE
+  [ "$label" = "$(last_run)" ] && c=$LAST_COOLDOWN
   echo "=== $label: RATE=$RATE $(basename "$script")"
   set +e
-  RUN_ID="$step" run-k6.sh "$script"
+  RUN_ID="$step" BASELINE="$b" COOLDOWN="$c" run-k6.sh "$script"
   rc=$?
   set -e
   # The run's steady state from its phases.json: run-k6.sh returns only after
@@ -108,19 +122,33 @@ run_and_measure() {
   jq -r '.[-1] | "\(.label): \(.verdict); \(.nodes_serving) node(s) serving; busiest per minute: \(.busiest_nodes | join(", ")); lowest busiest-node share \(.min_busiest_share)"' "$OUT/runs.json"
 }
 
-run_and_measure control /opt/perf/k6/vault-sign-consul-mount.js
-run_and_measure mesh-1 /opt/perf/k6/consul-leaf.js
-echo "=== idle for $IDLE"
-sleep "$(dur_s "$IDLE")"
-run_and_measure mesh-2 /opt/perf/k6/consul-leaf.js
+first_run() { set -- $RUNS; echo "$1"; }
+last_run() { set -- $RUNS; echo "${@: -1}"; }
+for r in $RUNS; do
+  case "$r" in
+  control) run_and_measure control /opt/perf/k6/vault-sign-consul-mount.js ;;
+  mesh-1) run_and_measure mesh-1 /opt/perf/k6/consul-leaf.js ;;
+  mesh-2)
+    echo "=== idle for $IDLE"
+    sleep "$(dur_s "$IDLE")"
+    run_and_measure mesh-2 /opt/perf/k6/consul-leaf.js
+    ;;
+  *) echo "unknown run $r (control, mesh-1, mesh-2)" >&2; exit 2 ;;
+  esac
+done
 
 jq --arg run "$RUN_ID" --argjson rate "$RATE" --argjson share "$SHARE" --arg idle "$IDLE" \
-  --arg hold "$HOLD" --argjson nodes "$nodes" '
+  --arg hold "$HOLD" --argjson nodes "$nodes" --arg expect "$EXPECT" '
   . as $r
   | ($r | map({(.label): .}) | add) as $by
+  | [$r[] | select(.label | startswith("mesh")) | .verdict] as $mesh
   | {run_id: $run, rate: $rate, hold: $hold, idle: $idle, share_threshold: $share,
-     vault_nodes: $nodes, runs: $r,
-     expected_behaviour: (if $by.control.verdict == "spread"
+     vault_nodes: $nodes, runs: $r, expect: $expect,
+     expected_behaviour: (if $expect == "spread" then
+                            (if ($mesh | length) > 0 and all($mesh[]; . == "spread") then "confirmed"
+                             elif any($mesh[]; . == "concentrated") then "refuted"
+                             else "inconclusive" end)
+                          elif $by.control.verdict == "spread"
                             and $by["mesh-1"].verdict == "concentrated"
                             and $by["mesh-2"].verdict == "concentrated"
                           then "confirmed"

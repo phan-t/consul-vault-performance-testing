@@ -425,7 +425,7 @@ refine() { # refine <id> <source values key> <script> <limits: yes|no>
          delivered: (if ($it + $dr) > 0 then ($it / ($it + $dr) * 1000 | round / 1000) else 0 end),
          p99_ms: ($d["p(99)"] | . * 100 | round / 100)}
       | .server_cpu_mean = $scpu | .cpu_saturated = ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax) | .guardrails = $g
-      | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_saturated | not) and ($g.ok // true))' "$dir/summary.json" |
+      | .pass = (.thresholds == "pass" and .delivered >= $min and (.cpu_saturated | not) and ($g.ok != false))' "$dir/summary.json" |
       jq -c --argjson m "$(cat "$dir/loadgen-mem-min-pct" 2>/dev/null || echo null)" '. + {loadgen_min_mem_pct: $m}')
     log "$id: $(jq -c '{rate, pass, p99_ms, delivered, server_cpu: .server_cpu_mean.cpu_pct}' <<<"$run")"
     runs=$(jq -c --argjson r "$run" '. + [$r]' <<<"$runs")

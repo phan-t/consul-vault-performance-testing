@@ -209,7 +209,7 @@ while [ "$rate" -le "$MAX" ]; do
            leader_cost: (if $lc and $w > 0 then $lc + {
              tx_bytes_per_write: (if $lc.tx_bytes_per_s then ($lc.tx_bytes_per_s / $w | round) else null end),
              cpu_ms_per_write: (if $lc.cpu_cores then ($lc.cpu_cores / $w * 1000 * 1000 | round / 1000) else null end)} else $lc end),
-           pass: (.thresholds == "pass" and .delivered >= $min and ($sat | not) and ($guard.ok // true))}' <<<"$step_json")
+           pass: (.thresholds == "pass" and .delivered >= $min and ($sat | not) and ($guard.ok != false))}' <<<"$step_json")
   jq --argjson s "$step_json" '. + [$s]' "$OUT/steps.json" > "$OUT/steps.tmp" && mv "$OUT/steps.tmp" "$OUT/steps.json"
   echo "step: $step_json"
 
@@ -218,7 +218,7 @@ while [ "$rate" -le "$MAX" ]; do
     break
   fi
   if [ "$(jq -r .pass <<<"$step_json")" != true ]; then
-    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json"), server CPU $(jq -r '.server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end' <<<"$step_json")$(jq -r 'if .cpu_saturated then " (over '"$SERVER_CPU_MAX"'%)" else "" end' <<<"$step_json")$(jq -r 'if .vu_starved then ", VU-starved" else "" end' <<<"$step_json")$(jq -r 'if (.guardrails.ok // true) | not then ", guardrails \(.guardrails | del(.ok) | tojson)" else "" end' <<<"$step_json")"
+    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json"), server CPU $(jq -r '.server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end' <<<"$step_json")$(jq -r 'if .cpu_saturated then " (over '"$SERVER_CPU_MAX"'%)" else "" end' <<<"$step_json")$(jq -r 'if .vu_starved then ", VU-starved" else "" end' <<<"$step_json")$(jq -r 'if .guardrails.ok == false then ", guardrails \(.guardrails | del(.ok) | tojson)" else "" end' <<<"$step_json")"
     break
   fi
   # Near the ceiling: finer steps, full holds.

@@ -1299,8 +1299,11 @@ Each test, with Consul's CSR limits removed (`signing-path.sh` and
 
 **Guard:** Consul's active root ID, signing key ID and intermediates must be
 the same before the switch, after it and after switching back. A change fails
-the test: the switch was a rotation. Check it by hand once before relying on
-it (`consul connect ca roots` before and after `consul-ca-limits.sh --address`).
+the test: the switch was a rotation. It also stops the T16 tests after it,
+which are marked failed with the reason: each restarts the load generator's
+agent, and after a CA change a restarted agent is locked out until the Consul
+servers restart (issue #11). Check it by hand once before relying on it
+(`consul connect ca roots` before and after `consul-ca-limits.sh --address`).
 
 **Record,** per path, in `values.t16<path>` and RESULTS.md:
 - **Distribution:** `expected_behaviour` (`confirmed` = both mesh runs

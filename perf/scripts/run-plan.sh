@@ -716,6 +716,7 @@ path_stats() {
 # restarts the load generator's agent, and after a CA change a restarted
 # agent is locked out until the Consul servers restart (issue #11).
 t16_ca_changed() {
+  [ -z "$(sget '.values.t16_ca_changed.by')" ] || return 0 # already recorded (up, then the trap's down)
   log "$1: Consul's CA changed across the Address switch; the remaining T16 tests won't run (issue #11)"
   sset '.values.t16_ca_changed' "$(jq -n -c --arg id "$1" '{by: $id}')"
 }
@@ -740,7 +741,9 @@ t16() { # t16 <haproxy|proxy|alb>
     return 1
   fi
   limits_remove
-  trap 't16_down '"$id"'; limits_restore' EXIT
+  # set +e: errexit applies again inside the trap, so a failing switch-back
+  # would otherwise skip the rest (the flag, limits_restore).
+  trap 'set +e; t16_down '"$id"'; limits_restore' EXIT
   set +e
   out=$(RUN_ID="$PLAN-$id" signing-path.sh up "$path" 2>&1)
   rc=$?
@@ -753,7 +756,10 @@ t16() { # t16 <haproxy|proxy|alb>
     sset ".values.$id" "$(jq -n -c --arg r "$(tail -1 <<<"$out")" '{skipped: true, reason: $r}')"
     return 0
   fi
-  [ "$rc" -ne 4 ] || t16_ca_changed "$id"
+  if [ "$rc" -eq 4 ]; then
+    t16_ca_changed "$id"
+    sset ".values.$id" "$(jq -n -c --arg p "$path" --arg r "$(tail -1 <<<"$out")" '{path: $p, ca_changed: true, reason: $r}')"
+  fi
   if [ "$rc" -ne 0 ]; then log "$id: switching Consul's signing to $path failed (exit $rc): $(tail -1 <<<"$out")"; return 1; fi
   log "$id: $(tail -1 <<<"$out")"
   # T6's mesh runs and windows (no control run: it doesn't go through Consul);
@@ -1063,6 +1069,7 @@ results_md() {
          elif $k == "t11grow" then "\(v("t11grow").cluster.voters // "?") voters (AZ \(v("t11grow").cluster.az_spread // {} | [.[]] | map(tostring) | join("/"))); "
             + (v("t11grow").nodes // [] | map("\(.node) joined \(.joined_s) s, promoted \(.promoted_s) s (\(.join_to_promotion_s) s after joining)") | join("; "))
          elif ($k | startswith("t16")) and v($k).skipped then "skipped: \(v($k).reason // "path unavailable")"
+         elif ($k | startswith("t16")) and v($k).ca_changed then "**The Consul CA changed on the Address switch** (\(v($k).path // "?")): \(v($k).reason // "?"); later T16 tests not run (issue #11)"
          elif ($k | startswith("t16")) then v($k) as $p | ($p.at_last_pass // {}) as $a
             | "\($p.path // "?") (\($p.address // "?")): distribution \($p.distribution.expected_behaviour // "?") for spread ("
             + ($p.distribution.runs // [] | map("\(.label) \(.verdict), \(.nodes_serving) node(s)") | join("; "))
@@ -1138,7 +1145,7 @@ start)
   env_args=()
   for v in T1_WORKERS T1_CONNS T1_STEP T1_WARMUP T2_LEAF_TTL T3_START T3_MAX T5_START T5_MAX T3C_CONCURRENCY T3C_MULTI_CONNS T3C_STEP T6_RATE T6_BASELINE \
     T6_COOLDOWN T6_RAMP T6_HOLD T6_IDLE SERVER_CPU_MAX SOAK_RATE SOAK_HOLD SOAK_MAX_ERROR_RATE SOAK_CPU_MAX SOAK_DRIFT_PCT SOAK_SEGMENT TARGET_RATE T13_CACHED T13_RATE T13_PHASES T14_RATE T14_REPEATS T15_RATE GROUP_GAP T12_RATE T12_FREEZE_MAX T12_REPEATS BURST_CSR_RATE BURST_SPECS T3F_RATE FINE_CPU FINE_FACTOR LOW_HOLD STEP_VAULT_MIN_FT T11_KV_RATES T11_KV_REPEATS T11_PAYLOADS T11_PAYLOAD_RATE T11_RAMP T11_HOLD T11_KV_P99_MS T11_RESIZE_SETTLE T11_FAILOVER_REPEATS T11_FREEZE BASELINE COOLDOWN RAMP HOLD WARMUP DURATION EXPORT START_RATE VUS MAX_VUS \
-    P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT T16_START T16_MAX; do
+    P99_MS MAX_ERROR_RATE SETTLE_APT SETTLE_IDLE SETTLE_MAX_CPU SETTLE_SCANNER_WAIT MIN_ACHIEVED PLAN_TESTS MEM_GUARD_PCT T16_START T16_MAX T16_RESET_CA_CHANGED; do
     [ -n "${!v:-}" ] && env_args+=("--setenv=$v=${!v}")
   done
   sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
@@ -1150,6 +1157,12 @@ run)
   log "plan $PLAN starting on $PERF_NODE"
   limits_restore # a previous run stopped mid-T5 leaves limits removed
   t16_cleanup    # or mid-T16 leaves Consul on a signing path
+  # After a CA change stopped T16 (and the Consul servers were restarted, issue #11):
+  # T16_RESET_CA_CHANGED=1 lets the remaining T16 tests run again in this plan.
+  if [ "${T16_RESET_CA_CHANGED:-0}" = 1 ] && [ -n "$(sget '.values.t16_ca_changed.by')" ]; then
+    log "T16_RESET_CA_CHANGED=1: clearing the CA-change flag from $(sget '.values.t16_ca_changed.by')"
+    jq 'del(.values.t16_ca_changed)' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  fi
   for t in "settle:settle the cluster (apt jobs, idle, quiet check)" \
     "t1:Vault PKI baseline (no_store worker sweep, all nodes)" \
     "t3:Vault cluster capacity on Consul's mount (stress)" "t3r:T3 boundary repeats (last pass, midpoint, first fail)" \

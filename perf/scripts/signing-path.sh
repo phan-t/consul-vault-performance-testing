@@ -26,9 +26,16 @@ mkdir -p "$OUT"
 VAULT_HOST=$(sed -E 's#^https?://([^:/]+).*#\1#' <<<"$VAULT_ADDR")
 NODE_SCRIPT=/usr/local/bin/signing-path-node.sh
 
-ca_state() { # Consul's active root, its signing key and intermediates (hashed)
-  local roots
-  roots=$(curl -sf --max-time 10 -H "X-Consul-Token: $CONSUL_OPERATOR_TOKEN" "$CONSUL_HTTP_ADDR/v1/connect/ca/roots") || { echo null; return; }
+# ca_state: Consul's active root, its signing key and intermediates (hashed).
+# Fails (after 3 tries) when Consul can't be read: an unreadable state is not a
+# CA change, which would stop every later T16 test.
+ca_state() {
+  local roots i
+  for i in 1 2 3; do
+    roots=$(curl -sf --max-time 10 -H "X-Consul-Token: $CONSUL_OPERATOR_TOKEN" "$CONSUL_HTTP_ADDR/v1/connect/ca/roots") && break
+    [ "$i" -lt 3 ] || return 1
+    sleep 5
+  done
   jq -c --arg ih "$(jq -r '[.Roots[] | select(.Active) | .IntermediateCerts // [] | join("")] | join("")' <<<"$roots" | sha256sum | cut -c1-16)" \
     '([.Roots[] | select(.Active)][0]) as $a | {active_root_id: .ActiveRootID, signing_key_id: $a.SigningKeyID, intermediates_sha256: $ih}' <<<"$roots"
 }
@@ -77,7 +84,7 @@ up() {
   nodes=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=$PERF_NAME" "Name=tag:Role,Values=vault" "Name=instance-state-name,Values=running" \
     --query 'Reservations[].Instances[].Tags[?Key==`Node`].Value[]' --output text | tr '\t' '\n' | sort | sed "s/\$/.$VAULT_HOST/" | tr '\n' ' ')
   prev=$(ca_address)
-  before=$(ca_state)
+  before=$(ca_state) || { echo "$path: can't read Consul's CA roots; nothing changed"; exit 1; }
   echo "$path: starting on every Consul server (Vault $version; nodes: $nodes)"
   # Recorded before anything changes, so down can undo a partial up.
   jq -n -c --arg p "$path" --arg a "$addr" --arg prev "$prev" --argjson b "$before" \
@@ -91,7 +98,8 @@ up() {
   echo "$path: switching Consul's CA provider Address $prev -> $addr"
   consul-ca-limits.sh --address "$addr"
   leaf_ok && ok=true || ok=false
-  after=$(ca_state)
+  # Unreadable after the switch: a failure (exit 1, the caller switches back), not a CA change.
+  after=$(ca_state) || { echo "$path: can't read Consul's CA roots after the switch"; exit 1; }
   jq -n -c --arg p "$path" --arg a "$addr" --arg prev "$prev" --argjson ok "$ok" --argjson b "$before" --argjson af "$after" \
     '{path: $p, available: true, address: $a, previous_address: $prev, leaf_ok: $ok,
       ca_before: $b, ca_after_switch: $af, ca_unchanged_after_switch: ($b == $af)}' > "$OUT/path.json"
@@ -114,12 +122,12 @@ down() {
     consul-ca-limits.sh --address "$prev" || rc=1
   fi
   on_servers down >/dev/null || { echo "stopping the path on some Consul server failed (see $OUT/servers.log)"; rc=1; }
-  after=$(ca_state)
+  after=$(ca_state) || { echo "can't read Consul's CA roots after switching back: not compared"; after=null; rc=1; }
   jq -c --arg addr "$(ca_address)" --argjson af "$after" \
     '. + {restored_address: $addr, ca_after_restore: $af,
-          ca_unchanged: (if .ca_before == null then null
+          ca_unchanged: (if .ca_before == null or $af == null then null
                          else (.ca_before == $af and (.ca_unchanged_after_switch // true)) end)}' "$OUT/path.json" > "$OUT/path.tmp" && mv "$OUT/path.tmp" "$OUT/path.json"
-  if [ "$before" != "null" ] && [ "$before" != "$after" ]; then
+  if [ "$before" != "null" ] && [ "$after" != "null" ] && [ "$before" != "$after" ]; then
     echo "Consul's CA changed during the test: $before -> $after"
     rc=4
   fi

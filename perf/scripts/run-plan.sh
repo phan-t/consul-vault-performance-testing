@@ -712,9 +712,28 @@ path_stats() {
         '{rate: $rate, consul_cores: $cc, proxy_cores: $pc, consul_to_path_conns_max: $c2p, path_to_vault_conns_max: $p2v, time_wait_max: $tw}'
     done | jq -s -c .
 }
-t16_down() { RUN_ID="$PLAN-$1" signing-path.sh down 2>&1 | tee -a "$DIR/run.log"; }
+# A CA change (exit 4 from signing-path.sh) stops every later T16 test: each
+# restarts the load generator's agent, and after a CA change a restarted
+# agent is locked out until the Consul servers restart (issue #11).
+t16_ca_changed() {
+  log "$1: Consul's CA changed across the Address switch; the remaining T16 tests won't run (issue #11)"
+  sset '.values.t16_ca_changed' "$(jq -n -c --arg id "$1" '{by: $id}')"
+}
+t16_down() {
+  local rc
+  RUN_ID="$PLAN-$1" signing-path.sh down 2>&1 | tee -a "$DIR/run.log"
+  rc=$? # pipefail: signing-path.sh's exit status
+  [ "$rc" -ne 4 ] || t16_ca_changed "$1"
+  return "$rc"
+}
 t16() { # t16 <haproxy|proxy|alb>
-  local path=$1 id=t16$1 start rc out dist grid f first_baseline=$BASELINE
+  local path=$1 id=t16$1 start rc out dist grid f first_baseline=$BASELINE changed
+  changed=$(sget '.values.t16_ca_changed.by')
+  if [ -n "$changed" ]; then
+    log "$id: not run: Consul's CA changed in $changed (a restarted agent would be locked out, issue #11)"
+    sset ".values.$id" "$(jq -n -c --arg c "$changed" '{skipped: true, reason: "not run: Consul'"'"'s CA changed in \($c) (issue #11)"}')"
+    return 1
+  fi
   start=${T16_START:-$(sget '.values.t5.last_pass')}
   if [ -z "$start" ]; then
     log "$id: no T5 last pass in $PLAN to start from: run t5 in the same plan (or set T16_START)"
@@ -734,6 +753,7 @@ t16() { # t16 <haproxy|proxy|alb>
     sset ".values.$id" "$(jq -n -c --arg r "$(tail -1 <<<"$out")" '{skipped: true, reason: $r}')"
     return 0
   fi
+  [ "$rc" -ne 4 ] || t16_ca_changed "$id"
   if [ "$rc" -ne 0 ]; then log "$id: switching Consul's signing to $path failed (exit $rc): $(tail -1 <<<"$out")"; return 1; fi
   log "$id: $(tail -1 <<<"$out")"
   # T6's mesh runs and windows (no control run: it doesn't go through Consul);
@@ -747,7 +767,7 @@ t16() { # t16 <haproxy|proxy|alb>
   env START="$start" ${T16_MAX:+MAX=$T16_MAX} LOW_HOLD="${HOLD:-10m}" BASELINE="$GROUP_GAP" COOLDOWN="$COOLDOWN" \
     RUN_ID="$PLAN-$id-grid" stress-k6.sh /opt/perf/k6/consul-leaf.js
   set +e
-  t16_down "$id" # pipefail: signing-path.sh's exit status
+  t16_down "$id"
   rc=$?
   set -e
   limits_restore; trap - EXIT

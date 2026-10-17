@@ -68,6 +68,22 @@ leaf_ok() {
   return 1
 }
 
+# switch_address <url>: Consul reconfigures its provider on the switch (logs in,
+# then token/lookup-self). Through a path that balances each request (the ALB),
+# the lookup can reach a performance standby the new token hasn't replicated
+# to yet: Vault answers 412 "required index state not present" and Consul
+# rejects the change, staying on the old Address (plan-3's t16alb). Retried.
+switch_address() {
+  local i
+  for i in 1 2 3 4 5; do
+    consul-ca-limits.sh --address "$1" && return 0
+    [ "$i" -lt 5 ] || break
+    echo "switch attempt $i failed; retrying in 5 s"
+    sleep 5
+  done
+  return 1
+}
+
 up() {
   local path=$1 addr version nodes msg before after prev ok upstream=$VAULT_ADDR
   case "$path" in
@@ -96,7 +112,7 @@ up() {
     exit 3
   fi
   echo "$path: switching Consul's CA provider Address $prev -> $addr"
-  consul-ca-limits.sh --address "$addr"
+  switch_address "$addr"
   leaf_ok && ok=true || ok=false
   # Unreadable after the switch: a failure (exit 1, the caller switches back), not a CA change.
   after=$(ca_state) || { echo "$path: can't read Consul's CA roots after the switch"; exit 1; }

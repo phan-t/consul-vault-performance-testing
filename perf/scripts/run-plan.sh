@@ -714,7 +714,7 @@ path_stats() {
 }
 t16_down() { RUN_ID="$PLAN-$1" signing-path.sh down 2>&1 | tee -a "$DIR/run.log"; }
 t16() { # t16 <haproxy|proxy|alb>
-  local path=$1 id=t16$1 start rc out dist grid f
+  local path=$1 id=t16$1 start rc out dist grid f first_baseline=$BASELINE
   start=${T16_START:-$(sget '.values.t5.last_pass')}
   if [ -z "$start" ]; then
     log "$id: no T5 last pass in $PLAN to start from: run t5 in the same plan (or set T16_START)"
@@ -737,10 +737,11 @@ t16() { # t16 <haproxy|proxy|alb>
   if [ "$rc" -ne 0 ]; then log "$id: switching Consul's signing to $path failed (exit $rc): $(tail -1 <<<"$out")"; return 1; fi
   log "$id: $(tail -1 <<<"$out")"
   # T6's mesh runs and windows (no control run: it doesn't go through Consul);
-  # the test's first idle window is the full BASELINE.
+  # the test's first idle window is the full BASELINE (captured above: a prefix
+  # assignment would see T6's BASELINE).
   RUN_ID="$PLAN-$id" RATE="$T6_RATE" BASELINE="${T6_BASELINE:-1m}" COOLDOWN="${T6_COOLDOWN:-1m}" \
     RAMP="${T6_RAMP:-30s}" HOLD="${T6_HOLD:-2m}" IDLE="${T6_IDLE:-150s}" \
-    RUNS="mesh-1 mesh-2" EXPECT=spread FIRST_BASELINE="$BASELINE" LAST_COOLDOWN="$GROUP_GAP" signing-distribution.sh
+    RUNS="mesh-1 mesh-2" EXPECT=spread FIRST_BASELINE="$first_baseline" LAST_COOLDOWN="$GROUP_GAP" signing-distribution.sh
   # From T5's last pass, already near the old ceiling: every step holds the
   # full HOLD, like T9-V's T3 rerun. The test's last idle window is the full COOLDOWN.
   env START="$start" ${T16_MAX:+MAX=$T16_MAX} LOW_HOLD="${HOLD:-10m}" BASELINE="$GROUP_GAP" COOLDOWN="$COOLDOWN" \
@@ -758,7 +759,7 @@ t16() { # t16 <haproxy|proxy|alb>
   sset ".values.$id" "$(jq -n -c --arg p "$path" --argjson start "$start" --argjson grid "$grid" \
     --argjson stats "$(path_stats "$(dirname "$f")")" --slurpfile d "$dist" \
     --slurpfile sp "$RESULTS_DIR/$PLAN-$id-$PERF_NODE-signing-path/path.json" \
-    --argjson t5 "$(sget '.values.t5.last_pass // null')" --arg t6 "$(sget '.values.t6.expected_behaviour')" '
+    --argjson t5 "$(jq -c '.values.t5.last_pass // null' "$STATE")" --arg t6 "$(sget '.values.t6.expected_behaviour')" '
     {path: $p, address: $sp[0].address, start: $start,
      distribution: {expected_behaviour: $d[0].expected_behaviour, runs: [$d[0].runs[] | {label, verdict, nodes_serving, min_busiest_share}]},
      grid: $grid, path_stats: $stats,
@@ -766,6 +767,17 @@ t16() { # t16 <haproxy|proxy|alb>
      ca_unchanged: $sp[0].ca_unchanged,
      compare: {t5_last_pass: $t5, t6_expected_behaviour: (if $t6 == "" then null else $t6 end)}}')"
   [ "$rc" -eq 0 ] || { log "$id: switching back failed or Consul's CA changed (exit $rc); see $PLAN-$id-$PERF_NODE-signing-path/path.json"; return 1; }
+}
+# A stop or crash mid-T16 can leave Consul on the path and the proxies running
+# (systemd's stop timeout can cut the EXIT trap's switch-back short): undo any
+# T16 test still marked running. signing-path.sh down is safe to repeat.
+t16_cleanup() {
+  local id
+  for id in t16haproxy t16proxy t16alb; do
+    [ "$(sget ".tests[\"$id\"].status")" = running ] || continue
+    log "$id was interrupted: switching Consul back and stopping its path"
+    t16_down "$id" || log "$id: clean-up failed; see $PLAN-$id-$PERF_NODE-signing-path/servers.log"
+  done
 }
 t16haproxy() { t16 haproxy; }
 t16proxy() { t16 proxy; }
@@ -1111,6 +1123,7 @@ start)
 run)
   log "plan $PLAN starting on $PERF_NODE"
   limits_restore # a previous run stopped mid-T5 leaves limits removed
+  t16_cleanup    # or mid-T16 leaves Consul on a signing path
   for t in "settle:settle the cluster (apt jobs, idle, quiet check)" \
     "t1:Vault PKI baseline (no_store worker sweep, all nodes)" \
     "t3:Vault cluster capacity on Consul's mount (stress)" "t3r:T3 boundary repeats (last pass, midpoint, first fail)" \
@@ -1147,6 +1160,7 @@ t9v)
   ;;
 stop)
   sudo systemctl stop "$UNIT" 2>/dev/null || true
+  t16_cleanup
   limits_restore
   echo "stopped $UNIT"
   ;;

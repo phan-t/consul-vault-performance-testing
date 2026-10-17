@@ -26,6 +26,10 @@
 #
 # down stops and disables everything up started and removes the metric. The
 # packages stay installed, inert.
+#
+# up and down take a lock, so a down sent while an up is still running (a stop
+# mid-install: SSM keeps running the up after its sender is gone) waits for it,
+# then stops what it started, rather than racing it.
 set -uo pipefail
 
 PROXY_PORT=8210
@@ -208,6 +212,9 @@ down() {
   systemctl daemon-reload
   echo "result=ok"
 }
+
+exec 9>/run/signing-path-node.lock
+flock -w 900 9 || fail "another signing-path-node.sh still running after 900 s"
 
 case "${1:-}" in
 up)

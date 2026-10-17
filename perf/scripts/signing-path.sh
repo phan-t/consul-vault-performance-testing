@@ -117,7 +117,8 @@ down() {
   after=$(ca_state)
   jq -c --arg addr "$(ca_address)" --argjson af "$after" \
     '. + {restored_address: $addr, ca_after_restore: $af,
-          ca_unchanged: (.ca_before == $af and (.ca_unchanged_after_switch // true))}' "$OUT/path.json" > "$OUT/path.tmp" && mv "$OUT/path.tmp" "$OUT/path.json"
+          ca_unchanged: (if .ca_before == null then null
+                         else (.ca_before == $af and (.ca_unchanged_after_switch // true)) end)}' "$OUT/path.json" > "$OUT/path.tmp" && mv "$OUT/path.tmp" "$OUT/path.json"
   if [ "$before" != "null" ] && [ "$before" != "$after" ]; then
     echo "Consul's CA changed during the test: $before -> $after"
     rc=4

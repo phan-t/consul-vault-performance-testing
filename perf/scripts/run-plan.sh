@@ -776,7 +776,13 @@ t16_cleanup() {
   for id in t16haproxy t16proxy t16alb; do
     [ "$(sget ".tests[\"$id\"].status")" = running ] || continue
     log "$id was interrupted: switching Consul back and stopping its path"
-    t16_down "$id" || log "$id: clean-up failed; see $PLAN-$id-$PERF_NODE-signing-path/servers.log"
+    if t16_down "$id"; then
+      # Not "running" any more, so this isn't repeated on every later run or stop
+      # (a resume that includes it still reruns it: it isn't "done").
+      sset ".tests[\"$id\"].status" '"interrupted"'
+    else
+      log "$id: clean-up failed; see $PLAN-$id-$PERF_NODE-signing-path/servers.log"
+    fi
   done
 }
 t16haproxy() { t16 haproxy; }

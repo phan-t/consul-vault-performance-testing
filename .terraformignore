@@ -9,3 +9,5 @@ credentials.txt
 /scripts/
 __pycache__/
 *.pyc
+results/
+results-archive/

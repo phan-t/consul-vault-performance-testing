@@ -1302,7 +1302,11 @@ the same before the switch, after it and after switching back. A change fails
 the test: the switch was a rotation. It also stops the T16 tests after it,
 which are marked failed with the reason: each restarts the load generator's
 agent, and after a CA change a restarted agent is locked out until the Consul
-servers restart (issue #11). Check it by hand once before relying on it
+servers restart (issue #11). An unreadable CA state (Consul's API failing
+three times) is a failure, not a change. To run the remaining T16 tests after
+restarting the Consul servers, resume with `T16_RESET_CA_CHANGED=1`, which
+clears the flag (`T16_RESET_CA_CHANGED=1 scripts/run-campaign.sh resume
+plan-3`). Check it by hand once before relying on it
 (`consul connect ca roots` before and after `consul-ca-limits.sh --address`).
 
 **Record,** per path, in `values.t16<path>` and RESULTS.md:

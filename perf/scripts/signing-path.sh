@@ -62,12 +62,13 @@ leaf_ok() {
 }
 
 up() {
-  local path=$1 addr version nodes msg before after prev ok
+  local path=$1 addr version nodes msg before after prev ok upstream=$VAULT_ADDR
   case "$path" in
   haproxy) addr=https://127.0.0.1:8211 ;;
   proxy) addr=https://127.0.0.1:8210 ;;
   alb)
     addr=https://alb.$VAULT_HOST
+    upstream=$addr # the node checks Vault through the ALB itself
     getent hosts "alb.$VAULT_HOST" >/dev/null || { echo "no alb.$VAULT_HOST: build with var.vault_alb (run-campaign.sh --with-t16)"; exit 3; }
     ;;
   *) echo "usage: signing-path.sh up <haproxy|proxy|alb>" >&2; exit 1 ;;
@@ -78,7 +79,10 @@ up() {
   prev=$(ca_address)
   before=$(ca_state)
   echo "$path: starting on every Consul server (Vault $version; nodes: $nodes)"
-  if ! msg=$(on_servers up "$path" "$VAULT_ADDR" "$version" $nodes); then
+  # Recorded before anything changes, so down can undo a partial up.
+  jq -n -c --arg p "$path" --arg a "$addr" --arg prev "$prev" --argjson b "$before" \
+    '{path: $p, available: null, address: $a, previous_address: $prev, ca_before: $b}' > "$OUT/path.json"
+  if ! msg=$(on_servers up "$path" "$upstream" "$version" $nodes); then
     on_servers down >/dev/null || true
     echo "$path unavailable: $msg"
     jq -n -c --arg p "$path" --arg m "$msg" '{path: $p, available: false, reason: $m}' > "$OUT/path.json"
@@ -101,7 +105,8 @@ up() {
 
 down() {
   local prev before after rc=0
-  [ -f "$OUT/path.json" ] || { echo "no $OUT/path.json: nothing to switch back"; return 0; }
+  # The path may be running even without path.json (up stopped early): always stop it.
+  [ -f "$OUT/path.json" ] || echo '{}' > "$OUT/path.json"
   prev=$(jq -r '.previous_address // empty' "$OUT/path.json")
   before=$(jq -c '.ca_before // null' "$OUT/path.json")
   if [ -n "$prev" ] && [ "$(ca_address)" != "$prev" ]; then

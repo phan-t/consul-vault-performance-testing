@@ -2,6 +2,7 @@
 # T16 (issue #14), on a Consul server, as root (run-plan.sh sends it over SSM;
 # each server fetches it from the perf assets in S3):
 #   signing-path-node.sh up <haproxy|proxy|alb> <vault addr> <vault version> <vault node FQDN>...
+#     (<vault addr>: the NLB, Vault Proxy's upstream; for alb, the ALB's URL, checked from here)
 #   signing-path-node.sh down
 #
 # up starts the local endpoint the Consul leader's Vault CA provider is pointed

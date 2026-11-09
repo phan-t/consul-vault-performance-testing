@@ -28,9 +28,9 @@ through **HCP Terraform (TFC)**.
 
 | Component | Default | Notes |
 |---|---|---|
-| Vault Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 (6000 IOPS) Raft volume | `2.1.1+ent`. Raft auto-join via EC2 tags, KMS auto-unseal, TLS, file audit device |
+| Vault Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 (6000 IOPS) Raft volume | `2.1.1+ent`. Raft auto-join via EC2 tags, KMS auto-unseal, TLS, and a file audit device |
 | Vault non-voters | `vault_non_voter_count = 0` | Autopilot redundancy zone spares (Enterprise, `vault_redundancy_zones = true`): voter *i* is in `zone-i`, and `vault-nv-N` joins `zone-N` as a non-voter that Autopilot promotes if that zone's voter fails. With `vault_redundancy_zones = false`, permanent non-voters (`retry_join_as_non_voter`). Either way, they run as performance standbys |
-| Consul Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 data volume | `2.0.1+ent`, pinned (see [Consul version](#consul-version)). TLS, gossip encryption, ACLs (default deny), auto_encrypt for clients |
+| Consul Enterprise | 5 × `m7i.2xlarge`, 100 GB gp3 data volume | `2.0.1+ent`, pinned (see [Consul version](#consul-version)). TLS, gossip encryption, ACLs (default deny), and auto_encrypt for clients |
 | Consul read replicas | `consul_read_replica_count = 0` | `read_replica = true` (Enterprise non-voting servers) |
 | Vault ALB (T16) | `vault_alb = false` | Opt-in, for T16 path C (TEST-PLAN *Stage 5*): an internal ALB, `alb.vault.<domain>:443`, with HTTP/2 to a second Vault listener on 8202. The NLB and 8200 are unchanged. `run-campaign.sh --with-t16` sets it |
 | Connect CA | Vault provider, external root | Enterprise root CA (simulated by Terraform) → Vault intermediate (`pki_mesh_int`, Vault-managed) → Consul signing intermediate (`connect_<dc>_inter`) → leafs. The `leaf-cert` role uses `no_store=true`. Auth uses the Vault **AWS IAM auth method** (no static Vault token). See [Mesh PKI](#mesh-pki) |
@@ -50,9 +50,9 @@ results:
 
 | Version | Raft/Serf/memberlist metrics | Idle RPC stream EOFs |
 |---|---|---|
-| **2.0.1** | ✅ emitted | ✅ none |
-| 2.0.2, 2.0.3 | ❌ dropped: release built without `hashicorpmetrics` ([#23812](https://github.com/hashicorp/consul/issues/23812)) | ✅ none |
-| 2.0.4 | ❌ dropped | ❌ servers close idle RPC streams after `rpc_handshake_timeout` (5 s), so un-retried writes such as `ConnectCA.Sign` return 500 ([#23923](https://github.com/hashicorp/consul/issues/23923)) |
+| **2.0.1** | Emitted | None |
+| 2.0.2, 2.0.3 | Dropped: release built without `hashicorpmetrics` ([#23812](https://github.com/hashicorp/consul/issues/23812)) | None |
+| 2.0.4 | Dropped | Servers close idle RPC streams after `rpc_handshake_timeout` (5 s), so un-retried writes such as `ConnectCA.Sign` return 500 ([#23923](https://github.com/hashicorp/consul/issues/23923)) |
 
 To test 2.0.4 anyway, set `consul_version = "2.0.4+ent"` and
 `consul_rpc_handshake_timeout = "60s"`. That setting cut the idle-stream errors
@@ -73,14 +73,14 @@ Enterprise root CA (ECDSA P-384, 10 yr)       simulated by Terraform ("Offline M
 ```
 
 - **Replacing the root, or the Vault intermediate under it, belongs to the
-  enterprise root CA's lifecycle and is out of scope.** In this design Consul
+  enterprise root CA's lifecycle and is out of scope.** In this design, Consul
   also can't take over a new externally signed intermediate by rotation: Vault
   refuses the cross-sign (issue #12). Only Consul's own signing CA rotation is
   tested (T13).
 
 - **`pki_mesh_int` is Consul's `root_pki_path` in Vault-managed mode.**
   Consul can only read it and call `root/sign-intermediate`. It cannot mount,
-  change or rotate it.
+  change, or rotate it.
 - **`vault-0` creates both mounts at bootstrap.** It imports the intermediate
   bundle from the `<name>/vault/mesh-ca` secret, which holds the key,
   intermediate and root certificate but not the root key. It also sets the
@@ -105,16 +105,16 @@ clusters.
 ```bash
 terraform login
 cd tfc-bootstrap
-cp terraform.tfvars.example terraform.tfvars   # org name + license file paths
+cp terraform.tfvars.example terraform.tfvars   # org name + licence file paths
 terraform init && terraform apply
 ```
 
 This creates the project and the `consul-vault-perf` workspace (CLI-driven,
 working directory `terraform/`). It also sets `aws_region` and, if you give
-license files, the sensitive `vault_license` and `consul_license` variables.
+licence files, the sensitive `vault_license` and `consul_license` variables.
 Otherwise, set those two variables in the TFC UI.
 
-> Consul 2.x needs an **IBM Consul Enterprise license**.
+> Consul 2.x needs an **IBM Consul Enterprise licence**.
 
 ### 2. Push AWS credentials
 
@@ -148,7 +148,7 @@ Bootstrap order after apply, which takes about 5–8 min:
    `/<name>/vault/bootstrap-status=complete`.
 4. The Consul servers wait for that flag, then start. The first leader
    initialises the Vault CA provider.
-5. `consul-0` creates the `agent`, `perf` and `metrics` ACL tokens.
+5. `consul-0` creates the `agent`, `perf`, and `metrics` ACL tokens.
 
 To follow progress on a node, run `sudo tail -f /var/log/perf-bootstrap.log`
 in an SSM session.
@@ -176,7 +176,7 @@ running cluster by accident. To rebuild a node on purpose, use
 
 ## Targets
 
-The step-by-step run order, commands and a results template are in
+The step-by-step run order, commands, and a results template are in
 [TEST-PLAN.md](TEST-PLAN.md).
 
 These are sized for an example mesh: **100,000 service instances
@@ -202,7 +202,7 @@ manages leafs and should be validated.
 | **Leaf throughput through Consul** | **≥ 350 leafs/s** sustained (~333/s needed, rounded up) |
 | End-to-end leaf p99 at 350/s | **≤ 1 s**, errors < 0.1% (`consul-leaf.js` thresholds) |
 | Vault sign p99 on Consul's intermediate at 350/s | **≤ 100 ms**, errors < 0.1% (`vault-sign-consul-mount.js` thresholds) |
-| Guardrails at 350/s | 0 leader elections, Autopilot failure tolerance stays at 2, Raft leader last contact p99 < 200 ms |
+| Guardrails at 350/s | 0 leader elections, Autopilot failure tolerance stays at 2, and Raft leader last contact p99 < 200 ms |
 | Stretch | The actual ceilings of the Vault path (T3) and the Consul path (T5) |
 
 - **The limits are configurable per run:** `P99_MS` and `MAX_ERROR_RATE`
@@ -219,7 +219,7 @@ manages leafs and should be validated.
 - `consul-leaf.js` measures the **signing path** (Consul leader → Vault)
   accurately.
 - Key and CSR generation happens on the load generator's client agent. With
-  Dataplane it happens on the **Consul servers**, so server CPU during
+  Dataplane, it happens on the **Consul servers**, so server CPU during
   real-world bursts will be higher than these tests show.
 - The registration burst (`consul-register-burst.js`) models client-agent
   behaviour, which Dataplane doesn't have.
@@ -269,8 +269,8 @@ period before and after it:
   BASELINE             RAMP / WARMUP   HOLD / DURATION      COOLDOWN
 ```
 
-- **Grafana annotations** mark each run on the dashboard: a start/end region
-  plus a steady-state marker, in the **Perf tests** annotation layer.
+- **Grafana annotations** mark each run on the dashboard: a region for the
+  whole run plus a steady-state marker, in the **Perf tests** annotation layer.
 - **The Grafana export** runs on `loadgen-0` after the cooldown (`EXPORT=auto`;
   set `EXPORT=1` or `EXPORT=0` to force it on or off). It covers the whole
   window and is driven by the live **Consul + Vault Perf** dashboard, so every
@@ -290,7 +290,7 @@ uploaded to `s3://<perf_bucket>/results/`) contains:
 | `grafana/dashboard.png` | Full dashboard for the run window |
 | `grafana/panels/NN-<panel>.png` | Every panel, rendered for the run window |
 | `grafana/metrics.csv` | Every dashboard query's time series (panel, series, UTC time, value, labels) |
-| `grafana/stats.json`, `grafana/stats.md` | Per-series count/mean/min/max/p50/last for **baseline / warmup / steady / cooldown** |
+| `grafana/stats.json`, `grafana/stats.md` | Per-series count, mean, min, max, p50, and last value for the **baseline, warm-up, steady, and cooldown** phases |
 | `grafana/links.txt` | Grafana link for the same window |
 
 To combine all load generators and tools for one run into a single report:
@@ -303,8 +303,8 @@ The report normalises everything to **milliseconds**:
 - **Client-side:** a row per node. Where several nodes ran, a combined row
   sums throughput and reports a request-weighted mean and the worst node's
   percentiles.
-- **Server-side:** every dashboard query, with baseline / warmup / steady /
-  cooldown means (the max across instances) and the steady-state max.
+- **Server-side:** every dashboard query, with baseline, warm-up, steady,
+  and cooldown means (the max across instances) and the steady-state max.
 
 To open the dashboard, port-forward 3000 (see the `access` output), or use the
 public URL if enabled, and go to **Perf Testing → Consul + Vault Perf**.
@@ -346,7 +346,7 @@ START=200 stress-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
   than `MIN_ACHIEVED` (default `0.95`) of the iterations it should have
   started. In an open model, dropped iterations mean every VU was waiting.
 - `FACTOR` (default `2`), `MAX` (default `12800`), `STEP_GAP` (extra pause
-  between steps, default `0`) and the usual `RAMP`/`HOLD` apply. For
+  between steps, default `0`), and the usual `RAMP` and `HOLD` apply. For
   `consul-leaf.js`, the client agent is restarted between steps to clear its
   leaf cache (`RESTART_AGENT`).
 - **Steps are chained:** one 5-minute baseline, then each step back to back
@@ -360,7 +360,7 @@ START=200 stress-k6.sh /opt/perf/k6/vault-sign-consul-mount.js
 - Per-step Prometheus measurements (peak CPU, signs per Vault node) cover the
   step's **steady state**, read from its `phases.json`.
 - `stress.json` records each step (thresholds, delivered fraction, failure
-  rate, p50/p95/p99, busiest hosts' peak CPU and sign requests per Vault node
+  rate, p50/p95/p99, busiest hosts' peak CPU, and sign requests per Vault node
   from Prometheus), the last passing rate, why it stopped, and the knee: the
   first pair of steps where p95 grew faster than the rate.
 - For `consul-leaf.js`, watch `sign_nodes` across steps. If Consul's signing
@@ -424,7 +424,7 @@ setting, and `vault/api` enables HTTP/2 itself, so `GODEBUG=http2client=0`
 doesn't help. T16 (TEST-PLAN *Stage 5*, issue #14) points the provider's
 `Address` at a path that balances per request instead, one test each:
 HAProxy on each Consul server (`127.0.0.1:8211`), Vault Proxy with keep-alives
-off (`127.0.0.1:8210`, a connection per sign) and an ALB (`vault_alb`). It
+off (`127.0.0.1:8210`, a connection per sign), and an ALB (`vault_alb`). It
 reruns T6's mesh runs, expecting `spread`, and a T5-style grid from T5's last
 pass:
 
@@ -470,7 +470,7 @@ Reading it, with T5 (Consul's own ceiling):
 | Result | Meaning |
 |---|---|
 | Consul's ceiling ≈ single-connection ceiling | The single connection (one Vault node) is the bottleneck |
-| Consul's ceiling well below single-connection ceiling | The limit is Consul-side (leader RPC, rate limiter, key generation) |
+| Consul's ceiling well below single-connection ceiling | The limit is Consul-side (leader RPC, rate limiter, or key generation) |
 | Single ≪ multi | Vault's no_store scale-out can't help Consul while the leader uses one connection |
 
 **Direct evidence of the connection count:**
@@ -509,12 +509,12 @@ Reading it, with T5 (Consul's own ceiling):
   realistic, with log rotation every 5 minutes at 1 GB. Turn it off to measure
   the audit overhead.
 - **Consul 2.0.2–2.0.4 (and late 1.22.x) Enterprise binaries drop Raft,
-  Serf and memberlist metrics.** Examples are `consul_raft_commitTime`,
-  `consul_raft_state_*` and `consul_raft_leader_lastContact`; they exist only
+  Serf, and memberlist metrics.** Examples are `consul_raft_commitTime`,
+  `consul_raft_state_*`, and `consul_raft_leader_lastContact`; they exist only
   as empty placeholders. This has been confirmed:
   - Consul moved its metric sinks to `hashicorp/go-metrics`
     ([#23635](https://github.com/hashicorp/consul/pull/23635)).
-  - The raft, serf and memberlist libraries report through
+  - The raft, serf, and memberlist libraries report through
     `go-metrics/compat`, which only uses the new registry when the binary is
     built with the `hashicorpmetrics` tag.
   - The release builds omit that tag, so those metrics go to a registry with
@@ -525,7 +525,7 @@ Reading it, with T5 (Consul's own ceiling):
   No config option or sink can work around this. The only fixes are Consul
   **2.0.1+ent** or a release that includes #23813. Metrics Consul emits itself
   are unaffected: `consul_kvs_apply`, `consul_txn_apply`, `consul_fsm_*`,
-  `consul_rpc_request`, `consul_server_isLeader` and `consul_autopilot_*`. The
+  `consul_rpc_request`, `consul_server_isLeader`, and `consul_autopilot_*`. The
   dashboard therefore uses those:
   - Leaf signing rate comes from `consul_fsm_ca_leaf{op="increment-index"}`.
   - Raft throughput comes from `deriv(consul_raft_last_index)`.
@@ -540,7 +540,7 @@ Reading it, with T5 (Consul's own ceiling):
 
 ## Security notes (test environment)
 
-- The root token, the Consul management token and every TLS key are in
+- The root token, the Consul management token, and every TLS key are in
   Secrets Manager **and in TFC state**. The load generators can read the Vault
   root token and the Consul management token (`operator_token`). Don't reuse
   this setup for production.
@@ -552,7 +552,7 @@ Reading it, with T5 (Consul's own ceiling):
 ## Layout
 
 ```
-tfc-bootstrap/          TFC project/workspace + license variables (local state)
+tfc-bootstrap/          TFC project/workspace + licence variables (local state)
 terraform/              Environment (TFC workspace, working dir)
   templates/            user_data for vault, consul-server, loadgen, monitoring (+ common.sh)
   files/                Grafana dashboard
@@ -565,6 +565,6 @@ perf/
   tools/vault-sign-load Go load tool using Consul's Vault client (single vs multi connection)
 ```
 
-## License
+## Licence
 
-[MPL-2.0](LICENSE). Vault Enterprise and Consul Enterprise themselves need their own licenses (see above).
+[MPL-2.0](LICENSE). Vault Enterprise and Consul Enterprise themselves need their own licences (see above).

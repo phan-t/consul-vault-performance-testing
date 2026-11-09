@@ -4,10 +4,10 @@
 
 | Stage | Test | Question it answers | Time |
 |---|---|---|---|
-| 0 | Settle | Is the full-size cluster built, verified and quiet? | ~1–1.1 h |
+| 0 | Settle | Is the full-size cluster built, verified, and quiet? | ~1–1.1 h |
 | 1: Vault ceiling | T1 | What's Vault's `no_store` signing ceiling and knee across all 5 nodes? | ~1 h |
 | | T3 | What rate can Vault sustain on Consul's own mount and role? | ~1–1.3 h |
-| | T3r | Does T3's ceiling reproduce? Repeats at its last pass, midpoint and first fail, giving a range | ~0.7 h |
+| | T3r | Does T3's ceiling reproduce? Repeats at its last pass, midpoint, and first fail, giving a range | ~0.7 h |
 | | T3c | What can one Consul-style connection carry, compared with many? | ~0.7 h |
 | 2: Consul ceiling | T5 | What's Consul's real leaf ceiling (agent → leader → Vault) with CSR limits removed? | ~1–1.3 h |
 | | T5r | Does T5's ceiling reproduce? The same boundary repeats | ~0.7 h |
@@ -21,8 +21,8 @@
 | | T12 | Under load, how long does a new zone spare take to join, and Autopilot to promote it when its zone's voter hangs? 3 runs, plus 1 in the active node's zone | ~0.8 h |
 | | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
 | | T13 | What does rotating Consul's signing CA under load do to sidecars and to client agents that restart? (Root rotation is out of scope.) Runs last: it leaves the signing CA rotated | ~0.5 h |
-| *Own campaign* | T11 | What do Vault Raft commit time, leader cost and failover look like at 7, 5 and 3 voters? | ~9–11 h |
-| *Own run* (Stage 5) | T16 | Does sending Consul's signing through HAProxy, Vault Proxy (keep-alives off) or an ALB spread it across Vault nodes and raise T5's ceiling? With T5 and T6 rerun as the reference | ~3.7–4.7 h, plus Stage 0 and T5/T6 |
+| *Own campaign* | T11 | What do Vault Raft commit time, leader cost, and failover look like at 7, 5, and 3 voters? | ~9–11 h |
+| *Own run* (Stage 5) | T16 | Does sending Consul's signing through HAProxy, Vault Proxy (keep-alives off), or an ALB spread it across Vault nodes and raise T5's ceiling? With T5 and T6 rerun as the reference | ~3.7–4.7 h, plus Stage 0, T5, and T6 |
 
 The tests run in the order of this table, as one unattended campaign
 (`plan-1`, ~13.5–14.5 h). T11 shrinks Vault for good, so it runs as its own
@@ -96,15 +96,15 @@ See README → *Targets* for how these were sized.
 | End-to-end leaf p99 at 350/s | **≤ 1 s**, errors < 0.1% |
 | Vault sign p99 on Consul's intermediate at 350/s | **≤ 100 ms**, errors < 0.1% |
 | Server CPU | Stress steps and boundary repeats: mean CPU over the steady state ≤ 90% on every Vault and Consul server. Soak: ≤ 80% |
-| Soak at 350/s for 2 h | ≥ 99.99% success, p99 ≤ 1 s; server memory, Go heap and file descriptors grow ≤ 10% (a warning, not a failure) |
-| Guardrails | 0 leader elections, Autopilot failure tolerance 2, Raft leader last contact p99 < 200 ms (T11: tolerance (N−1)/2, so 1 at 3 voters; its failover check is excluded). Checked after every test, and **fail** a stress step or boundary repeat when broken during its steady state |
+| Soak at 350/s for 2 h | ≥ 99.99% success, p99 ≤ 1 s; server memory, Go heap, and file descriptors grow ≤ 10% (a warning, not a failure) |
+| Guardrails | 0 leader elections, Autopilot failure tolerance 2, and Raft leader last contact p99 < 200 ms (T11: tolerance (N−1)/2, so 1 at 3 voters; its failover check is excluded). Checked after every test, and **fail** a stress step or boundary repeat when broken during its steady state |
 
 ## Environment
 
 - **Consul Enterprise:** 2.0.1+ent, 5 voters.
 - **Vault Enterprise:** 2.1.1+ent, 5 voters (plus 2 non-voters in T9-V).
 - **Load and monitoring:** 2 × `r7i.4xlarge` load generators (16 vCPU, 128 GiB: see *T5 rerun*) and 1 × `m7i.xlarge` monitoring node.
-- **Base image:** all instances run Ubuntu 24.04 (`ami_owner` / `ami_name_pattern`; Canonical's public image by default).
+- **Base image:** all instances run Ubuntu 24.04 (`ami_owner` and `ami_name_pattern`; Canonical's public image by default).
 - **Instance size:** Vault and Consul servers are `m7i.2xlarge`, with gp3 volumes at 6000 IOPS.
 - **Mesh PKI:**
 
@@ -114,11 +114,11 @@ enterprise root CA (simulated by Terraform) → Vault intermediate (pki_mesh_int
 
 Leafs are issued with `no_store`.
 
-**Changing the Vault license on a running cluster:**
+**Changing the Vault licence on a running cluster:**
 1. Update `vault.hclic` and apply `tfc-bootstrap/`; this updates the
    `vault_license` workspace variable.
 2. Apply `terraform/`; this updates the config secret that new nodes read.
-3. On each node, write the license to `/etc/vault.d/vault.hclic`.
+3. On each node, write the licence to `/etc/vault.d/vault.hclic`.
 4. Reload the standbys with `systemctl reload vault`, and **restart** the
    active node.
 
@@ -208,7 +208,7 @@ Each run produces:
 - **Results** in `/opt/perf/results/` and in
   `s3://<perf_bucket>/results/<RUN_ID>-…/`.
 
-After each test, run `summarise.sh <RUN_ID>` for one Markdown/CSV report in
+After each test, run `summarise.sh <RUN_ID>` for one Markdown and CSV report in
 milliseconds.
 
 ## Where commands run
@@ -266,19 +266,19 @@ run-plan.sh stop plan-1           # stop; Consul CSR limits are restored
   - T2 uses T1's knee, the last worker level that still added ≥ 10%
     throughput.
   - T3r and T5r repeat each stress test's boundary: one full run each at its
-    last pass, the midpoint and its first fail, with the same pass criteria
+    last pass, the midpoint, and its first fail, with the same pass criteria
     as a step. They're skipped if there's no boundary.
-  - Consul's CSR limits are removed for T5, T5r, the soak and T3f, set to
+  - Consul's CSR limits are removed for T5, T5r, the soak, and T3f, set to
     `BURST_CSR_RATE` for the burst test, and always restored.
 - **After every test** it checks the guardrails (Consul and Vault leader
   elections, minimum Autopilot failure tolerance), runs `summarise.sh`,
   rewrites `RESULTS.md`, and uploads to `s3://<bucket>/results/<PLAN>-plan/`.
 - **Settings default to this plan and can be overridden with env vars:**
-  `T1_WORKERS`, `T3_START`/`T3_MAX`, `T5_START`/`T5_MAX`, `T3C_*`, `T6_*`,
+  `T1_WORKERS`, `T3_START`, `T3_MAX`, `T5_START`, `T5_MAX`, `T3C_*`, `T6_*`,
   `SOAK_*`, `BURST_*`, `T3F_RATE`, `T12_*`, `SERVER_CPU_MAX`, `FINE_CPU`,
-  `FINE_FACTOR`, `LOW_HOLD`,
-  `SETTLE_APT`/`SETTLE_IDLE`/`SETTLE_MAX_CPU`, `P99_MS`, `MAX_ERROR_RATE`,
-  and the usual `BASELINE`/`COOLDOWN`/`RAMP`/`HOLD`/`WARMUP`/`DURATION`.
+  `FINE_FACTOR`, `LOW_HOLD`, `SETTLE_APT`, `SETTLE_IDLE`, `SETTLE_MAX_CPU`,
+  `P99_MS`, `MAX_ERROR_RATE`, and the usual `BASELINE`, `COOLDOWN`, `RAMP`,
+  `HOLD`, `WARMUP`, and `DURATION`.
 
 The per-test sections below are the reference, and the manual fallback.
 
@@ -403,7 +403,7 @@ Consul's `leaf-cert` role (`pki-perf-mount.sh create`).
 The load comes from `vault-sign-load` with **32 independent clients** (32
 connections), so the NLB spreads it across every Vault node. The result
 records `vault_nodes_serving` and the per-node split to prove it, from the
-`pki_perf` mount's route metric. In plan-1 that metric matched nothing (every
+`pki_perf` mount's route metric. In plan-1, that metric matched nothing (every
 level reported 0 nodes), so the name is now matched by regex, and
 `vault_nodes_busy` (Vault nodes over 10% mean CPU) shows the spread even if it
 still doesn't.
@@ -423,7 +423,7 @@ summarise.sh t1
 The four concurrency levels are chained, each with a 2-minute warm-up and 10
 minutes measured.
 
-**Record:** throughput, p50/p95/p99 and nodes serving per level. The knee is
+**Record:** throughput, p50/p95/p99, and nodes serving per level. The knee is
 the concurrency after which throughput stops rising (< 10% more) but p99 keeps
 climbing.
 
@@ -442,8 +442,8 @@ writing each certificate to Raft. That lets the clean-up delete them:
    deletes expired certificates, hence the short TTL;
 3. it unmounts the now near-empty mount.
 
-In plan-1 a plain unmount through the NLB never finished: every attempt was
-redirected, dropped and cancelled, which blocked the campaign for 4 h 20 min
+In plan-1, a plain unmount through the NLB never finished: every attempt was
+redirected, dropped, and cancelled, which blocked the campaign for 4 h 20 min
 (issue #10). The clean-up now shows its errors and gives up after 60 minutes
 (`CLEANUP_DEADLINE`). A clean-up failure is recorded in `values.t2.cleanup`,
 and RESULTS.md shows it as "done (clean-up failed: …)": T2's measurement is
@@ -460,7 +460,7 @@ summarise.sh t2
 ```
 
 **Compare with T1** at the same concurrency: throughput, p99, Vault Raft
-commit time and active-node CPU.
+commit time, and active-node CPU.
 
 ### T3: Vault cluster capacity on Consul's mount (~1–1.3 h)
 
@@ -510,9 +510,9 @@ summarise.sh t3c
 **Record:** from `connection-test.json`:
 - `single_max` and `multi_max`, and the ratio between them. Both are the best
   step **within the target** (no errors, p99 ≤ 100 ms), and `single_max` must
-  use exactly one connection. At high concurrency Go's HTTP/2 client opens
+  use exactly one connection. At high concurrency, Go's HTTP/2 client opens
   more: plan-1's raw single-mode maximum, 4,045/s, used 3 connections, 3
-  Vault nodes and had p99 153 ms. The honest figure was 2,048/s at
+  Vault nodes, and had p99 153 ms. The honest figure was 2,048/s at
   concurrency 64 (p99 63 ms). `single_max_any` and `multi_max_any` keep the
   raw maxima for reference;
 - in single mode, whether a second connection or node appears at high
@@ -576,7 +576,7 @@ scripts/run-campaign.sh finish plan-2
 ```
 
 `start` rebuilds every node (Stage 0), so this needs the full environment,
-not just monitoring. Steps: 800, 1,600, 3,200, 6,400 and 12,800/s, about 12
+not just monitoring. Steps: 800, 1,600, 3,200, 6,400, and 12,800/s, about 12
 minutes each, until one fails or is invalid. Then T5r at the midpoint of the
 last pass and first fail. About 1 h for Stage 0 plus 1.5–2 h for settle, T5
 and T5r.
@@ -603,7 +603,7 @@ the Consul runs is still well over 90 s: 1 minute of cooldown, the 150 s
 `IDLE`, and 1 minute of baseline.
 
 **Record:** from `distribution.json`:
-- `expected_behaviour`: `confirmed`, `refuted` or `inconclusive`;
+- `expected_behaviour`: `confirmed`, `refuted`, or `inconclusive`;
 - each run's verdict and nodes serving;
 - `busiest_node_changed_after_idle`.
 
@@ -648,7 +648,7 @@ minutes in) it stalled every 5 minutes, and each stall was worse than the last.
 That took the client p99 to 9.2 s while the servers sat idle: 0 errors in 2.48
 million leafs and no growth (issue #8). Real agents, and Dataplane's servers,
 hold far fewer leafs. The Vault and Consul servers don't restart between
-segments, so growth, CPU and server-side latency are measured over the whole
+segments, so growth, CPU, and server-side latency are measured over the whole
 2 hours. RESULTS.md also records the agent's largest cache
 (`consul_leaf_certs_entries_count`).
 
@@ -677,7 +677,7 @@ consul-ca-limits.sh 50 0
 ```
 
 Change it with `SOAK_RATE`, `SOAK_HOLD`, `SOAK_SEGMENT`, `SOAK_MAX_ERROR_RATE`,
-`SOAK_CPU_MAX` and `SOAK_DRIFT_PCT`.
+`SOAK_CPU_MAX`, and `SOAK_DRIFT_PCT`.
 
 **For a stronger leak check,** run a long soak as its own plan, for example
 `PLAN_TESTS="settle soak" SOAK_HOLD=10h scripts/run-campaign.sh start soak-1`
@@ -696,7 +696,7 @@ sends, through Consul:
 - **100,000 leafs in 10 minutes** (167/s): the whole mesh.
 
 Each run records leafs issued, failed, rate-limited
-(`consul_csr_rate_limited`), p50, p99 and max. It passes on errors < 0.1% and
+(`consul_csr_rate_limited`), p50, p99, and max. It passes on errors < 0.1% and
 p99 ≤ 1 s. If the limiter's refusals reach the client as errors instead of
 being retried by the agent, it fails, which is a finding about the limit
 rather than a test bug. Change it with `BURST_CSR_RATE` and `BURST_SPECS`
@@ -815,7 +815,7 @@ the held `vault-nv-0` and `vault-nv-1` join `zone-0` and `zone-1` as spares.
 They set `autopilot_redundancy_zone`, **not** `retry_join_as_non_voter`, which
 would make them permanent non-voters that Autopilot never promotes.
 `run-campaign.sh` checks for 5 zones at the start, which also checks that the
-license allows redundancy zones.
+licence allows redundancy zones.
 
 Under a constant signing load on Consul's mount, at half T3's last passing
 rate (`T12_RATE`), `vault-zone-test.sh` picks a zone with a spare whose voter
@@ -850,7 +850,7 @@ error window includes the NLB health checks.
 **Repeats.** One sample can't show the spread of two 10-second Autopilot timers
 plus 1-second polling, so T12 runs **3 times** (`T12_REPEATS`), alternating
 zones, each re-adding a spare and freezing a voter. RESULTS.md gives the
-median and range of join, promotion, recovery and failed requests. Then
+median and range of join, promotion, recovery, and failed requests. Then
 **one more run in the active node's zone** (`MODE=active`), where the freeze
 also forces an election: the realistic worst case. T12's guardrails cover the
 3 standby runs only, since the active run elects a new leader on purpose. If
@@ -911,7 +911,7 @@ because it leaves the signing CA rotated.
 
 **Root rotation is out of scope.** Consul's root here is a Vault intermediate
 under the enterprise root CA, so replacing it belongs to that CA's lifecycle.
-In plan-1 it also turned out that Consul can't rotate an externally signed root
+In plan-1, it also turned out that Consul can't rotate an externally signed root
 in this design: Vault refuses the cross-sign (issue #12, closed as out of
 scope). Only a root change forces every leaf to be re-issued. The load of a full
 re-issue is covered by the burst test: 100,000 leafs in 10 minutes at the
@@ -939,7 +939,7 @@ with the CSR limit set to the recommended 350/s, `ca-rotation-test.sh`:
 
 It records: when signing moved to the new CA, leafs re-issued (Vault's signs
 on Consul's intermediates minus the foreground's), the new leafs' failures,
-p99 and longest gap during the rotation, and the agent check: locked out or
+p99, and longest gap during the rotation, and the agent check: locked out or
 not, how long the server restarts took, and reconnect time after them.
 
 ```bash
@@ -1009,13 +1009,13 @@ Stages 1–3 first. Every T11 size writes to its own new KV mount, and
 `t11smoke` runs before the long runs. Even so, compare commit times with
 raft-1's only with that difference in mind.
 
-### T11: Vault Raft commit time, leader cost and failover at 7, 5 and 3 voters (~7.7–10.7 h; ~9–11 h as its own campaign)
+### T11: Vault Raft commit time, leader cost, and failover at 7, 5, and 3 voters (~7.7–10.7 h; ~9–11 h as its own campaign)
 
 Measures what each extra pair of voters costs on every Vault write. It looks
 at the mechanism as well as the end result:
 - **Fan-out:** the leader sends every entry to N−1 followers, so its network and
   CPU work per write should scale about 2 : 4 : 6.
-- **Quorum:** the leader waits for the 1st, 2nd or 3rd fastest follower ack.
+- **Quorum:** the leader waits for the 1st, 2nd, or 3rd fastest follower ack.
 - **Saturation:** because of the fan-out, a bigger cluster's commit time should
   bend upward at a lower rate.
 
@@ -1026,7 +1026,7 @@ workloads:
   per size (`kv_perf_t11v7`, …; `max_versions=1`, keys cycled over 10,000, so
   the data set stays the same size). Every write goes through Raft on the active node (standbys forward
   it), so this isolates Raft. The smoke check records Raft applies per write.
-  - **The same rate grid at every size:** 200, 400, 600, 800, 1,000, 1,200
+  - **The same rate grid at every size:** 200, 400, 600, 800, 1,000, 1,200,
     and 1,600/s. In raft-1, every size saturated at 1,600/s (delivered 0.60,
     p99 27 s), so 2,400–12,800/s were never reached, and 800 → 1,600 was too
     coarse to separate the sizes. The grid stops at the first failing rate.
@@ -1085,10 +1085,10 @@ Every step records:
 
 **Leader placement is recorded, not controlled.** The leader doesn't move
 within a size until the failover check, so each size has one placement.
-RESULTS.md shows the leader, its AZ and how many voters share that AZ (the acks
+RESULTS.md shows the leader, its AZ, and how many voters share that AZ (the acks
 it can get without crossing AZs), so you can see whether placement could explain
 a latency difference. Pinning the leader to one AZ wouldn't make the sizes
-equal anyway: it would share that AZ with 0, 1 or 2 other voters.
+equal anyway: it would share that AZ with 0, 1, or 2 other voters.
 
 **One build, shrunk in place.** T11 needs 7 voters (3/2/2 over the three AZs).
 In the main campaign, `t11grow` provides them. As its own campaign, T11
@@ -1104,7 +1104,7 @@ shrinking Vault with `vault-raft-voters.sh shrink <N>`, which:
 Each size writes to a fresh, empty KV mount of its own, so every size starts
 from the same data. Earlier sizes' mounts are left in place (idle, about 25 MB
 each) rather than unmounted: an unmount deletes every key through Raft, which
-is slow, and a cancelled one hung the active node in testing. After a shrink it idles 2 minutes while the NLB health
+is slow, and a cancelled one hung the active node in testing. After a shrink, it idles 2 minutes while the NLB health
 checks and Autopilot catch up. Then it runs one **chained** timeline, like T3
 and T5:
 
@@ -1154,7 +1154,7 @@ scripts/run-campaign.sh finish raft-1        # download results, then offer terr
    overrides `campaign.auto.tfvars`).
 2. Builds the environment. With nothing in state it creates everything;
    otherwise it replaces every instance, like the main campaign.
-3. Verifies 7 Vault voters, 0 non-voters and 5 Consul voters.
+3. Verifies 7 Vault voters, 0 non-voters, and 5 Consul voters.
 4. Starts `settle → t11smoke → t11v7 → t11v5 → t11v3` unattended on loadgen-0.
 
 `finish` removes the profile after the destroy, and a `start` without `--t11`
@@ -1180,7 +1180,7 @@ and one failover. Then it checks what T11 depends on:
 Stage 4. To
 tune it, set `T11_KV_RATES`, `T11_KV_REPEATS`, `T11_PAYLOADS`,
 `T11_PAYLOAD_RATE`, `T11_RAMP`, `T11_HOLD`, `T11_KV_P99_MS`,
-`T11_RESIZE_SETTLE`, `T11_FAILOVER_REPEATS` and `T11_FREEZE`. Manual equivalent for one size, on loadgen-0:
+`T11_RESIZE_SETTLE`, `T11_FAILOVER_REPEATS`, and `T11_FREEZE`. Manual equivalent for one size, on loadgen-0:
 
 ```bash
 vault-raft-voters.sh status                 # voters, leader, AZ spread, failure tolerance
@@ -1207,9 +1207,9 @@ size, then four tables. Each column is a voter count:
    value is the mean of the repeats ± half their range.
 2. **Leader cost per write,** per grid rate: KB sent, CPU ms, and the ratio to
    the 3-voter value. Expect about 2× at 5 voters and 3× at 7.
-3. **Payload sweep:** commit time, client p99 and KB per write at 1, 16 and
-   32 KiB (mean of the repeats ± half their range).
-4. **Failover:** new active and write gap (median / max), failed writes, and
+3. **Payload sweep:** commit time, client p99, and KB per write at 1, 16,
+   and 32 KiB (mean of the repeats ± half their range).
+4. **Failover:** new active and write gap (median and max), failed writes, and
    the stages from the logs.
 
 **How to read it:**
@@ -1241,10 +1241,10 @@ default:
 - HAProxy and Vault Proxy aren't in Terraform. T16 installs and starts them on
   the Consul servers itself, over SSM (`signing-path-node.sh`, fetched from
   the perf assets), and stops them afterwards.
-- The ALB, its ACM certificate and Vault's second listener (8202) exist only
+- The ALB, its ACM certificate, and Vault's second listener (8202) exist only
   with `vault_alb = true`. The 8200 listener and the NLB are unchanged.
 - Script changes keep their defaults: `consul-ca-limits.sh --address`, and
-  `signing-distribution.sh`'s `RUNS`, `EXPECT`, `FIRST_BASELINE` and
+  `signing-distribution.sh`'s `RUNS`, `EXPECT`, `FIRST_BASELINE`, and
   `LAST_COOLDOWN`. T6 runs as before.
 - The metrics are new series (`perf_signing_connections`,
   `perf_process_cpu_seconds_total`); `perf_vault_connections` is unchanged.
@@ -1261,7 +1261,7 @@ scripts/run-campaign.sh finish plan-3
 defaults `PLAN_TESTS` to that sequence; `finish` removes the profile after the
 destroy, and a `start` without it removes it too.
 
-### T16: Consul's signing through HAProxy, Vault Proxy and an ALB (~1.2–1.6 h per path)
+### T16: Consul's signing through HAProxy, Vault Proxy, and an ALB (~1.2–1.6 h per path)
 
 | Path | Test | Address | How it spreads | Cost to watch |
 |---|---|---|---|---|
@@ -1297,8 +1297,8 @@ Each test, with Consul's CSR limits removed (`signing-path.sh` and
    between steps, as in T5.
 5. **Switches back** to the NLB after the cooldown and stops the path.
 
-**Guard:** Consul's active root ID, signing key ID and intermediates must be
-the same before the switch, after it and after switching back. A change fails
+**Guard:** Consul's active root ID, signing key ID, and intermediates must be
+the same before the switch, after it, and after switching back. A change fails
 the test: the switch was a rotation. It also stops the T16 tests after it,
 which are marked failed with the reason: each restarts the load generator's
 agent, and after a CA change a restarted agent is locked out until the Consul
@@ -1342,8 +1342,8 @@ ALB's header aren't verified). Consul authenticates with AWS IAM here.
 |---|---|---|
 | T5 vs T3c single | T5 ≈ single-connection ceiling | The single connection (one Vault node) is Consul's bottleneck |
 | T5 vs T3c single | T5 well below single | The Consul leader is the bottleneck (RPC, Raft, CPU) |
-| T3c single vs T3 / T3c multi | Single ≪ multi | Vault's scale-out doesn't reach the Consul path |
-| T9-V vs T3 / T3c | Multi rises, single flat | Non-voters help direct clients only |
+| T3c single vs T3 and T3c multi | Single ≪ multi | Vault's scale-out doesn't reach the Consul path |
+| T9-V vs T3 and T3c | Multi rises, single flat | Non-voters help direct clients only |
 | T5 vs targets | T5 ≥ 350/s within p99 ≤ 1 s | `csr_max_per_second` can be raised to the target |
 | Burst vs targets | 20,000 in 60 s and 100,000 in 10 min arrive, p99 ≤ 1 s, with the limit set | The recommended limit absorbs the sized bursts |
 | T13 signing CA rotation | No re-issue, no new-leaf failures | Signing CA rotation is safe for sidecars |
@@ -1353,7 +1353,7 @@ ALB's header aren't verified). Consul authenticates with AWS IAM here.
 | T12 promotion vs T11 failover | Promotion ≈ Autopilot's two 10 s timers | Zone spares restore failure tolerance in about 20 s; a longer or missing promotion points at the Autopilot configuration |
 | T11 7 vs 5 vs 3 voters | Commit time and KV ceiling flat | Voter count is free for Vault writes: choose it for failure tolerance |
 | T11 7 vs 5 vs 3 voters | Commit p99 rises with voters | Each voter pair costs that much on every write: weigh it against the extra failure tolerance |
-| T11 failover | Write gap differs by voter count | Election time depends on cluster size; otherwise it's the heartbeat/election timeout, whatever the size |
+| T11 failover | Write gap differs by voter count | Election time depends on cluster size; otherwise it's the heartbeat and election timeouts, whatever the size |
 | T16 distribution vs T6 | T16 mesh runs spread, T6's concentrated | The path spreads Consul's signing across Vault nodes |
 | T16 grid vs T5 (same plan) | Ceiling rises towards T3's, busiest Vault node below 90% | One connection was Consul's limit: the path lifts it |
 | T16 grid vs T5 | Spread, but the leader's or the proxy's CPU stops it | Consul's leader is the next limit; compare the proxy's cores with Consul's |
@@ -1370,7 +1370,7 @@ test with that limit set. The report should also state the headroom above
 
 | Test | RUN_ID | Result | p99 | Bottleneck / notes |
 |---|---|---|---|---|
-| T1 32 / 64 / 128 / 256 concurrency | t1 | | | |
+| T1 at concurrency 32, 64, 128, and 256 | t1 | | | |
 | T2 store | t2 | | | |
 | T3 Vault cluster | t3 | last pass: | | |
 | T3c single / multi | t3c | single: / multi: | | |
@@ -1386,7 +1386,7 @@ test with that limit set. The report should also state the headroom above
 | T15 Vault rolling restart | t15 | failed leafs: ; max gap: ; slowest healthy: | | NLB out/back: |
 | T13 signing CA rotation, 100,000 cached | t13 | switched: ; re-issued: | new-leaf p99: | agent: locked out? ; reconnected after server restart: |
 | T11 grow: non-voter → voter | t11grow | joined: / ; promoted: / | | |
-| T11 Vault Raft 7 / 5 / 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
+| T11 Vault Raft at 7, 5, and 3 voters | t11v7 / t11v5 / t11v3 | KV last pass: / / ; write gap: / / | commit p99: / / | |
 | T16 HAProxy | t16haproxy | distribution: ; last pass: (T5: ) | | Consul / proxy cores: ; CA unchanged: |
 | T16 Vault Proxy, keep-alives off | t16proxy | distribution: ; last pass: (T5: ) | | Consul / proxy cores: ; TIME_WAIT: ; CA unchanged: |
 | T16 ALB | t16alb | distribution: ; last pass: (T5: ) | | CA unchanged: |
@@ -1400,7 +1400,7 @@ test with that limit set. The report should also state the headroom above
 | Stage 2: T5 (adaptive, from 350/s), T5r, T6, soak, burst, T3f, T14, T2 | ~5.8–6.1 h |
 | Stage 3: T9-V, T12 (3 runs + active zone), T15, T13 | ~3.2 h |
 | **Main campaign** (`plan-1`) | **~13.5–14.5 h (~US$125–145 at ~US$9–10/h)** |
-| T11 as its own campaign (`raft-1 --t11`): Stage 0, smoke check, T11 at 7, 5, 3 voters | ~9–11 h (~US$85–105) |
+| T11 as its own campaign (`raft-1 --t11`): Stage 0, smoke check, T11 at 7, 5, and 3 voters | ~9–11 h (~US$85–105) |
 | *Or Stage 4 on the main build* (`--with-t11`): T11 grow, smoke check, T11 | *+7.7–10.7 h, ~21–25 h in one run* |
 | T16 as its own run (`plan-3 --with-t16`): Stage 0, settle, T5, T6, then T16 for 3 paths | ~6.2–7.5 h (T16 itself ~3.7–4.7 h); the ALB bills only while the environment is up |
 
@@ -1421,10 +1421,10 @@ own idle windows and export.
   cold-start/server-restart bursts, and Consul server memory with the leaf
   cache on the servers (100,000–200,000 leafs).
 - **Planned failover** (`vault operator step-down`): an unplanned hang is the
-  harder case and is covered by T3f, T11, T12 and T14; T15 covers planned
+  harder case and is covered by T3f, T11, T12, and T14; T15 covers planned
   restarts.
 - **Root CA rotation:** the root is the enterprise root CA's, and its lifecycle
-  sits with that CA. In this design Consul can't rotate an externally signed
+  sits with that CA. In this design, Consul can't rotate an externally signed
   root anyway (issue #12, closed).
 - **Full Vault outage and recovery backlog** (issue #2).
 - **Audit device cost, and audit metrics per step** (issue #3).

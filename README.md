@@ -39,8 +39,8 @@ through **HCP Terraform (TFC)**.
 | Access | SSM Session Manager | No SSH and no public IPs on the nodes. By default, no inbound traffic from outside the VPC; an optional public ALB for Grafana (and the Vault and Consul UIs) is off unless `grafana_public_zone` is set |
 | Base image | Ubuntu 24.04 | The latest Canonical image by default (`ami_owner`, `ami_name_pattern`; point them at your own hardened image), selected by `ami_arch` (`amd64` by default; instance types must match). Packages come from the HashiCorp APT repo, pinned and held |
 
-The voters are placed round-robin across the 3 AZs (2/2/1). Each node is its
-own `aws_instance`, not an ASG, so node IDs stay stable while you scale.
+The voters are placed round-robin across the 3 AZs (2/2/1). Each node is a
+separate `aws_instance` with no ASG, so node IDs stay stable while you scale.
 
 ## Consul version
 
@@ -56,7 +56,7 @@ results:
 
 To test 2.0.4 anyway, set `consul_version = "2.0.4+ent"` and
 `consul_rpc_handshake_timeout = "60s"`. That setting cut the idle-stream errors
-by about 93% here. Note that 2.0.1 lacks the security fixes in 2.0.2–2.0.4.
+by about 93% here. 2.0.1 lacks the security fixes in 2.0.2–2.0.4.
 
 ## Mesh PKI
 
@@ -72,24 +72,23 @@ Enterprise root CA (ECDSA P-384, 10 yr)       simulated by Terraform ("Offline M
             └─ leaf certificates (7 days)     role leaf-cert, no_store=true
 ```
 
-- **Replacing the root, or the Vault intermediate under it, belongs to the
-  enterprise root CA's lifecycle and is out of scope.** In this design, Consul
+- Replacing the root, or the Vault intermediate under it, belongs to the
+  enterprise root CA's lifecycle and is out of scope. In this design, Consul
   also can't take over a new externally signed intermediate by rotation: Vault
   refuses the cross-sign (issue #12). Only Consul's own signing CA rotation is
   tested (T13).
-
-- **`pki_mesh_int` is Consul's `root_pki_path` in Vault-managed mode.**
+- `pki_mesh_int` is Consul's `root_pki_path` in Vault-managed mode.
   Consul can only read it and call `root/sign-intermediate`. It cannot mount,
   change, or rotate it.
-- **`vault-0` creates both mounts at bootstrap.** It imports the intermediate
+- `vault-0` creates both mounts at bootstrap. It imports the intermediate
   bundle from the `<name>/vault/mesh-ca` secret, which holds the key,
   intermediate and root certificate but not the root key. It also sets the
   keyed issuer as the default and applies the Vault-managed policy from the
   Consul docs.
-- **Consul manages everything inside `connect_<dc>_inter`.** That includes its
+- Consul manages everything inside `connect_<dc>_inter`. That includes its
   signing CA, which it renews automatically, and the `leaf-cert` role.
-- **The trust anchor for verifying leaf chains** is `terraform output -raw mesh_root_ca_pem`.
-- **In production,** the Vault intermediate's key would be generated inside
+- The trust anchor for verifying leaf chains is `terraform output -raw mesh_root_ca_pem`.
+- In production, the Vault intermediate's key would be generated inside
   Vault and its CSR signed by the enterprise root CA. Terraform generating it
   here keeps the build single-pass, and doesn't change any signing path.
 
@@ -205,12 +204,12 @@ manages leafs and should be validated.
 | Guardrails at 350/s | 0 leader elections, Autopilot failure tolerance stays at 2, and Raft leader last contact p99 < 200 ms |
 | Stretch | The actual ceilings of the Vault path (T3) and the Consul path (T5) |
 
-- **The limits are configurable per run:** `P99_MS` and `MAX_ERROR_RATE`
+- The limits are configurable per run: `P99_MS` and `MAX_ERROR_RATE`
   (default `0.001`) override the k6 thresholds.
-- **Stress tests start at the target:** `stress-k6.sh` starts at 350/s for
+- Stress tests start at the target: `stress-k6.sh` starts at 350/s for
   `vault-sign-consul-mount.js` and `consul-leaf.js`, per load generator
   (`TARGET_RATE` in `run-plan.sh` moves every target-derived rate).
-- **The main decision these results feed** is Consul's `csr_max_per_second`.
+- The main decision these results feed is Consul's `csr_max_per_second`.
   The default of 50/s would take about 33 minutes for a 100,000-leaf cold
   start, and about 7 minutes per server restart. Set it to what both the
   Consul leader and Vault sustain within these targets.
@@ -285,7 +284,7 @@ uploaded to `s3://<perf_bucket>/results/`) contains:
 | File | Contents |
 |---|---|
 | `params.json`, `phases.json` | Test parameters, and phase start/end times (epoch ms) |
-| `summary.json` (k6) / `result.json` (vault-benchmark) | Client-side results. k6 now includes p99. vault-benchmark latencies are in ns. |
+| `summary.json` (k6) / `result.json` (vault-benchmark) | Client-side results, including k6's p99. vault-benchmark latencies are in ns. |
 | `k6.log` / `vault-benchmark.log`, `warmup.log` | Tool output |
 | `grafana/dashboard.png` | Full dashboard for the run window |
 | `grafana/panels/NN-<panel>.png` | Every panel, rendered for the run window |
@@ -311,9 +310,6 @@ public URL if enabled, and go to **Perf Testing → Consul + Vault Perf**.
 
 ### Consul leaf scenarios (no apps or Envoy needed)
 
-Root rotation isn't modelled. The root is the enterprise root CA and Vault
-holds an intermediate under it, so Consul never rotates the root itself.
-
 Consul signs a leaf through Vault whenever something in the mesh needs one. It
 does **not** sign one when you register a plain service. These scenarios generate
 that signing load without deploying any workload:
@@ -324,6 +320,7 @@ that signing load without deploying any workload:
 | **B. Sidecar registration burst** | `COUNT=5000 RATE=100 run-k6.sh /opt/perf/k6/consul-register-burst.js` | A rollout. Each registered sidecar definition makes the agent fetch a leaf at once; `leaf_ready_ms` = registration → cert available |
 | **B'. Renewal fleet** | `consul-ca-limits.sh --leaf-ttl 1h`, then B with `CLEANUP=false` | Steady renewals. The agent renews every leaf at ~60–90% of the TTL, so 5,000 sidecars at 1 h ≈ 5,000 signings/hour |
 
+- Root rotation isn't modelled (see [Mesh PKI](#mesh-pki)).
 - `perf-cleanup.sh [prefix]` deregisters perf services left on an agent.
 - Burst sidecars get explicit ports and one passing TTL check. Without that,
   the default auto-assigned port range (21000–21255) fits only 256 sidecars,
@@ -408,7 +405,9 @@ and may land elsewhere. Under heavy load, Go's HTTP/2 client opens a second
 connection once the first reaches the server's concurrent-stream limit, so a
 stress run may show signing spread at high rates. The leader's other Vault
 calls (token renewal at about two thirds of its TTL, the hourly CA fetch) are
-too sparse to keep the connection open. Then compare capacity with and without non-voters:
+too sparse to keep the connection open.
+
+To compare capacity with and without non-voters:
 
 1. With `vault_non_voter_count = 0`, run
    `START=50 stress-k6.sh /opt/perf/k6/consul-leaf.js`.
@@ -419,7 +418,7 @@ too sparse to keep the connection open. Then compare capacity with and without n
 Run the distribution test with the non-voters in place so there are more
 nodes for the traffic to spread across.
 
-**Spreading it (T16).** Consul's Vault provider has no pool or HTTP version
+**Spreading Consul's signing (T16).** Consul's Vault provider has no pool or HTTP version
 setting, and `vault/api` enables HTTP/2 itself, so `GODEBUG=http2client=0`
 doesn't help. T16 (TEST-PLAN *Stage 5*, issue #14) points the provider's
 `Address` at a path that balances per request instead, one test each:
@@ -483,7 +482,7 @@ Reading it, with T5 (Consul's own ceiling):
 - Idle, every server shows 0 (the connection closes). Under load, only the
   leader shows it.
 
-### Things that will shape your numbers
+### Settings and behaviour that affect the results
 
 - **Consul's CSR rate limit.** `csr_max_per_second` defaults to **50/s**, so
   test 3 plateaus there and returns rate-limit errors, counted in
@@ -496,8 +495,8 @@ Reading it, with T5 (Consul's own ceiling):
   You can also set `var.consul_connect_ca` before the first apply.
 - **Only the Consul leader signs.** `ConnectCA.Sign` is a write RPC, so
   followers and read replicas forward it to the leader. Read replicas scale
-  Consul reads, not leaf issuance. For the mesh path, the leader's CPU and its
-  Vault round-trip latency are the ceiling.
+  Consul reads. They don't add leaf signing capacity. For the mesh path, the
+  leader's CPU and its Vault round-trip latency are the ceiling.
 - **Vault horizontal scale with `no_store`.** Performance standbys, including
   non-voters, sign `no_store` requests locally. Direct clients (tests 1–2)
   therefore spread across every node behind the NLB. Consul's leader reuses a
@@ -532,10 +531,12 @@ Reading it, with T5 (Consul's own ceiling):
   - Leadership comes from `consul_server_isLeader`.
   - Signing latency comes from the Vault side.
 
-  `consul_rpc_server_call` is also absent, and that is not explained by this
-  build issue. Regenerate the dashboard with `python3 scripts/gen-dashboard.py`.
+  `consul_rpc_server_call` is also absent, and this build issue doesn't
+  explain it. `scripts/gen-dashboard.py` generates the dashboard, so rerun it
+  (`python3 scripts/gen-dashboard.py`) after changing the metrics it uses.
 - **Agent leaf cache.** Test 3 leaves every issued leaf in the client agent's
-  cache. For very large runs, restart the agent between runs
+  cache, at about 12 KB each. In plan-1, the agent stalled from about 600,000
+  cached leafs, so restart it between large runs
   (`sudo systemctl restart consul`).
 
 ## Security notes (test environment)
@@ -545,7 +546,7 @@ Reading it, with T5 (Consul's own ceiling):
   root token and the Consul management token (`operator_token`). Don't reuse
   this setup for production.
 - Secrets use `recovery_window_in_days = 0`, and the S3 bucket uses
-  `force_destroy`, so `terraform destroy` really cleans up.
+  `force_destroy`, so `terraform destroy` deletes them straight away.
 - With `vault_alb` (T16), the Vault TLS key is also imported into ACM for the
   ALB's listener.
 

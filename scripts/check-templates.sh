@@ -3,10 +3,12 @@
 #   * bash -n syntax
 #   * every function the script calls is defined (catches lost helpers)
 #   * size under the 16 KB user_data limit
-# Run before any apply that changes terraform/templates/.
+# Run before any apply that changes terraform/templates/, the module's
+# template (terraform/modules/vault-cluster/templates/), or terraform-repl/templates/.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T="$ROOT/terraform/templates"
+VT="$ROOT/terraform/modules/vault-cluster/templates"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 # Values have realistic lengths (ARNs, URLs, the Consul connect config): EC2
@@ -26,15 +28,17 @@ locals {
   pad3000 = join("", [for i in range(300) : "xxxxxxxxxx"])
   re   = "/(?m)^[ \\\\t]*#(?:[^!\\\\n][^\\\\n]*)?\\\\n/"
 }
-output "vault"   { value = replace(templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-0", voter = true, permanent_non_voter = false, redundancy_zone = "zone-0", start_vault = true, bootstrap = true, vault_version = "2.1.1+ent", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = true, alb_listener = true, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter" })), local.re, "") }
-output "vaultnv" { value = replace(templatefile("$T/vault.sh.tftpl", merge(local.b, { node_name = "vault-nv-0", voter = false, permanent_non_voter = true, redundancy_zone = "", start_vault = false, bootstrap = false, vault_version = "", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = false, alb_listener = false, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter" })), local.re, "") }
+output "vault"   { value = replace(templatefile("$VT/vault.sh.tftpl", merge(local.b, { node_name = "vault-0", voter = true, permanent_non_voter = false, redundancy_zone = "zone-0", start_vault = true, bootstrap = true, vault_version = "2.1.1+ent", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = true, alb_listener = true, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter", consul_setup = true, logshipper_buffer_length = 0, logshipper_buffer_size = "" })), local.re, "") }
+output "vaultnv" { value = replace(templatefile("$VT/vault.sh.tftpl", merge(local.b, { node_name = "vault-nv-0", voter = false, permanent_non_voter = true, redundancy_zone = "", start_vault = false, bootstrap = false, vault_version = "", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvperf/vault/bootstrap-status", audit_enabled = false, alb_listener = false, consul_role_arn = "arn:aws:iam::123456789012:role/cvperf-consul", mesh_pki_path = "pki_mesh_int", mesh_ca_secret_id = local.arn, inter_pki_path = "connect_dc1_inter", consul_setup = true, logshipper_buffer_length = 0, logshipper_buffer_size = "" })), local.re, "") }
 output "consul"  { value = replace(templatefile("$T/consul-server.sh.tftpl", merge(local.b, { node_name = "consul-0", voter = true, voter_count = 5, bootstrap = true, datacenter = "dc1", consul_version = "2.0.1+ent", join_tag = "cvperf-consul", server_secret_id = local.arn, bootstrap_param = "/cvperf/consul/bootstrap-status", connect_json = local.pad700, rpc_handshake_timeout = "" })), local.re, "") }
 output "loadgen" { value = replace(templatefile("$T/loadgen.sh.tftpl", merge(local.b, { node_name = "loadgen-0", datacenter = "dc1", consul_version = "2.0.1+ent", vault_version = "2.1.1+ent", vault_benchmark_version = "0.3.0", k6_version = "2.3.0", vault_fqdn = "vault.perf.internal", join_tag = "cvperf-consul", client_secret_id = local.arn, vault_init_secret_id = local.arn, bucket = "cvperf-perf-0123456789abcdef", login_user = "ubuntu" })), local.re, "") }
+output "vaultrepl" { value = replace(templatefile("$VT/vault.sh.tftpl", merge(local.b, { name = "cvrepl-pr-sec-dr", node_name = "pr-sec-dr-0", voter = true, permanent_non_voter = false, redundancy_zone = "zone-0", start_vault = true, bootstrap = true, vault_version = "2.1.1+ent", vault_fqdn = "pr-sec-dr.vault.repl.internal", join_tag = "cvrepl-pr-sec-dr-vault", kms_key_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789", config_secret_id = local.arn, init_secret_id = local.arn, bootstrap_param = "/cvrepl-pr-sec-dr/vault/bootstrap-status", audit_enabled = true, alb_listener = false, consul_setup = false, consul_role_arn = "", mesh_pki_path = "", mesh_ca_secret_id = "", inter_pki_path = "", logshipper_buffer_length = 65536, logshipper_buffer_size = "2gb" })), local.re, "") }
+output "loadgenrepl" { value = replace(templatefile("$ROOT/terraform-repl/templates/loadgen.sh.tftpl", merge(local.b, { name = "cvrepl", node_name = "loadgen-1", local_cluster = "pr-sec", vault_addr = "https://pr-sec.vault.repl.internal:8200", vault_version = "2.1.1+ent", k6_version = "2.3.0", ca_cert_pem = local.pad700, clusters_json = local.pad3000, bucket = "cvrepl-perf-123456789012-ap-southeast-2", bucket_region = "ap-southeast-2", monitoring_secret_id = local.arn, login_user = "ubuntu" })), local.re, "") }
 output "monitoring" { value = replace(templatefile("$T/monitoring.sh.tftpl", merge(local.b, { monitoring_secret_id = local.arn, bucket = "cvperf-perf-0123456789abcdef", prometheus_yml = local.pad3000, prometheus_image = "p", grafana_image = "g", renderer_image = "r" })), local.re, "") }
 TF
 (cd "$W" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false >/dev/null)
 rc=0
-for o in vault vaultnv consul loadgen monitoring; do
+for o in vault vaultnv vaultrepl consul loadgen loadgenrepl monitoring; do
   (cd "$W" && terraform output -raw "$o") > "$W/$o.sh"
   defined=$(grep -oE '^[a-z_]+\(\) \{' "$W/$o.sh" | sed 's/() {//' | sort -u)
   # top-level calls: lines that start with a known-helper-shaped word and aren't definitions/keywords

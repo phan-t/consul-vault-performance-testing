@@ -113,6 +113,11 @@ working directory `terraform/`). It also sets `aws_region` and, if you give
 licence files, the sensitive `vault_license` and `consul_license` variables.
 Otherwise, set those two variables in the TFC UI.
 
+It also creates `consul-vault-perf-repl` (working directory `terraform-repl/`)
+for the replication build in TEST-PLAN's Stage 6, with only `vault_license`.
+Give it the same AWS credential variables as the main workspace. Set
+`repl_workspace_name = ""` to leave it out.
+
 > Consul 2.x needs an **IBM Consul Enterprise licence**.
 
 ### 2. Push AWS credentials
@@ -171,7 +176,7 @@ To check membership:
 
 `user_data` and the AMI are in `ignore_changes`, so edits never recycle a
 running cluster by accident. To rebuild a node on purpose, use
-`terraform apply -replace='aws_instance.vault["vault-3"]'`.
+`terraform apply -replace='module.vault.aws_instance.this["vault-3"]'`.
 
 ## Targets
 
@@ -555,14 +560,18 @@ Reading it, with T5 (Consul's own ceiling):
 ```
 tfc-bootstrap/          TFC project/workspace + licence variables (local state)
 terraform/              Environment (TFC workspace, working dir)
-  templates/            user_data for vault, consul-server, loadgen, monitoring (+ common.sh)
+  templates/            user_data for consul-server, loadgen, monitoring (+ common.sh)
+  modules/vault-cluster/ One Vault cluster (nodes, NLB, KMS, secrets, TLS, DNS, IAM) and its user_data
+  modules/network/      One region's VPC, for terraform-repl
   files/                Grafana dashboard
+terraform-repl/         Stage 6 (T17): four Vault clusters at two sites (two VPCs in Sydney), its own workspace
 perf/
   k6/                   consul-leaf.js, vault-sign-consul-mount.js, lib/common.js
   vault-benchmark/      pki_sign profiles (no_store vs store)
   scripts/              run-k6.sh, run-vault-benchmark.sh, stress-k6.sh, signing-distribution.sh,
                         connection-test.sh, consul-ca-limits.sh, run-everywhere.sh, summarise.sh,
                         signing-path.sh + signing-path-node.sh (T16 signing paths)
+  scripts/repl/         T17: setup, link cuts, probes, DR promotion, checks, run.sh
   tools/vault-sign-load Go load tool using Consul's Vault client (single vs multi connection)
 ```
 

@@ -67,3 +67,26 @@ resource "tfe_variable" "consul_license" {
   sensitive    = true
   description  = "Consul Enterprise license"
 }
+
+# Replication build (../terraform-repl, issue #23): its own workspace and
+# state, so it never touches the main build. Only the Vault licence: no Consul.
+resource "tfe_workspace" "repl" {
+  count             = var.repl_workspace_name == "" ? 0 : 1
+  name              = var.repl_workspace_name
+  project_id        = tfe_project.this.id
+  description       = "Vault Enterprise PR and DR replication tests (T17), two sites in Sydney"
+  terraform_version = var.terraform_version
+  working_directory = "terraform-repl"
+  auto_apply        = false
+  tag_names         = ["vault", "perf", "replication"]
+}
+
+resource "tfe_variable" "repl_vault_license" {
+  count        = var.repl_workspace_name != "" && var.vault_license_file != "" ? 1 : 0
+  workspace_id = tfe_workspace.repl[0].id
+  category     = "terraform"
+  key          = "vault_license"
+  value        = trimspace(file(var.vault_license_file))
+  sensitive    = true
+  description  = "Vault Enterprise license (must include PR and DR replication)"
+}

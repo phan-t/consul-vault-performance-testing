@@ -1,17 +1,6 @@
 # Instance bootstrap material lives in Secrets Manager / SSM, never in user_data.
 # Everything here is also in TFC state (encrypted at rest by HCP Terraform).
 
-resource "aws_kms_key" "vault_unseal" {
-  description             = "${var.name} Vault auto-unseal"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-}
-
-resource "aws_kms_alias" "vault_unseal" {
-  name          = "alias/${var.name}-vault-unseal"
-  target_key_id = aws_kms_key.vault_unseal.key_id
-}
-
 resource "random_id" "consul_gossip" {
   byte_length = 32
 }
@@ -42,23 +31,7 @@ locals {
   consul_tokens = { for k, v in random_uuid.consul_token : k => v.result }
 }
 
-# --- Vault -----------------------------------------------------------------
-
-resource "aws_secretsmanager_secret" "vault_config" {
-  name                    = "${var.name}/vault/config"
-  description             = "Vault license and TLS material"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "vault_config" {
-  secret_id = aws_secretsmanager_secret.vault_config.id
-  secret_string = jsonencode({
-    license = var.vault_license
-    ca      = tls_self_signed_cert.ca.cert_pem
-    cert    = tls_locally_signed_cert.vault.cert_pem
-    key     = tls_private_key.vault.private_key_pem
-  })
-}
+# --- Vault (the cluster's own secrets are in modules/vault-cluster) ---------
 
 # Mesh intermediate CA bundle for Vault to import (key + intermediate + root
 # cert). The offline root's key is deliberately NOT included.
@@ -77,26 +50,6 @@ resource "aws_secretsmanager_secret_version" "mesh_ca" {
       tls_self_signed_cert.mesh_root.cert_pem,
     ])
   })
-}
-
-# Written by vault-0 after `vault operator init` (root token + recovery key).
-# Test environment only: operators and load generators read the root token.
-resource "aws_secretsmanager_secret" "vault_init" {
-  name                    = "${var.name}/vault/init"
-  description             = "Vault init output (root token, recovery keys). Written by vault-0."
-  recovery_window_in_days = 0
-}
-
-# vault-0 flips this to "complete" once Vault is initialised and configured
-# for Consul. Consul servers wait for it before starting.
-resource "aws_ssm_parameter" "vault_bootstrap" {
-  name  = "/${var.name}/vault/bootstrap-status"
-  type  = "String"
-  value = "pending"
-
-  lifecycle {
-    ignore_changes = [value]
-  }
 }
 
 # --- Consul ----------------------------------------------------------------

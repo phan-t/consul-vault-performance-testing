@@ -21,35 +21,6 @@ resource "tls_self_signed_cert" "ca" {
   allowed_uses = ["cert_signing", "crl_signing", "digital_signature"]
 }
 
-# --- Vault ---------------------------------------------------------------
-
-resource "tls_private_key" "vault" {
-  algorithm   = "ECDSA"
-  ecdsa_curve = "P256"
-}
-
-resource "tls_cert_request" "vault" {
-  private_key_pem = tls_private_key.vault.private_key_pem
-
-  subject {
-    common_name  = local.vault_fqdn
-    organization = var.name
-  }
-
-  dns_names    = [local.vault_fqdn, "*.${local.vault_fqdn}", "localhost"]
-  ip_addresses = ["127.0.0.1"]
-}
-
-resource "tls_locally_signed_cert" "vault" {
-  cert_request_pem      = tls_cert_request.vault.cert_request_pem
-  ca_private_key_pem    = tls_private_key.ca.private_key_pem
-  ca_cert_pem           = tls_self_signed_cert.ca.cert_pem
-  validity_period_hours = 24 * 180
-  early_renewal_hours   = 24 * 14
-
-  allowed_uses = ["digital_signature", "key_encipherment", "server_auth", "client_auth"]
-}
-
 # --- Consul servers ------------------------------------------------------
 
 resource "tls_private_key" "consul_server" {

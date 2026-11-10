@@ -5,6 +5,11 @@
 // at the same offered rate the latency difference between 3, 5 and 7 voters is
 // the cost of reaching quorum. Keys cycle over KEYS so the data set stays the
 // same size (overwrites, one version kept) whatever the rate or duration.
+//
+// T17 (repl-1) also sets KEY_PREFIX, and LOG_WRITES=1: every successful write
+// is logged as "W <unix ms> <key> <version>" (run k6 with --log-output=file=...
+// --log-format=raw), so a promoted DR replica's missing writes can be counted
+// and the PR secondary's data checked key by key after catch-up.
 import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
@@ -16,7 +21,8 @@ const MOUNT = env('KV_MOUNT', 'kv_perf');
 const KEYS = Number(env('KEYS', 10000));
 // Payload size in bytes (a typical small secret).
 const VALUE = 'x'.repeat(Number(env('VALUE_BYTES', 1024)));
-const PREFIX = `${env('PERF_NODE', 'lg')}`;
+const PREFIX = env('KEY_PREFIX', `${env('PERF_NODE', 'lg')}`);
+const LOG_WRITES = env('LOG_WRITES', '0') === '1';
 // Log the first few failures (status and body) from a handful of VUs, so a
 // failing run says why. raft-1's 64 KiB runs failed 84% of writes, fast
 // (p50 56 ms), and left no trace of the cause.
@@ -40,6 +46,9 @@ export default function () {
     },
   );
   const ok = check(res, { 'status 200': (r) => r.status === 200 });
+  if (ok && LOG_WRITES) {
+    console.log(`W ${Date.now()} ${key} ${res.json('data.version')}`);
+  }
   if (!ok && exec.vu.idInTest <= 5 && logged < 3) {
     logged += 1;
     console.warn(`kv_write failed: status ${res.status} ${res.error || ''} ${String(res.body || '').slice(0, 300)}`);

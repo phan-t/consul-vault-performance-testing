@@ -173,7 +173,7 @@ resource "aws_lb_target_group" "vault_public" {
 }
 
 resource "aws_lb_target_group_attachment" "vault_public" {
-  for_each         = local.vault_public ? aws_instance.vault : {}
+  for_each         = local.vault_public ? module.vault.instances : {}
   target_group_arn = aws_lb_target_group.vault_public[0].arn
   target_id        = each.value.id
   port             = 8200

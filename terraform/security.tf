@@ -1,31 +1,6 @@
 # No inbound access from outside the VPC. Operators use SSM Session Manager
 # (shell and port forwarding), so no SSH keys or bastion are needed.
 
-resource "aws_security_group" "vault" {
-  name        = "${var.name}-vault"
-  description = "Vault servers"
-  vpc_id      = aws_vpc.this.id
-  tags        = { Name = "${var.name}-vault" }
-}
-
-resource "aws_vpc_security_group_ingress_rule" "vault_api" {
-  security_group_id = aws_security_group.vault.id
-  description       = "Vault API (clients, NLB health checks, Consul CA provider)"
-  cidr_ipv4         = var.vpc_cidr
-  ip_protocol       = "tcp"
-  from_port         = 8200
-  to_port           = 8200
-}
-
-resource "aws_vpc_security_group_ingress_rule" "vault_cluster" {
-  security_group_id            = aws_security_group.vault.id
-  description                  = "Vault cluster (Raft, request forwarding)"
-  referenced_security_group_id = aws_security_group.vault.id
-  ip_protocol                  = "tcp"
-  from_port                    = 8201
-  to_port                      = 8201
-}
-
 resource "aws_security_group" "consul" {
   name        = "${var.name}-consul"
   description = "Consul servers and client agents"
@@ -128,7 +103,7 @@ resource "aws_vpc_security_group_egress_rule" "vault_alb_targets" {
   count                        = var.vault_alb ? 1 : 0
   security_group_id            = aws_security_group.vault_alb[0].id
   description                  = "Vault ALB listener and health checks"
-  referenced_security_group_id = aws_security_group.vault.id
+  referenced_security_group_id = module.vault.security_group_id
   ip_protocol                  = "tcp"
   from_port                    = 8202
   to_port                      = 8202
@@ -136,7 +111,7 @@ resource "aws_vpc_security_group_egress_rule" "vault_alb_targets" {
 
 resource "aws_vpc_security_group_ingress_rule" "vault_alb_listener" {
   count                        = var.vault_alb ? 1 : 0
-  security_group_id            = aws_security_group.vault.id
+  security_group_id            = module.vault.security_group_id
   description                  = "Vault ALB listener (T16 path C)"
   referenced_security_group_id = aws_security_group.vault_alb[0].id
   ip_protocol                  = "tcp"

@@ -22,6 +22,7 @@
 | | T15 | What does a rolling restart of every Vault node (the routine operation) cost sidecars? | ~0.4 h |
 | | T13 | What does rotating Consul's signing CA under load do to sidecars and to client agents that restart? Runs last, because it leaves the signing CA rotated | ~0.5 h |
 | *Own campaign* | T11 | What do Vault Raft commit time, leader cost, and failover look like at 7, 5, and 3 voters? | ~9–11 h |
+| *Own build* (Stage 6) | T17 | What do clients at each site see, and what protection is lost, when a PR or DR replication link fails, and does the PR secondary resync after a 4-hour cut? (Issue #23, Table 6 of the HLD) | ~9–11 h, plus a ~2.5 h dry run |
 | *Own run* (Stage 5) | T16 | Does sending Consul's signing through HAProxy, Vault Proxy (keep-alives off), or an ALB spread it across Vault nodes and raise T5's ceiling? With T5 and T6 rerun as the reference | ~3.7–4.7 h, plus Stage 0, T5, and T6 |
 
 The tests run in the order of this table, as one unattended campaign
@@ -30,7 +31,9 @@ unattended campaign on a fresh 7-voter build (`raft-1`, `--t11`). Moving
 between the two campaigns needs a `terraform apply`, so fresh AWS credentials.
 `--with-t11` instead appends T11 to `plan-1` as Stage 4 (~21–25 h in one
 run; see *Stage 4*). T16 (Stage 5) runs on its own build, with T5 and T6
-rerun beside it (`plan-3`, `--with-t16`; see *Stage 5*).
+rerun beside it (`plan-3`, `--with-t16`; see *Stage 5*). T17 (Stage 6) runs on
+a separate build of four Vault clusters at two sites, from `terraform-repl/`
+and its own workspace (`repl-1`, `scripts/run-repl.sh`; see *Stage 6*).
 
 ## Quick start
 
@@ -316,8 +319,8 @@ node or the Consul leader during a steady state skews the results.
    printf 'vault_non_voter_count  = 2\nvault_non_voters_start = false\n' > terraform/campaign.auto.tfvars
    export TF_CLOUD_ORGANIZATION=<your-org>
    cd terraform
-   bash -c 'args=(); for n in 0 1 2 3 4; do args+=("-replace=aws_instance.vault[\"vault-$n\"]" "-replace=aws_instance.consul[\"consul-$n\"]"); done
-            args+=("-replace=aws_instance.loadgen[0]" "-replace=aws_instance.monitoring[0]" "-replace=aws_ssm_parameter.vault_bootstrap")
+   bash -c 'args=(); for n in 0 1 2 3 4; do args+=("-replace=module.vault.aws_instance.this[\"vault-$n\"]" "-replace=aws_instance.consul[\"consul-$n\"]"); done
+            args+=("-replace=aws_instance.loadgen[0]" "-replace=aws_instance.monitoring[0]" "-replace=module.vault.aws_ssm_parameter.bootstrap")
             terraform plan "${args[@]}" && terraform apply "${args[@]}"'
    ```
    This also creates `loadgen-1` and the held non-voters `vault-nv-0` and
@@ -1328,6 +1331,192 @@ start their own TLS to Vault, so a client certificate would need HAProxy's
 `x_forwarded_for_client_cert_header` options (the right decoders for the
 ALB's header aren't verified). Consul authenticates with AWS IAM here.
 
+## Stage 6: Replication link failure (T17)
+
+T17 tests Table 6 of the HLD ("Effect of a replication failure"): for each
+replication link that fails while every cluster stays up, what clients on each
+side see and what protection is lost. Issue #23 has the agreed design and
+the tests deferred after it (an expired DR operation token, the Merkle check
+and reindex, and recovery from wrong data that has replicated).
+
+It runs on its own build, from `terraform-repl/` and the
+`consul-vault-perf-repl` workspace. The main build's state is never touched.
+
+| Site | Clusters |
+|---|---|
+| DC East: a VPC in Sydney (`10.60.0.0/16`) | `primary` (PR primary), `pr-sec-dr` (DR replica of the PR secondary) |
+| DC West: a second VPC in Sydney (`10.61.0.0/16`) | `pr-sec` (PR secondary), `primary-dr` (DR replica of the primary) |
+
+- **Clusters:** each has 5 voters and no non-voters on `m7i.2xlarge`, from
+  `terraform/modules/vault-cluster`, the same module as the main build. Every
+  replication link crosses between the sites, over VPC peering.
+- **No Consul.** The load generators make Consul's calls to Vault directly.
+- **Both sites are in Sydney.** Melbourne (`ap-southeast-4`) isn't allowed on
+  the account, and Sydney's three AZs can't be split between two sites when
+  each cluster needs all three. So each site is its own VPC, and the delay
+  between them is added (below). `terraform-repl`'s `regions` variable can
+  still put the West site in another region.
+
+### Latency between the sites
+
+Without help, the link between the two VPCs is about 1 ms, and catch-up would
+look faster than across any real link between two data centres. Setup runs
+`perf/scripts/repl/latency.sh` on every Vault node before replication starts:
+`tc netem` delays traffic to the other site's VPC by half of `SITE_RTT_MS`
+(default 12 ms, about the round trip between Sydney and Melbourne), so a round
+trip between the sites is about 12 ms. Traffic inside a site isn't delayed.
+Setup measures the result (TCP connect time from `primary` to `pr-sec` on
+8201) and records it.
+
+It's a fixed delay, with no jitter, packet loss, or bandwidth limit, so the
+results describe a clean link. Set `SITE_RTT_MS` higher to see how catch-up
+changes on a slower link, or `0` for none.
+
+### How a link is cut
+
+`perf/scripts/repl/cut.sh` blocks port 8201 between the two clusters on a link
+and nowhere else. On every node of each cluster, an `iptables` chain drops
+8201 to and from the other cluster's node IPs. Port 8201 also carries Raft and
+request forwarding inside each cluster. So a rule that blocks the port by
+itself would break the clusters under test, and so would a rule on a whole
+VPC's range, because `pr-sec` and `primary-dr` are both in the West site's
+VPC. The NLB keeps the client's IP, so connections through
+`<cluster>.vault.repl.internal:8201` are caught at the far end. The API, monitoring, and the load are untouched.
+Each cut is checked by connecting to 8201 from one end.
+
+### Load
+
+From one load generator at each site, against its local cluster, for the
+whole run (`perf/scripts/repl/load.sh`):
+
+| Load | Rate | Against |
+|---|---|---|
+| Leaf signing with `no_store` (`pki_perf/sign/leaf-nostore`) | 350/s on each cluster (`SIGN_RATE`) | primary, pr-sec |
+| KV writes, 1 KiB, over `DAY_KEYS` keys, every write logged | `KV_RATE` | primary |
+| KV writes, forwarded to the primary | `SEC_KV_RATE` (2/s) | pr-sec |
+| AppRole login, then revoke (`vault-approle-login.js`) | `LOGIN_RATE` (2/s) | primary, pr-sec |
+| Token renewal (`vault-token-renew.js`) | `RENEW_RATE` (5/s) | primary, pr-sec |
+
+k6's pass/fail thresholds are off: during the cuts, some operations are
+expected to fail, and that's the result being recorded.
+
+**Size the KV load from DBS's figures.** How long the Merkle sync takes depends
+on how many keys differ when the link returns, not on how long the cut lasted.
+Set `DAY_KEYS` to the number of distinct keys DBS changes in a day, and
+`KV_RATE` high enough to write all of them during the PR cut. The defaults
+(50,000 keys at 20/s) are placeholders until DBS gives its figures.
+
+### Order
+
+`perf/scripts/repl/run.sh` runs unattended on loadgen-0. Each step is recorded,
+and a rerun skips the steps already done.
+
+1. **Setup** (`setup.sh`): enable PR and DR on the primary, then activate
+   `pr-sec`, `primary-dr`, DR on `pr-sec`, and `pr-sec-dr`, in that order. The
+   PR secondary gets a new root token from the primary's recovery key, because
+   activation replaces its tokens. Then the mounts, AppRole roles, the
+   `dr-ops` batch token role, and a periodic token for each cluster's load.
+2. **Prepare:** the DR operation token, two stored leafs for the revocation
+   test, OPS-B's first logins, and the objects the PR cut will change. Then a
+   **control run** with every link up: every probe, and a cross-cluster
+   revocation, should succeed.
+3. **Load and baseline** (`BASELINE`, 10 minutes).
+4. **DR cut** (`primary` to `primary-dr`, `DR_HOLD` 10 minutes): Table 6's
+   operations on both PR clusters, which should see no effect. Then promote
+   `primary-dr` with the batch DR operation token, and count its missing
+   writes against loadgen-0's write log. The expected result is that every
+   write before the cut is there and the writes after it are missing. Then
+   restore the link, demote, revoke the old secondary ID, and `update-primary`
+   with a new token. A demoted cluster keeps its data, so this should be a
+   Merkle diff and sync, not a full copy. The runner records which.
+5. **Both** (every link between the sites, `BOTH_HOLD` 15 minutes): the
+   primary should see no effect, and the PR secondary should act as in the PR
+   cut. Then all three secondaries catch up.
+6. **PR cut** (`primary` to `pr-sec`, `PR_HOLD` 4 hours): at the start, then every
+   `PROBE_EVERY` (1 hour):
+   - Table 6's PR row on `pr-sec`. Reads, signing, AppRole login, and
+     token renewal should succeed. KV writes, a PKI role change, and a CA
+     configuration change should fail.
+   - **Cross-cluster revocation:** revoke, on `pr-sec`, a stored leaf issued on
+     the primary. It should fail during the cut, and succeed and reach the
+     primary after it.
+   - **OPS-B:** a login with an existing entity and an unlimited-use secret ID
+     should succeed. A first login, which needs a new entity, should fail. A
+     login with a limited-use secret ID should fail too, because using it is
+     a write on the primary.
+   - **Stale data:** a marker key written on the primary, read on `pr-sec`.
+
+   At the start of the cut, the planned changes (`verify.py manifest-apply`):
+   new, changed, and deleted KV keys with a hash of each value, policies, PKI
+   roles, AppRole roles and secret IDs, a new mount and a removed one, and
+   identity entities and a group. The buffer overflows within minutes at any
+   realistic rate, so the PR secondary has to catch up by Merkle diff and
+   sync when the link returns.
+7. **Verify,** once `pr-sec` is streaming again, with the KV writers paused for 15
+   seconds:
+   - The PR secondary's `last_remote_wal` matches the primary's
+     `last_performance_wal`. For DR it's compared with `last_dr_wal`.
+     `last_wal` isn't used, because a PR secondary doesn't receive local WALs.
+   - The `merkle_root` matches on both clusters.
+   - Every entry in the manifest reads back on `pr-sec` as recorded.
+   - Every key the KV load wrote has its last logged version on `pr-sec`.
+8. **Finish:** stop the load, write `RESULTS.md`, and upload the results.
+
+### What's recorded
+
+All in `results/<plan>-repl/`:
+
+- `events.jsonl`: the timeline, including every cut, promotion, and catch-up.
+- `status.jsonl`: every cluster's replication status, every second. It's
+  where the time in `merkle-diff`, `merkle-sync`, and back to `stream-wals`
+  comes from.
+- `probes.jsonl`: every probe, with its code and whether it was as expected.
+- The log shipper's `missing_guard` and `guard_found` counters before and after
+  each cut, summed over the primary's nodes. A rise in `missing_guard` shows
+  the buffer no longer held what the secondary asked for.
+- The `verify.py` outputs, the k6 summaries, and the server-side metrics in
+  Prometheus. Each cluster is its own scrape job (`vault-<cluster>`).
+- `RESULTS.md`: Table 6 with the observed results next to the expected ones,
+  then the evidence for each row.
+
+### Running it
+
+```bash
+# once: tfc-bootstrap creates the consul-vault-perf-repl workspace; give it AWS credentials
+export TF_CLOUD_ORGANIZATION=<your-org>
+scripts/run-repl.sh start --dry-run        # 3 voters per cluster, 1-hour PR cut (repl-dry)
+scripts/run-repl.sh follow repl-dry
+scripts/run-repl.sh finish repl-dry        # download, then destroy
+
+KV_RATE=<rate> DAY_KEYS=<keys> scripts/run-repl.sh start repl-1
+scripts/run-repl.sh follow repl-1
+scripts/run-repl.sh finish repl-1          # as soon as it's done: each idle hour costs ~US$14
+```
+
+**Run the dry run first.** It tests the scripts, the `iptables` rules on
+clusters that forward and replicate inside themselves, the catch-up through
+Merkle diff and sync (its KV rate overflows the buffer in the hour), and every
+check after it, before paying for the full run.
+
+**To check on the version under test.** These details come from HashiCorp's
+documentation or are inferred, and the dry run is the first chance to confirm
+them on 2.1.1+ent:
+
+- that `sch_netem` loads on the Ubuntu AWS kernel (`latency.sh` installs
+  `linux-modules-extra` if it doesn't), and the measured round trip;
+- whether the log shipper buffer is split between the DR and PR shippers;
+- the metric names `vault.logshipper.streamWALs.missing_guard` and
+  `guard_found`;
+- that a batch DR operation token made before the cut works on the
+  demoted DR replica for `update-primary`;
+- that a write to `auth/token/roles` on the PR secondary isn't needed, because
+  the role is replicated (setup tries it and logs the result).
+- what `pki_perf/revoke` returns on the PR secondary during the cut. If Vault
+  queues a cross-cluster revocation locally and answers 200, the probe's
+  expected failure is wrong, and the check that counts is whether the primary
+  revokes the leaf after the link returns;
+- that k6 2.3.0 still has `k6 pause` and `k6 resume`, and `run --address`.
+
 ---
 
 ## Read-out
@@ -1397,6 +1586,8 @@ test with that limit set. The report should also state the headroom above
 | T11 as its own campaign (`raft-1 --t11`): Stage 0, smoke check, T11 at 7, 5, and 3 voters | ~9–11 h (~US$85–105) |
 | *Or Stage 4 on the main build* (`--with-t11`): T11 grow, smoke check, T11 | *+7.7–10.7 h, ~21–25 h in one run* |
 | T16 as its own run (`plan-3 --with-t16`): Stage 0, settle, T5, T6, then T16 for 3 paths | ~6.2–7.5 h (T16 itself ~3.7–4.7 h); the ALB bills only while the environment is up |
+| T17 dry run (`repl-dry`, `run-repl.sh --dry-run`): 3 voters per cluster, 1-hour PR cut | ~2.5–3.5 h (~US$30–40) |
+| T17 (`repl-1`): four clusters, 20 Vault nodes, 4-hour PR cut | ~9–11 h (~US$130–160 at ~US$14.20/h, plus a few dollars for data transfer between the sites' AZs) |
 
 Every number the `csr_max_per_second` recommendation uses has at least two
 samples.
@@ -1424,7 +1615,8 @@ own idle windows and export.
 - **Network degradation between the Consul leader and Vault** (issue #5).
 - **Go runtime metrics and Consul CA expiry gauges** (issue #6).
 - **Leaf correctness under load:** SPIFFE SAN, TTL, chain (issue #7).
-- **Performance Replication lag** to a secondary cluster (in the agreed plan): this
+- **Performance Replication lag** under steady load, as a measurement: T17 (Stage 6)
+  covers replication link failures and catch-up, on its own build. This
   build is one cluster in one region.
 - **T5 with non-voters:** would measure, not infer, that non-voters don't raise
   Consul's ceiling.

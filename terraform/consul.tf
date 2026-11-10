@@ -74,7 +74,7 @@ resource "aws_instance" "consul" {
     consul_version        = var.consul_version
     join_tag              = local.consul_join_tag
     server_secret_id      = aws_secretsmanager_secret.consul_server.arn
-    bootstrap_param       = aws_ssm_parameter.vault_bootstrap.name
+    bootstrap_param       = module.vault.bootstrap_param_name
     connect_json          = jsonencode(local.consul_connect_config)
     rpc_handshake_timeout = var.consul_rpc_handshake_timeout
     node_exporter_url     = local.node_exporter_url

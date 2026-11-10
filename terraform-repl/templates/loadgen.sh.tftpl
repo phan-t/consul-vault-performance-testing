@@ -1,0 +1,54 @@
+#!/bin/bash
+# Replication build load generator: ${node_name} in ${region} (k6, Vault CLI; no Consul)
+export AWS_DEFAULT_REGION="${region}"
+ARCH="${arch}"
+NODE_EXPORTER_URL="${node_exporter_url}"
+SCANNER_PATTERN="${scanner_pattern}"
+SCANNER_ACTIVE_CPU="${scanner_active_cpu}"
+
+${common}
+
+tune_os
+install_hashicorp_repo
+install_node_exporter
+apt_install openssl git tmux htop sysstat python3
+# Vault CLI only; the server is never started here.
+install_pkg vault-enterprise "${vault_version}"
+systemctl disable --now vault 2>/dev/null || true
+
+retry curl -sSL -o "$WORKDIR/k6.tgz" \
+  "https://github.com/grafana/k6/releases/download/v${k6_version}/k6-v${k6_version}-linux-${arch}.tar.gz"
+tar -xzf "$WORKDIR/k6.tgz" -C "$WORKDIR"
+install -m 0755 "$WORKDIR/k6-v${k6_version}-linux-${arch}/k6" /usr/local/bin/k6
+
+# Outside /opt/perf: sync-assets.sh mirrors the bucket into it with --delete.
+mkdir -p /opt/perf/results /etc/perf
+cat > /etc/perf/ca.crt <<'EOF'
+${ca_cert_pem}
+EOF
+trust_ca /etc/perf/ca.crt ${name}-ca
+
+# The perf assets are in the East site's bucket (the same region by default).
+retry aws s3 sync --region "${bucket_region}" "s3://${bucket}/assets/perf/" /opt/perf/
+find /opt/perf -name '*.sh' -exec chmod 0755 {} +
+
+cat > /etc/perf/clusters.json <<'EOF'
+${clusters_json}
+EOF
+chown -R ${login_user}:${login_user} /opt/perf
+
+cat > /etc/profile.d/perf.sh <<'EOF'
+export AWS_DEFAULT_REGION="${region}"
+export PERF_NAME="${name}"
+export PERF_BUCKET="${bucket}"
+export PERF_BUCKET_REGION="${bucket_region}"
+export PERF_NODE="${node_name}"
+export PERF_LOCAL_CLUSTER="${local_cluster}"
+export PERF_CLUSTERS=/etc/perf/clusters.json
+export PERF_MONITORING_SECRET="${monitoring_secret_id}"
+export VAULT_ADDR="${vault_addr}"
+export VAULT_CACERT=/etc/perf/ca.crt
+export PATH="$PATH:/opt/perf/scripts/repl:/opt/perf/scripts"
+EOF
+
+echo "=== bootstrap done $(date -Is) ==="

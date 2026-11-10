@@ -32,7 +32,7 @@ resource "aws_instance" "loadgen" {
     vault_fqdn              = local.vault_fqdn
     join_tag                = local.consul_join_tag
     client_secret_id        = aws_secretsmanager_secret.consul_client.arn
-    vault_init_secret_id    = aws_secretsmanager_secret.vault_init.arn
+    vault_init_secret_id    = module.vault.init_secret_arn
     bucket                  = aws_s3_bucket.perf.id
     node_exporter_url       = local.node_exporter_url
     scanner_pattern         = var.scanner_pattern

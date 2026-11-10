@@ -18,7 +18,7 @@ output "consul_https_addr" {
 }
 
 output "vault_nodes" {
-  value = { for k, v in aws_instance.vault : k => { id = v.id, ip = v.private_ip, az = v.availability_zone, voter = v.tags["Voter"] } }
+  value = { for k, v in module.vault.instances : k => { id = v.id, ip = v.private_ip, az = v.availability_zone, voter = v.voter } }
 }
 
 output "consul_nodes" {
@@ -40,7 +40,7 @@ output "perf_bucket" {
 output "secrets" {
   description = "Secrets Manager IDs (read with `aws secretsmanager get-secret-value`)."
   value = {
-    vault_init    = aws_secretsmanager_secret.vault_init.name
+    vault_init    = module.vault.init_secret_name
     consul_server = aws_secretsmanager_secret.consul_server.name
     consul_client = aws_secretsmanager_secret.consul_client.name
     monitoring    = aws_secretsmanager_secret.monitoring.name
@@ -68,7 +68,7 @@ output "access" {
       --parameters host=${local.vault_fqdn},portNumber=8200,localPortNumber=8200
 
     # Vault root token (test environment only)
-    aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.vault_init.name} \
+    aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${module.vault.init_secret_name} \
       --query SecretString --output text | jq -r .root_token
   EOT
 }

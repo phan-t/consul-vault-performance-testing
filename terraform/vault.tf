@@ -1,141 +1,159 @@
 # Vault Enterprise: var.vault_voter_count voters + var.vault_non_voter_count
 # extra nodes (performance standbys): redundancy zone spares, or permanent
-# non-voters without var.vault_redundancy_zones. Individual instances (not an
-# ASG) keep node IDs stable; add nodes by raising the count.
+# non-voters without var.vault_redundancy_zones. The cluster itself (nodes,
+# NLB, KMS, bootstrap secrets, TLS, security group, DNS, IAM) is
+# modules/vault-cluster, which the replication build (../terraform-repl) also
+# uses, four times.
 
-resource "aws_instance" "vault" {
-  for_each = { for n in local.vault_nodes : n.name => n }
+module "vault" {
+  source = "./modules/vault-cluster"
 
-  ami                    = local.ami_id
-  instance_type          = var.vault_instance_type
-  subnet_id              = aws_subnet.private[each.value.index % length(aws_subnet.private)].id
-  iam_instance_profile   = aws_iam_instance_profile.node["vault"].name
-  vpc_security_group_ids = [aws_security_group.vault.id, aws_security_group.common.id]
-  monitoring             = var.detailed_monitoring
+  name                     = var.name
+  project                  = var.name
+  region                   = var.aws_region
+  vpc_id                   = aws_vpc.this.id
+  vpc_cidr                 = var.vpc_cidr
+  subnet_ids               = aws_subnet.private[*].id
+  extra_security_group_ids = [aws_security_group.common.id]
 
-  metadata_options {
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+  ami_id              = local.ami_id
+  arch                = local.arch
+  root_volume_size    = local.root_size
+  instance_type       = var.vault_instance_type
+  data_volume         = var.vault_data_volume
+  detailed_monitoring = var.detailed_monitoring
+
+  voter_count      = var.vault_voter_count
+  non_voter_count  = var.vault_non_voter_count
+  redundancy_zones = var.vault_redundancy_zones
+  non_voters_start = var.vault_non_voters_start
+  vault_version    = var.vault_version
+  vault_license    = var.vault_license
+  audit_enabled    = var.vault_audit_enabled
+  alb_listener     = var.vault_alb
+
+  fqdn               = local.vault_fqdn
+  zone_id            = aws_route53_zone.private.zone_id
+  ca_cert_pem        = tls_self_signed_cert.ca.cert_pem
+  ca_private_key_pem = tls_private_key.ca.private_key_pem
+
+  consul_setup = {
+    role_arn           = aws_iam_role.node["consul"].arn
+    mesh_pki_path      = local.mesh_pki_path
+    mesh_ca_secret_arn = aws_secretsmanager_secret.mesh_ca.arn
+    inter_pki_path     = local.connect_inter_pki_path
   }
 
-  root_block_device {
-    volume_type = "gp3"
-    volume_size = local.root_size
-    encrypted   = true
-  }
+  common_sh          = file("${path.module}/templates/common.sh")
+  user_data_comments = local.user_data_comments
+  node_exporter_url  = local.node_exporter_url
+  scanner_pattern    = var.scanner_pattern
+  scanner_active_cpu = var.scanner_active_cpu
 
-  ebs_block_device {
-    device_name           = "/dev/sdf"
-    volume_type           = "gp3"
-    volume_size           = var.vault_data_volume.size
-    iops                  = var.vault_data_volume.iops
-    throughput            = var.vault_data_volume.throughput
-    encrypted             = true
-    delete_on_termination = true
-  }
-
-  user_data = replace(templatefile("${path.module}/templates/vault.sh.tftpl", {
-    common              = file("${path.module}/templates/common.sh")
-    name                = var.name
-    node_name           = each.key
-    voter               = each.value.voter
-    permanent_non_voter = !each.value.voter && !var.vault_redundancy_zones # zone spares join as ordinary nodes
-    redundancy_zone     = var.vault_redundancy_zones ? "zone-${each.value.index % var.vault_voter_count}" : ""
-    start_vault         = each.value.voter || var.vault_non_voters_start
-    bootstrap           = each.value.index == 0
-    region              = var.aws_region
-    vault_version       = var.vault_version
-    vault_fqdn          = local.vault_fqdn
-    join_tag            = local.vault_join_tag
-    kms_key_id          = aws_kms_key.vault_unseal.key_id
-    config_secret_id    = aws_secretsmanager_secret.vault_config.arn
-    init_secret_id      = aws_secretsmanager_secret.vault_init.arn
-    bootstrap_param     = aws_ssm_parameter.vault_bootstrap.name
-    audit_enabled       = var.vault_audit_enabled
-    alb_listener        = var.vault_alb
-    consul_role_arn     = aws_iam_role.node["consul"].arn
-    mesh_pki_path       = local.mesh_pki_path
-    mesh_ca_secret_id   = aws_secretsmanager_secret.mesh_ca.arn
-    inter_pki_path      = local.connect_inter_pki_path
-    node_exporter_url   = local.node_exporter_url
-    scanner_pattern     = var.scanner_pattern
-    scanner_active_cpu  = var.scanner_active_cpu
-    arch                = local.arch
-  }), local.user_data_comments, "")
-
-  tags = {
-    Name         = "${var.name}-${each.key}"
-    Role         = "vault"
-    Node         = each.key
-    Voter        = tostring(each.value.voter)
-    VaultCluster = local.vault_join_tag
-  }
-
-  # Nodes are cattle only by explicit choice: use `terraform apply -replace`.
-  lifecycle {
-    ignore_changes = [ami, user_data]
-  }
-
-  # Secrets must exist before the node boots and reads them.
-  depends_on = [
-    aws_secretsmanager_secret_version.vault_config,
-    aws_secretsmanager_secret_version.mesh_ca,
-    aws_iam_role_policy.vault,
-    aws_iam_role_policy.describe_instances,
-    aws_nat_gateway.this,
-    aws_route_table_association.private,
-  ]
+  boot_after = concat(
+    [aws_secretsmanager_secret_version.mesh_ca.id],
+    aws_nat_gateway.this[*].id,
+    aws_route_table_association.private[*].id,
+  )
 }
 
-# --- Internal NLB: all unsealed nodes (active, standbys, non-voters) -------
-# Performance standbys (incl. non-voters) serve reads, and PKI sign/issue on a
-# no_store role, locally - so direct Vault clients scale horizontally here.
-# Caveat for the Consul path: all ConnectCA.Sign RPCs are forwarded to the
-# Consul leader, whose Vault client reuses pooled (HTTP/2) connections, so
-# Consul-driven signing tends to land on one Vault node at a time.
-
-resource "aws_lb" "vault" {
-  name                             = "${var.name}-vault"
-  internal                         = true
-  load_balancer_type               = "network"
-  subnets                          = aws_subnet.private[*].id
-  enable_cross_zone_load_balancing = true
+# The cluster moved into modules/vault-cluster without changing anything:
+# `terraform plan` on an existing build shows no changes.
+moved {
+  from = aws_instance.vault
+  to   = module.vault.aws_instance.this
 }
-
-resource "aws_lb_target_group" "vault" {
-  name                 = "${var.name}-vault"
-  port                 = 8200
-  protocol             = "TCP"
-  vpc_id               = aws_vpc.this.id
-  deregistration_delay = 30
-
-  health_check {
-    protocol            = "HTTPS"
-    port                = "8200"
-    path                = "/v1/sys/health?standbyok=true&perfstandbyok=true"
-    matcher             = "200"
-    interval            = 10
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-  }
+moved {
+  from = aws_lb.vault
+  to   = module.vault.aws_lb.this
 }
-
-resource "aws_lb_listener" "vault" {
-  load_balancer_arn = aws_lb.vault.arn
-  port              = 8200
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.vault.arn
-  }
+moved {
+  from = aws_lb_target_group.vault
+  to   = module.vault.aws_lb_target_group.this
 }
-
-resource "aws_lb_target_group_attachment" "vault" {
-  for_each         = aws_instance.vault
-  target_group_arn = aws_lb_target_group.vault.arn
-  target_id        = each.value.id
-  port             = 8200
+moved {
+  from = aws_lb_listener.vault
+  to   = module.vault.aws_lb_listener.api
+}
+moved {
+  from = aws_lb_target_group_attachment.vault
+  to   = module.vault.aws_lb_target_group_attachment.this
+}
+moved {
+  from = aws_kms_key.vault_unseal
+  to   = module.vault.aws_kms_key.unseal
+}
+moved {
+  from = aws_kms_alias.vault_unseal
+  to   = module.vault.aws_kms_alias.unseal
+}
+moved {
+  from = aws_secretsmanager_secret.vault_config
+  to   = module.vault.aws_secretsmanager_secret.config
+}
+moved {
+  from = aws_secretsmanager_secret_version.vault_config
+  to   = module.vault.aws_secretsmanager_secret_version.config
+}
+moved {
+  from = aws_secretsmanager_secret.vault_init
+  to   = module.vault.aws_secretsmanager_secret.init
+}
+moved {
+  from = aws_ssm_parameter.vault_bootstrap
+  to   = module.vault.aws_ssm_parameter.bootstrap
+}
+moved {
+  from = tls_private_key.vault
+  to   = module.vault.tls_private_key.this
+}
+moved {
+  from = tls_cert_request.vault
+  to   = module.vault.tls_cert_request.this
+}
+moved {
+  from = tls_locally_signed_cert.vault
+  to   = module.vault.tls_locally_signed_cert.this
+}
+moved {
+  from = aws_security_group.vault
+  to   = module.vault.aws_security_group.this
+}
+moved {
+  from = aws_vpc_security_group_ingress_rule.vault_api
+  to   = module.vault.aws_vpc_security_group_ingress_rule.api
+}
+moved {
+  from = aws_vpc_security_group_ingress_rule.vault_cluster
+  to   = module.vault.aws_vpc_security_group_ingress_rule.cluster
+}
+moved {
+  from = aws_route53_record.vault
+  to   = module.vault.aws_route53_record.api
+}
+moved {
+  from = aws_route53_record.vault_node
+  to   = module.vault.aws_route53_record.node
+}
+moved {
+  from = aws_iam_role.node["vault"]
+  to   = module.vault.aws_iam_role.vault
+}
+moved {
+  from = aws_iam_instance_profile.node["vault"]
+  to   = module.vault.aws_iam_instance_profile.vault
+}
+moved {
+  from = aws_iam_role_policy_attachment.ssm_core["vault"]
+  to   = module.vault.aws_iam_role_policy_attachment.ssm_core
+}
+moved {
+  from = aws_iam_role_policy.describe_instances["vault"]
+  to   = module.vault.aws_iam_role_policy.describe_instances
+}
+moved {
+  from = aws_iam_role_policy.vault
+  to   = module.vault.aws_iam_role_policy.vault
 }
 
 # --- T16 path C (opt-in, var.vault_alb): internal ALB, HTTP/2 to targets -----
@@ -146,8 +164,8 @@ resource "aws_lb_target_group_attachment" "vault" {
 
 resource "aws_acm_certificate" "vault_alb" {
   count             = var.vault_alb ? 1 : 0
-  private_key       = tls_private_key.vault.private_key_pem
-  certificate_body  = tls_locally_signed_cert.vault.cert_pem
+  private_key       = module.vault.tls_private_key_pem
+  certificate_body  = module.vault.tls_cert_pem
   certificate_chain = tls_self_signed_cert.ca.cert_pem
   tags              = { Name = "${var.name}-vault-alb" }
 }
@@ -200,7 +218,7 @@ resource "aws_lb_listener" "vault_alb" {
 }
 
 resource "aws_lb_target_group_attachment" "vault_alb" {
-  for_each         = { for k, v in aws_instance.vault : k => v.id if var.vault_alb }
+  for_each         = { for k, v in module.vault.instances : k => v.id if var.vault_alb }
   target_group_arn = aws_lb_target_group.vault_alb[0].arn
   target_id        = each.value
   port             = 8202

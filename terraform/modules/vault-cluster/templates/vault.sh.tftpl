@@ -89,6 +89,18 @@ telemetry {
   prometheus_retention_time = "30s"
   disable_hostname          = true
 }
+%{ if logshipper_buffer_length > 0 || logshipper_buffer_size != "" ~}
+
+# Replication log shipper buffer (repl-1, issue #23). Unset = Vault's defaults.
+replication {
+%{ if logshipper_buffer_length > 0 ~}
+  logshipper_buffer_length = ${logshipper_buffer_length}
+%{ endif ~}
+%{ if logshipper_buffer_size != "" ~}
+  logshipper_buffer_size = "${logshipper_buffer_size}"
+%{ endif ~}
+}
+%{ endif ~}
 EOF
 
 # Audit log rotation (every 5 minutes, size based) so load tests can't fill the disk.
@@ -146,7 +158,8 @@ echo "vault held (vault_non_voters_start = false)"
 
 %{ if bootstrap ~}
 # ---------------------------------------------------------------------------
-# Cluster bootstrap (vault-0 only): init, then configure for Consul Connect CA
+# Cluster bootstrap (first node only): init, then (main build) configure for
+# the Consul Connect CA
 # ---------------------------------------------------------------------------
 export VAULT_ADDR=https://127.0.0.1:8200
 export VAULT_CACERT=/opt/vault/tls/ca.crt
@@ -176,6 +189,7 @@ if [ "$STATUS" != "complete" ]; then
 %{ if audit_enabled ~}
   vault audit list 2>/dev/null | grep -q '^file/' || vault audit enable file file_path=/var/log/vault/audit.log
 %{ endif ~}
+%{ if consul_setup ~}
 
   # AWS IAM auth for the Consul servers' Connect CA provider (no static tokens).
   vault auth list | grep -q '^aws/' || vault auth enable aws
@@ -248,6 +262,7 @@ EOF
     token_policies=consul-connect-ca \
     token_period=1h \
     token_type=service
+%{ endif ~}
 
   retry aws ssm put-parameter --name "${bootstrap_param}" --value complete --overwrite
   echo "vault bootstrap complete"

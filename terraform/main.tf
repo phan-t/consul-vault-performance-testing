@@ -37,14 +37,8 @@ locals {
   # instances don't need them. vault-0's user_data exceeded it with real ARNs.
   user_data_comments = "/(?m)^[ \\t]*#(?:[^!\\n][^\\n]*)?\\n/"
 
-  # EC2 tags used by cloud auto-join (Vault retry_join, Consul retry_join).
-  vault_join_tag  = "${var.name}-vault"
+  # EC2 tag used by Consul's cloud auto-join (Vault's is in modules/vault-cluster).
   consul_join_tag = "${var.name}-consul"
-
-  vault_nodes = concat(
-    [for i in range(var.vault_voter_count) : { name = "vault-${i}", voter = true, index = i }],
-    [for i in range(var.vault_non_voter_count) : { name = "vault-nv-${i}", voter = false, index = var.vault_voter_count + i }],
-  )
 
   consul_nodes = concat(
     [for i in range(var.consul_voter_count) : { name = "consul-${i}", voter = true, index = i }],

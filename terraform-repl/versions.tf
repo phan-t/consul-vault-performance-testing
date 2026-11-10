@@ -47,3 +47,13 @@ provider "aws" {
     tags = local.default_tags
   }
 }
+
+# Default provider, for anything without an alias (the IAM policy
+# documents): the East site.
+provider "aws" {
+  region = var.regions.east
+
+  default_tags {
+    tags = local.default_tags
+  }
+}

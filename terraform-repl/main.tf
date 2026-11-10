@@ -72,6 +72,7 @@ module "net_east" {
   region             = var.regions.east
   cidr               = var.vpc_cidrs.east
   availability_zones = var.availability_zones.east
+  peer_routes        = [{ cidr = var.vpc_cidrs.west, peering_connection_id = aws_vpc_peering_connection_accepter.east_west.id }]
 }
 
 module "net_west" {
@@ -81,6 +82,7 @@ module "net_west" {
   region             = var.regions.west
   cidr               = var.vpc_cidrs.west
   availability_zones = var.availability_zones.west
+  peer_routes        = [{ cidr = var.vpc_cidrs.east, peering_connection_id = aws_vpc_peering_connection_accepter.east_west.id }]
 }
 
 # VPC peering between the sites: no hourly charge, only data transfer.
@@ -100,26 +102,28 @@ resource "aws_vpc_peering_connection_accepter" "east_west" {
   tags                      = { Name = "${var.name}-east-west" }
 }
 
-resource "aws_route" "east_to_west" {
-  provider                  = aws.east
-  route_table_id            = module.net_east.private_route_table_id
-  destination_cidr_block    = var.vpc_cidrs.west
-  vpc_peering_connection_id = aws_vpc_peering_connection.east_west.id
-  depends_on                = [aws_vpc_peering_connection_accepter.east_west]
+# The peering routes are inline in each network module's route table
+# (peer_routes). They were aws_route resources, which the route table's next
+# apply would have removed; these blocks drop them from state without
+# deleting the routes, which the route tables now manage.
+removed {
+  from = aws_route.east_to_west
+  lifecycle {
+    destroy = false
+  }
 }
 
-resource "aws_route" "west_to_east" {
-  provider                  = aws.west
-  route_table_id            = module.net_west.private_route_table_id
-  destination_cidr_block    = var.vpc_cidrs.east
-  vpc_peering_connection_id = aws_vpc_peering_connection.east_west.id
-  depends_on                = [aws_vpc_peering_connection_accepter.east_west]
+removed {
+  from = aws_route.west_to_east
+  lifecycle {
+    destroy = false
+  }
 }
 
 locals {
   net = {
-    east = { vpc_id = module.net_east.vpc_id, cidr = var.vpc_cidrs.east, subnets = module.net_east.private_subnet_ids, peer = var.vpc_cidrs.west, boot_after = concat(module.net_east.boot_after, [aws_route.east_to_west.id]) }
-    west = { vpc_id = module.net_west.vpc_id, cidr = var.vpc_cidrs.west, subnets = module.net_west.private_subnet_ids, peer = var.vpc_cidrs.east, boot_after = concat(module.net_west.boot_after, [aws_route.west_to_east.id]) }
+    east = { vpc_id = module.net_east.vpc_id, cidr = var.vpc_cidrs.east, subnets = module.net_east.private_subnet_ids, peer = var.vpc_cidrs.west, boot_after = concat(module.net_east.boot_after, [aws_vpc_peering_connection_accepter.east_west.id]) }
+    west = { vpc_id = module.net_west.vpc_id, cidr = var.vpc_cidrs.west, subnets = module.net_west.private_subnet_ids, peer = var.vpc_cidrs.east, boot_after = concat(module.net_west.boot_after, [aws_vpc_peering_connection_accepter.east_west.id]) }
   }
 }
 

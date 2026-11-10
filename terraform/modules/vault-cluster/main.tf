@@ -161,21 +161,24 @@ resource "aws_lb_target_group_attachment" "this" {
 }
 
 # Replication (var.cluster_port_nlb): <fqdn>:8201 for primary_cluster_addr.
-# Any node answers on the cluster port and points the secondary to the active
-# node. The NLB keeps the client's IP, so a cut by source IP (repl-cut.sh)
-# also covers connections through it.
+# Only the active node serves replication on the cluster port: a standby has
+# no TLS config for the replication ALPN and fails the handshake ("tls:
+# internal error", seen in the repl-dry run). So the health check passes on the
+# active node only: standbys answer 429, performance standbys 473, and a DR
+# secondary's active node 200 (drsecondarycode). The NLB keeps the client's
+# IP, so a cut by source IP (cut.sh) also covers connections through it.
 resource "aws_lb_target_group" "cluster" {
   count                = var.cluster_port_nlb ? 1 : 0
   name                 = "${var.name}-vcl"
   port                 = 8201
   protocol             = "TCP"
   vpc_id               = var.vpc_id
-  deregistration_delay = 30
+  deregistration_delay = 10
 
   health_check {
     protocol            = "HTTPS"
     port                = "8200"
-    path                = "/v1/sys/health?standbyok=true&perfstandbyok=true${var.health_check_extra}"
+    path                = "/v1/sys/health?drsecondarycode=200"
     matcher             = "200"
     interval            = 10
     healthy_threshold   = 2

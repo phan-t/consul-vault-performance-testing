@@ -27,6 +27,12 @@ variable "availability_zones" {
   type = list(string)
 }
 
+variable "peer_routes" {
+  description = "Routes to peered VPCs: {cidr, peering_connection_id}. Inline in the private route table, which manages its routes itself, so a separate aws_route would be removed by the next apply."
+  type        = list(object({ cidr = string, peering_connection_id = string }))
+  default     = []
+}
+
 resource "aws_vpc" "this" {
   cidr_block           = var.cidr
   enable_dns_support   = true
@@ -85,13 +91,21 @@ resource "aws_nat_gateway" "this" {
   depends_on = [aws_internet_gateway.this]
 }
 
-# One private route table: the caller adds the peering route to it.
+# One private route table, with the NAT route and the peering routes.
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
 
   route {
     cidr_block     = "0.0.0.0/0"
     nat_gateway_id = aws_nat_gateway.this.id
+  }
+
+  dynamic "route" {
+    for_each = var.peer_routes
+    content {
+      cidr_block                = route.value.cidr
+      vpc_peering_connection_id = route.value.peering_connection_id
+    }
   }
 
   tags = { Name = "${var.name}-private" }

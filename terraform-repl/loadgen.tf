@@ -58,7 +58,7 @@ resource "aws_instance" "loadgen_east" {
     ignore_changes = [ami, user_data]
   }
 
-  depends_on = [aws_iam_role_policy.loadgen, aws_s3_object.perf, module.net_east, aws_route.east_to_west]
+  depends_on = [aws_iam_role_policy.loadgen, aws_s3_object.perf, module.net_east]
 }
 
 resource "aws_instance" "loadgen_west" {
@@ -87,5 +87,5 @@ resource "aws_instance" "loadgen_west" {
     ignore_changes = [ami, user_data]
   }
 
-  depends_on = [aws_iam_role_policy.loadgen, aws_s3_object.perf, module.net_west, aws_route.west_to_east]
+  depends_on = [aws_iam_role_policy.loadgen, aws_s3_object.perf, module.net_west]
 }

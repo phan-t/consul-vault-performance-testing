@@ -9,7 +9,8 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 locals {
-  roles = toset(["vault", "consul", "loadgen", "monitoring"])
+  # Vault's role is in modules/vault-cluster.
+  roles = toset(["consul", "loadgen", "monitoring"])
 }
 
 resource "aws_iam_role" "node" {
@@ -46,51 +47,6 @@ resource "aws_iam_role_policy" "describe_instances" {
   policy   = data.aws_iam_policy_document.describe_instances.json
 }
 
-# --- Vault -----------------------------------------------------------------
-
-data "aws_iam_policy_document" "vault" {
-  statement {
-    sid       = "AutoUnseal"
-    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey"]
-    resources = [aws_kms_key.vault_unseal.arn]
-  }
-
-  statement {
-    sid     = "ReadConfig"
-    actions = ["secretsmanager:GetSecretValue"]
-    resources = [
-      aws_secretsmanager_secret.vault_config.arn,
-      aws_secretsmanager_secret.vault_init.arn,
-      aws_secretsmanager_secret.mesh_ca.arn,
-    ]
-  }
-
-  statement {
-    sid       = "WriteInit"
-    actions   = ["secretsmanager:PutSecretValue"]
-    resources = [aws_secretsmanager_secret.vault_init.arn]
-  }
-
-  statement {
-    sid       = "BootstrapStatus"
-    actions   = ["ssm:GetParameter", "ssm:PutParameter"]
-    resources = [aws_ssm_parameter.vault_bootstrap.arn]
-  }
-
-  # AWS auth method (IAM type) resolves bound role ARNs to unique IDs.
-  statement {
-    sid       = "AwsAuthResolveRoles"
-    actions   = ["iam:GetRole"]
-    resources = [aws_iam_role.node["consul"].arn]
-  }
-}
-
-resource "aws_iam_role_policy" "vault" {
-  name   = "vault"
-  role   = aws_iam_role.node["vault"].id
-  policy = data.aws_iam_policy_document.vault.json
-}
-
 # --- Consul ----------------------------------------------------------------
 
 data "aws_iam_policy_document" "consul" {
@@ -101,7 +57,7 @@ data "aws_iam_policy_document" "consul" {
 
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.vault_bootstrap.arn]
+    resources = [module.vault.bootstrap_param_arn]
   }
 
   # T16 (issue #14): run-plan.sh has each server fetch signing-path-node.sh
@@ -125,7 +81,7 @@ data "aws_iam_policy_document" "loadgen" {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
       aws_secretsmanager_secret.consul_client.arn,
-      aws_secretsmanager_secret.vault_init.arn,
+      module.vault.init_secret_arn,
       # Grafana credentials for run annotations and result exports.
       aws_secretsmanager_secret.monitoring.arn,
     ]

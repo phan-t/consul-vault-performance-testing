@@ -162,12 +162,12 @@ replace_args() {
   # Only what exists: on a fresh build (nothing in state) this is empty and the apply just creates.
   state=$(terraform -chdir="$TF" state list 2>/dev/null || true)
   # Every existing server, voter or not; nodes a larger voter count adds are created, not replaced.
-  for k in $(tfo '.vault_nodes.value // {} | keys[]'); do a+=("-replace=aws_instance.vault[\"$k\"]"); done
+  for k in $(tfo '.vault_nodes.value // {} | keys[]'); do a+=("-replace=module.vault.aws_instance.this[\"$k\"]"); done
   for k in $(tfo '.consul_nodes.value // {} | keys[]'); do a+=("-replace=aws_instance.consul[\"$k\"]"); done
   # Every existing load generator (not just [0]): a stale one keeps old user_data.
   for i in $(tfo '.loadgen_instance_ids.value // [] | keys[]'); do a+=("-replace=aws_instance.loadgen[$i]"); done
   grep -qx 'aws_instance.monitoring\[0\]' <<<"$state" && a+=("-replace=aws_instance.monitoring[0]")
-  grep -qx 'aws_ssm_parameter.vault_bootstrap' <<<"$state" && a+=("-replace=aws_ssm_parameter.vault_bootstrap")
+  grep -qx 'module.vault.aws_ssm_parameter.bootstrap' <<<"$state" && a+=("-replace=module.vault.aws_ssm_parameter.bootstrap")
   [ ${#a[@]} -gt 0 ] && printf '%s\n' "${a[@]}"
   return 0
 }

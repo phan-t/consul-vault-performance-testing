@@ -44,3 +44,9 @@ variable "consul_license_file" {
   type        = string
   default     = ""
 }
+
+variable "repl_workspace_name" {
+  description = "Workspace for the replication build. Must match the `cloud` block in ../terraform-repl/versions.tf. Empty = don't create it."
+  type        = string
+  default     = "consul-vault-perf-repl"
+}

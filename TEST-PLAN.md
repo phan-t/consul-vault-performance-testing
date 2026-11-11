@@ -1404,7 +1404,8 @@ expected to fail, and that's the result being recorded.
 on how many keys differ when the link returns, not on how long the cut lasted.
 Set `DAY_KEYS` to the number of distinct keys DBS changes in a day, and
 `KV_RATE` high enough to write all of them during the PR cut. The defaults
-(50,000 keys at 20/s) are placeholders until DBS gives its figures.
+(50,000 keys at 50/s, the dry runs' rate) are placeholders until DBS gives its
+figures. 50/s writes every key about 14 times in a 4-hour cut.
 
 ### Order
 

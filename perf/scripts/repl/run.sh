@@ -17,9 +17,9 @@
 #      planned changes; then the catch-up and every check after it.
 # Each step is recorded in state.json, and a rerun skips completed steps.
 #
-# Settings (environment): SITE_RTT_MS (12), PR_HOLD (4h), BOTH_HOLD (15m), DR_HOLD (10m),
+# Settings (environment): SITE_RTT_MS (12), PR_HOLD (4h), BOTH_HOLD (15m), DR_HOLD (10m), FINAL_WAIT (10m),
 # BASELINE (10m), SETTLE (5m), PROBE_EVERY (1h), CATCHUP_MAX (4h),
-# KV_RATE (20), DAY_KEYS (50000), SIGN_RATE (350), SEC_KV_RATE (2),
+# KV_RATE (50), DAY_KEYS (50000), SIGN_RATE (350), SEC_KV_RATE (2),
 # LOGIN_RATE (2), RENEW_RATE (5).
 PLAN=${2:-repl-1}
 export PLAN
@@ -31,12 +31,13 @@ STATE="$RES/state.json"
 PR_HOLD=${PR_HOLD:-4h}
 BOTH_HOLD=${BOTH_HOLD:-15m}
 DR_HOLD=${DR_HOLD:-10m}
+FINAL_WAIT=${FINAL_WAIT:-10m}
 BASELINE=${BASELINE:-10m}
 SETTLE=${SETTLE:-5m}
 PROBE_EVERY=${PROBE_EVERY:-1h}
 CATCHUP_MAX=${CATCHUP_MAX:-4h}
 LOAD_VARS="KV_RATE DAY_KEYS SIGN_RATE SEC_KV_RATE LOGIN_RATE RENEW_RATE LOAD_HOLD"
-RUN_VARS="SITE_RTT_MS PR_HOLD BOTH_HOLD DR_HOLD BASELINE SETTLE PROBE_EVERY CATCHUP_MAX MANIFEST_NEW MANIFEST_UPDATE MANIFEST_DELETE $LOAD_VARS"
+RUN_VARS="SITE_RTT_MS PR_HOLD BOTH_HOLD DR_HOLD FINAL_WAIT BASELINE SETTLE PROBE_EVERY CATCHUP_MAX MANIFEST_NEW MANIFEST_UPDATE MANIFEST_DELETE $LOAD_VARS"
 
 [ -f "$STATE" ] || echo '{"steps": {}}' > "$STATE"
 done_step() { jq -e --arg s "$1" '.steps[$s].status == "done"' "$STATE" >/dev/null; }
@@ -204,13 +205,16 @@ s_verify() {
   # taken a moment apart rarely matches.
   for x in "pr-sec performance primary last_performance_wal" "primary-dr dr primary last_dr_wal" "pr-sec-dr dr pr-sec last_dr_wal"; do
     read -r sc t pc f <<<"$x"
-    for _ in $(seq 1 30); do
+    # Up to FINAL_WAIT: under load a DR replica can run minutes behind.
+    t0=$(now_s)
+    while :; do
       p=$(repl_status "$pc"); s=$(repl_status "$sc")
       pw=$(jq -r --arg t "$t" --arg f "$f" '.[$t][$f] // 0' <<<"$p"); sw=$(jq -r --arg t "$t" '.[$t].last_remote_wal // 0' <<<"$s")
       [ "$pw" = "$sw" ] && break
+      [ $(($(now_s) - t0)) -ge "$(to_secs "$FINAL_WAIT")" ] && break
       sleep 2
     done
-    event final_pair secondary "$sc" type "$t" primary_wal "$pw" secondary_wal "$sw" \
+    event final_pair secondary "$sc" type "$t" secs "$(($(now_s) - t0))" primary_wal "$pw" secondary_wal "$sw" \
       primary_root "$(jq -r --arg t "$t" '.[$t].merkle_root // ""' <<<"$p")" secondary_root "$(jq -r --arg t "$t" '.[$t].merkle_root // ""' <<<"$s")"
   done
   python3 "$R/verify.py" manifest-check pr-sec || true

@@ -160,6 +160,61 @@ def final_wals():
     return rows
 
 
+# Which cut takes each DR link down.
+DR_PAIRS = [("primary-dr", "primary", ("dr-primary", "both")), ("pr-sec-dr", "pr-sec", ("both",))]
+LAG_STEPS = ["load", "dr-cut", "both-cut", "pr-cut", "verify"]
+
+
+def dr_lag():
+    """Each DR replica's lag behind its primary per step, from samples with its own link up.
+
+    Lag = primary last_dr_wal - replica last_remote_wal, matched to the second.
+    Seconds = WALs / the primary's average WAL rate under load (from the load
+    step to verify, when the load stops).
+    """
+    steps = [(e.get("step"), ts(e["ts"])) for e in ev("step_start")]
+    bounds = {}
+    for i, (name, t) in enumerate(steps):
+        if name in LAG_STEPS:
+            bounds[name] = (t, steps[i + 1][1] if i + 1 < len(steps) else float("inf"))
+    cuts = {}
+    for e in ev("cut_start"):
+        end = [ts(x["ts"]) for x in ev("cut_end", link=e.get("link")) if ts(x["ts"]) >= ts(e["ts"])]
+        cuts.setdefault(e.get("link"), []).append((ts(e["ts"]), end[0] if end else float("inf")))
+    by = {}
+    for r in status:
+        d = r.get("dr") or {}
+        by.setdefault(r.get("cluster"), {})[int(ts(r["ts"]))] = d
+    rows = []
+    for rep, prim, links in DR_PAIRS:
+        down = [w for l in links for w in cuts.get(l, [])]
+        rate = 0
+        if "load" in bounds:
+            a, b = bounds["load"][0], bounds.get("verify", (float("inf"),))[0]
+            w = [(t, d.get("last_dr_wal")) for t, d in sorted(by.get(prim, {}).items()) if a <= t < b and d.get("last_dr_wal") is not None]
+            if len(w) > 1 and w[-1][0] > w[0][0]:
+                rate = (w[-1][1] - w[0][1]) / (w[-1][0] - w[0][0])
+        for name in LAG_STEPS:
+            if name not in bounds:
+                continue
+            a, b = bounds[name]
+            lags = []
+            for sec, pd in sorted(by.get(prim, {}).items()):
+                if not (a <= sec < b) or any(x <= sec <= y for x, y in down):
+                    continue
+                rd = by.get(rep, {}).get(sec)
+                pw, rw = pd.get("last_dr_wal"), (rd or {}).get("last_remote_wal")
+                if pw is None or rw is None:
+                    continue
+                lags.append(pw - rw)
+            if not lags:
+                continue
+            lags.sort()
+            mx = lags[-1]
+            rows.append((rep, prim, name, len(lags), lags[len(lags) // 2], mx, rate, mx / rate if rate > 0 else None))
+    return rows
+
+
 def guards(label):
     g = {(e["cluster"]): json.loads(e["counters"]) for e in ev("guards") if e.get("label") == label and e.get("counters")}
     return g
@@ -236,11 +291,24 @@ def main():
     pairs = ev("final_pair")
     if pairs:
         o.append("WAL indexes and Merkle roots with the load stopped, each secondary sampled at its primary's WAL index:\n")
-        o.append("| Secondary | Primary's WAL | Secondary's last_remote_wal | Primary's merkle_root | Secondary's merkle_root | Match |")
-        o.append("|---|---|---|---|---|---|")
+        o.append("| Secondary | Primary's WAL | Secondary's last_remote_wal | Primary's merkle_root | Secondary's merkle_root | Match | Waited |")
+        o.append("|---|---|---|---|---|---|---|")
         for p in pairs:
             match = "yes" if p["primary_wal"] == p["secondary_wal"] and p["primary_root"] == p["secondary_root"] else "**no**"
-            o.append(f"| {p['secondary']} ({p['type']}) | {p['primary_wal']} | {p['secondary_wal']} | {p['primary_root'][:12]} | {p['secondary_root'][:12]} | {match} |")
+            waited = hms(float(p["secs"])) if p.get("secs") else "?"
+            o.append(f"| {p['secondary']} ({p['type']}) | {p['primary_wal']} | {p['secondary_wal']} | {p['primary_root'][:12]} | {p['secondary_root'][:12]} | {match} | {waited} |")
+        o.append("")
+        o.append("Waited: time after the load stopped until the WAL indexes matched, up to FINAL_WAIT.\n")
+    lag = dr_lag()
+    if lag:
+        o.append("## DR lag with the link up\n")
+        o.append("How far each DR replica ran behind its primary in each step, counting only samples while its own link was up "
+                 "(the time after a cut, while it catches up, is included). A DR promotion at that moment would lose these writes. "
+                 "Seconds: the WAL gap divided by the primary's average WAL rate under load.\n")
+        o.append("| DR replica | Step | Samples | Median gap (WALs) | Max gap (WALs) | Primary's WALs/s under load | Max gap (s) |")
+        o.append("|---|---|---|---|---|---|---|")
+        for rep, prim, name, n, med, mx, rate, secs in lag:
+            o.append(f"| {rep} (of {prim}) | {name} | {n} | {med} | {mx} | {rate:.0f} | {hms(secs) if secs is not None else '?'} |")
         o.append("")
     mc = load("manifest-check-pr-sec.json")
     if mc:

@@ -40,8 +40,8 @@ init_json() {
 }
 
 # token <cluster>: a root token valid on that cluster. Secondaries lose their
-# own: setup.sh writes a new one for the PR secondary into its init secret,
-# and a DR replica only accepts DR operation tokens until it's promoted (then
+# own: setup.sh caches an admin token for the PR secondary (repl-admin
+# AppRole login), and a DR replica only accepts DR operation tokens until it's promoted (then
 # the primary's tokens work, because DR replicates them).
 token() {
   local f="$STATE_DIR/token-$1"

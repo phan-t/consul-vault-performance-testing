@@ -6,7 +6,6 @@
 #   load.sh start    start every load for this node's cluster (PERF_LOCAL_CLUSTER)
 #   load.sh stop     stop them (k6 stops gracefully and writes its summary)
 #   load.sh start-missing    start any load that isn't running (a rerun)
-#   load.sh pause|resume kv|all   pause or resume the KV writes, or every load (k6 REST API)
 #   load.sh status
 #
 # On the primary (loadgen-0): signing 350/s, KV writes over DAY_KEYS keys at
@@ -68,9 +67,13 @@ start_one() {
   esac
   [ "$rate" -gt 0 ] 2>/dev/null || { log "load: $name rate 0; not started"; return 0; }
   sudo systemctl reset-failed "perf-k6-$name" 2>/dev/null || true
+  # Client metrics to Prometheus (remote write), per load and node, so failures
+  # can be matched to the cuts and catch-ups.
   sudo systemd-run --unit "perf-k6-$name" --uid "$(id -u)" --gid "$(id -g)" --working-directory "$out" \
     --setenv=HOME="$HOME" -p KillSignal=SIGINT -p TimeoutStopSec=120 \
-    /usr/local/bin/k6 run --address "localhost:$port" --no-color --quiet \
+    --setenv=K6_PROMETHEUS_RW_SERVER_URL="${GRAFANA_URL%:3000}:9090/api/v1/write" \
+    --setenv=K6_PROMETHEUS_RW_TREND_STATS="p(50),p(99),max" --setenv=K6_PROMETHEUS_RW_PUSH_INTERVAL=5s \
+    /usr/local/bin/k6 run --address "localhost:$port" --no-color --quiet -o experimental-prometheus-rw --tag load="$name" \
     --log-output="file=$out/k6.log" --log-format=raw \
     --tag node="$PERF_NODE" --tag cluster="$C" "${envs[@]}" "$K6/$script" >/dev/null
   event load_start node "$PERF_NODE" cluster "$C" load "$name" rate "$rate"
@@ -89,15 +92,6 @@ stop)
   done
   log "load: stopped"
   ;;
-pause | resume)
-  for l in $(loads); do
-    IFS=: read -r n s r p <<<"$l"
-    if [ "${2:-kv}" = all ] || [ "$n" = "${2:-kv}" ]; then
-      systemctl is-active --quiet "perf-k6-$n" || continue
-      k6 "$1" --address "localhost:$p" >/dev/null && event "load_$1" node "$PERF_NODE" load "$n"
-    fi
-  done
-  ;;
 start-missing)
   for l in $(loads); do
     IFS=: read -r n s r p <<<"$l"
@@ -108,7 +102,7 @@ status)
   for l in $(loads); do n=${l%%:*}; echo "perf-k6-$n: $(systemctl is-active "perf-k6-$n" 2>/dev/null || true)"; done
   ;;
 *)
-  echo "usage: load.sh start|start-missing|stop|pause kv|all|resume kv|all|status" >&2
+  echo "usage: load.sh start|start-missing|stop|status" >&2
   exit 1
   ;;
 esac

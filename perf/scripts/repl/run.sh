@@ -112,7 +112,7 @@ s_load() {
 s_dr_cut() {
   local cut_ms
   "$R/cut.sh" on dr-primary
-  cut_ms=$(date +%s%3N)
+  cut_ms=$(cat "$STATE_DIR/cut-dr-primary-ms")
   event cut_start link dr-primary ms "$cut_ms"
   "$R/checks.sh" probe primary dr-cut all
   "$R/checks.sh" probe pr-sec dr-cut all
@@ -137,9 +137,8 @@ catch_up() { # catch_up <cluster> <dr|performance> <its primary> <label>
 }
 
 s_both_cut() {
-  for c in primary pr-sec; do event guards cluster "$c" label both-before counters "$("$R/status.sh" guards "$c")"; done
   "$R/cut.sh" on both
-  event cut_start link both ms "$(date +%s%3N)"
+  event cut_start link both ms "$(cat "$STATE_DIR/cut-both-ms")"
   "$R/checks.sh" probe primary both-cut all
   "$R/checks.sh" probe pr-sec both-cut reads
   sleep_for "$BOTH_HOLD"
@@ -151,15 +150,14 @@ s_both_cut() {
   catch_up primary-dr dr primary both &
   catch_up pr-sec-dr dr pr-sec both &
   wait
-  for c in primary pr-sec; do event guards cluster "$c" label both-after counters "$("$R/status.sh" guards "$c")"; done
+  for c in primary pr-sec; do event guards cluster "$c" label both counters "$("$R/status.sh" guards "$c" "$(cat "$STATE_DIR/cut-both-ms")")"; done
   sleep_for "$SETTLE"
 }
 
 s_pr_cut() {
   local hold every end next n=0
-  event guards cluster primary label pr-before counters "$("$R/status.sh" guards primary)"
   "$R/cut.sh" on pr
-  event cut_start link pr ms "$(date +%s%3N)"
+  event cut_start link pr ms "$(cat "$STATE_DIR/cut-pr-ms")"
   "$R/checks.sh" probe primary pr-cut-0 all
   "$R/checks.sh" probe pr-sec pr-cut-0 reads
   "$R/checks.sh" opsb pr-cut-0
@@ -187,20 +185,34 @@ s_pr_cut() {
   "$R/cut.sh" off pr
   event cut_end link pr
   catch_up pr-sec performance primary pr
-  event guards cluster primary label pr-after counters "$("$R/status.sh" guards primary)"
+  event guards cluster primary label pr counters "$("$R/status.sh" guards primary "$(cat "$STATE_DIR/cut-pr-ms")")"
 }
 
-# After the PR catch-up: the data, with the KV writers paused so the WAL
-# indexes and Merkle roots can settle.
+# After the PR catch-up: the data, with the load stopped so the WAL indexes
+# and Merkle roots can settle.
 s_verify() {
-  # Every load pauses: logins and renewals write tokens and leases, which DR
-  # replicates, so the DR WAL indexes and Merkle roots only settle without them.
-  "$R/load.sh" pause all
-  loadgen1 "PLAN=$PLAN $R/load.sh pause all" 60 >&2
+  # The load stops here, for good: logins and renewals write tokens and
+  # leases, which DR replicates, so the DR WAL indexes and Merkle roots only
+  # settle without them. (k6 can't pause an arrival-rate scenario once it has
+  # started.) The checks below don't need the load.
+  "$R/load.sh" stop
+  loadgen1 "PLAN=$PLAN $R/load.sh stop" 120 >&2
   sleep 15
   for c in $CLUSTERS; do event final_status cluster "$c" status "$(repl_status "$c")"; done
-  "$R/load.sh" resume all
-  loadgen1 "PLAN=$PLAN $R/load.sh resume all" 60 >&2
+  # Each secondary against its primary, at the same WAL index: background
+  # writes (tidy, CRL rebuilds) keep the roots moving, so one pair of samples
+  # taken a moment apart rarely matches.
+  for x in "pr-sec performance primary last_performance_wal" "primary-dr dr primary last_dr_wal" "pr-sec-dr dr pr-sec last_dr_wal"; do
+    read -r sc t pc f <<<"$x"
+    for _ in $(seq 1 30); do
+      p=$(repl_status "$pc"); s=$(repl_status "$sc")
+      pw=$(jq -r --arg t "$t" --arg f "$f" '.[$t][$f] // 0' <<<"$p"); sw=$(jq -r --arg t "$t" '.[$t].last_remote_wal // 0' <<<"$s")
+      [ "$pw" = "$sw" ] && break
+      sleep 2
+    done
+    event final_pair secondary "$sc" type "$t" primary_wal "$pw" secondary_wal "$sw" \
+      primary_root "$(jq -r --arg t "$t" '.[$t].merkle_root // ""' <<<"$p")" secondary_root "$(jq -r --arg t "$t" '.[$t].merkle_root // ""' <<<"$s")"
+  done
   python3 "$R/verify.py" manifest-check pr-sec || true
   python3 "$R/verify.py" writes-final pr-sec "$RES/load-loadgen-0/kv/k6.log" || true
   "$R/checks.sh" revoke pr-sec cut after-pr ok

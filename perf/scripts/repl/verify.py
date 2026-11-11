@@ -244,8 +244,15 @@ def read_writes(path, until_ms=None):
 
 def versions(cluster, keys, tok=None):
     def one(k):
-        code, out = call(cluster, "GET", f"kv_perf/metadata/{k}", tok=tok)
-        return k, (out.get("data") or {}).get("current_version", 0) if code == 200 else (0 if code == 404 else -1)
+        # Retry timeouts and 5xx: just after a promotion some reads fail.
+        for attempt in range(4):
+            code, out = call(cluster, "GET", f"kv_perf/metadata/{k}", tok=tok)
+            if code == 200:
+                return k, (out.get("data") or {}).get("current_version", 0)
+            if code == 404:
+                return k, 0
+            time.sleep(1 + attempt)
+        return k, -1
 
     with cf.ThreadPoolExecutor(32) as ex:
         return dict(ex.map(one, keys))

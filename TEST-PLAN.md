@@ -1412,9 +1412,10 @@ Set `DAY_KEYS` to the number of distinct keys DBS changes in a day, and
 and a rerun skips the steps already done.
 
 1. **Setup** (`setup.sh`): enable PR and DR on the primary, then activate
-   `pr-sec`, `primary-dr`, DR on `pr-sec`, and `pr-sec-dr`, in that order. The
-   PR secondary gets a new root token from the primary's recovery key, because
-   activation replaces its tokens. Then the mounts, AppRole roles, the
+   `pr-sec`, `primary-dr`, DR on `pr-sec`, and `pr-sec-dr`, in that order.
+   Activation replaces the PR secondary's tokens, and 2.1.1+ent refuses
+   `sys/generate-root` there, so setup logs in to it with a `repl-admin`
+   AppRole role made on the primary. Then the mounts, AppRole roles, the
    `dr-ops` batch token role, and a periodic token for each cluster's load.
 2. **Prepare:** the DR operation token, two stored leafs for the revocation
    test, OPS-B's first logins, and the objects the PR cut will change. Then a
@@ -1452,15 +1453,15 @@ and a rerun skips the steps already done.
    identity entities and a group. The buffer overflows within minutes at any
    realistic rate, so the PR secondary has to catch up by Merkle diff and
    sync when the link returns.
-7. **Verify,** once `pr-sec` is streaming again, with the KV writers paused for 15
-   seconds:
+7. **Verify,** once `pr-sec` is streaming again. The load stops first, and the
+   WAL indexes and Merkle roots are read 15 seconds later:
    - The PR secondary's `last_remote_wal` matches the primary's
      `last_performance_wal`. For DR it's compared with `last_dr_wal`.
      `last_wal` isn't used, because a PR secondary doesn't receive local WALs.
    - The `merkle_root` matches on both clusters.
    - Every entry in the manifest reads back on `pr-sec` as recorded.
    - Every key the KV load wrote has its last logged version on `pr-sec`.
-8. **Finish:** stop the load, write `RESULTS.md`, and upload the results.
+8. **Finish:** write `RESULTS.md`, and upload the results.
 
 ### What's recorded
 
@@ -1515,7 +1516,6 @@ them on 2.1.1+ent:
   queues a cross-cluster revocation locally and answers 200, the probe's
   expected failure is wrong, and the check that counts is whether the primary
   revokes the leaf after the link returns;
-- that k6 2.3.0 still has `k6 pause` and `k6 resume`, and `run --address`.
 
 ---
 

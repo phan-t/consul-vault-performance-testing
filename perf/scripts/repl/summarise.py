@@ -84,14 +84,16 @@ def transitions(cluster, kind, since):
     return out
 
 
-def phases(cluster, kind, since):
-    t = transitions(cluster, kind, since)
+def phases(cluster, kind, since, until):
+    """Time in each state between the restore and the end of catch-up. A cut-off
+    secondary can keep reporting stream-wals, so the window, not the first
+    stream-wals sample, marks the end."""
+    t = [(at, st) for at, st in transitions(cluster, kind, since) if at <= until]
     rows = []
     for i, (start, st) in enumerate(t):
-        end = t[i + 1][0] if i + 1 < len(t) else None
-        rows.append((st, start - since, (end - start) if end else None))
-        if st == "stream-wals":
-            break
+        end = t[i + 1][0] if i + 1 < len(t) else until
+        if st:
+            rows.append((st, start - since, end - start))
     return rows
 
 
@@ -100,13 +102,16 @@ def catchup_text(cluster, kind, label):
     if not end:
         return "not run"
     since = ts(end[0]["ts"])
-    rows = phases(cluster, kind, since)
+    if label == "dr-primary":
+        done = ev("dr_reconnect_done")
+    else:
+        done = ev("catchup", cluster=cluster, label=label)
+    until = since + float(done[0]["secs"]) + (ts(done[0]["ts"]) - since - float(done[0]["secs"]) if label == "dr-primary" else 0) if done else since + 3600
+    rows = phases(cluster, kind, since, until)
     if not rows:
         return "no status samples"
     merkle = any(st in ("merkle-diff", "merkle-sync") for st, _, _ in rows)
     path = "Merkle diff and sync" if merkle else "streaming from the buffer"
-    # The runner's own test is the one that counts: streaming, connection
-    # ready, and past the primary's WAL index at the restore.
     if label == "dr-primary":
         cu = [{"ok": "true", "secs": e["secs"]} for e in ev("dr_reconnect_done")]
     else:
@@ -118,7 +123,7 @@ def catchup_text(cluster, kind, label):
     else:
         done = [r for r in rows if r[0] == "stream-wals"]
         total = f"state stream-wals {hms(done[0][1])} after the link returned" if done else "**not back to stream-wals**"
-    steps = ", ".join(f"{st} {hms(d)}" for st, _, d in rows if d is not None)
+    steps = ", ".join(f"{st} {hms(d)}" for st, _, d in rows if d is not None and st != "stream-wals")
     return f"{path}; {total}" + (f" ({steps})" if steps else "")
 
 
@@ -181,8 +186,9 @@ def main():
     done = ev("run_done")
     o.append(f"# T17 results: {os.path.basename(RES.rstrip('/'))}\n")
     if start:
-        o.append(f"Started {start[0]['ts']}" + (f", finished {done[-1]['ts']} ({hms(ts(done[-1]['ts']) - ts(start[0]['ts']))})" if done else ", not finished") + ".\n")
-        o.append(f"Settings: `{start[0].get('settings', '').strip()}`\n")
+        last = done[-1]["ts"] if done else events[-1]["ts"]
+        o.append(f"Started {start[0]['ts']}, last event {last} ({hms(ts(last) - ts(start[0]['ts']))}).\n")
+        o.append("Settings: `" + " ".join(x for x in start[0].get("settings", "").split() if not x.endswith("=")) + "`\n")
 
     # --- Table 6 ---
     dr_m = load("writes-missing-primary-dr.json") or {}
@@ -213,9 +219,10 @@ def main():
 
     # --- catch-up, buffer ---
     o.append("## Catch-up after the PR cut\n")
-    g0, g1 = guards("pr-before").get("primary"), guards("pr-after").get("primary")
-    if g0 and g1:
-        o.append(f"- Log shipper on the primary: `missing_guard` {g0['missing_guard']} → {g1['missing_guard']}, `guard_found` {g0['guard_found']} → {g1['guard_found']}. "
+    g = guards("pr").get("primary")
+    if g:
+        o.append(f"- Log shipper on the primary, from the start of the cut to the end of catch-up: `missing_guard` +{g.get('missing_guard')}, "
+                 f"`guard_found` +{g.get('guard_found')}, `buffer_over_run` +{g.get('buffer_over_run')}. "
                  "A rise in `missing_guard` means the buffer no longer held what the secondary asked for.")
     gap = wal_gap()
     if gap:
@@ -226,14 +233,14 @@ def main():
     o.append("")
 
     o.append("## Data after catch-up\n")
-    rows = final_wals()
-    if rows:
-        o.append("WAL indexes and Merkle roots with the KV writers paused:\n")
+    pairs = ev("final_pair")
+    if pairs:
+        o.append("WAL indexes and Merkle roots with the load stopped, each secondary sampled at its primary's WAL index:\n")
         o.append("| Secondary | Primary's WAL | Secondary's last_remote_wal | Primary's merkle_root | Secondary's merkle_root | Match |")
         o.append("|---|---|---|---|---|---|")
-        for name, pw, sw, pm, sm in rows:
-            match = "yes" if pw == sw and pm == sm and pw is not None else "**no**"
-            o.append(f"| {name} | {pw} | {sw} | {str(pm)[:12]} | {str(sm)[:12]} | {match} |")
+        for p in pairs:
+            match = "yes" if p["primary_wal"] == p["secondary_wal"] and p["primary_root"] == p["secondary_root"] else "**no**"
+            o.append(f"| {p['secondary']} ({p['type']}) | {p['primary_wal']} | {p['secondary_wal']} | {p['primary_root'][:12]} | {p['secondary_root'][:12]} | {match} |")
         o.append("")
     mc = load("manifest-check-pr-sec.json")
     if mc:
@@ -258,7 +265,7 @@ def main():
     for node, name, reqs, failed, p99 in k6_rows():
         o.append(f"| {node} | {name} | {reqs} | {failed:.2%} | {p99:.0f} |")
     o.append("")
-    o.append("Failures here include the ones Table 6 expects, such as KV writes on pr-sec during the cuts. Per-cut rates are in Grafana and the k6 metrics in Prometheus.\n")
+    o.append("Failures here include the ones Table 6 expects, such as KV writes on pr-sec during the cuts. Per-cut rates are in Prometheus (`k6_http_reqs_total` by `node` and `load`).\n")
 
     errs = ev("error")
     if errs:

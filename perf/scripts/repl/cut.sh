@@ -68,6 +68,9 @@ check() {
 
 action=${1:?usage: cut.sh on|off|check <link>}
 link=${2:?usage: cut.sh on|off|check <link>}
+# When the first rule goes in: the cut's real start (the whole call takes
+# about 20 s over SSM). A promotion's missing-write count is measured from it.
+if [ "$action" = on ]; then date +%s%3N > "$STATE_DIR/cut-$link-ms"; fi
 for p in $(pairs "$link"); do
   a=${p%%:*}
   b=${p#*:}

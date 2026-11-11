@@ -4,10 +4,13 @@
 #   status.sh watch [interval_s]   every second (default) until stopped, one
 #                                  line per cluster in $RES/status.jsonl:
 #                                  state, WAL indexes, merkle root, connection
-#   status.sh guards <cluster>     log shipper counters summed over the
-#                                  cluster's nodes, as JSON: missing_guard
-#                                  (the buffer no longer held what a secondary
-#                                  asked for) and guard_found (it did)
+#   status.sh guards <cluster> <since_ms>
+#                                  how much the log shipper counters rose on
+#                                  the cluster's nodes since since_ms, from
+#                                  Prometheus, as JSON: missing_guard (the
+#                                  buffer no longer held what a secondary asked
+#                                  for), guard_found (it did), buffer_over_run.
+#                                  Vault keeps its own metrics for only 30 s.
 #   status.sh show                 every cluster's state, for people
 . /opt/perf/scripts/repl/lib.sh
 
@@ -31,13 +34,18 @@ watch)
   done
   ;;
 guards)
-  c=${2:?usage: status.sh guards <cluster>}
-  for ip in $(node_ips "$c"); do
-    curl -s --max-time 5 --cacert "$VAULT_CACERT" --resolve "$(cl "$c" fqdn):8200:$ip" \
-      "https://$(cl "$c" fqdn):8200/v1/sys/metrics?format=prometheus" || true
-  done | awk '/^vault_logshipper_streamWALs_(missing_guard|guard_found)[ {]/ {
-      split($1, n, "{"); sub(/^vault_logshipper_streamWALs_/, "", n[1]); s[n[1]] += $NF }
-    END { printf "{\"missing_guard\": %d, \"guard_found\": %d}\n", s["missing_guard"], s["guard_found"] }'
+  c=${2:?usage: status.sh guards <cluster> <since_ms>}
+  since=${3:?usage: status.sh guards <cluster> <since_ms>}
+  win=$(( ($(date +%s%3N) - since) / 1000 + 20 ))
+  prom="http://monitoring.$(cl primary fqdn | sed -E 's/^[^.]+\.vault\.//'):9090"
+  out="{}"
+  for m in missing_guard guard_found buffer_over_run; do
+    v=$(curl -sG --max-time 10 "$prom/api/v1/query" \
+      --data-urlencode "query=sum(increase(vault_logshipper_streamWALs_${m}{job=\"vault-$c\"}[${win}s]))" |
+      jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo "?")
+    out=$(jq -c --arg k "$m" --arg v "$v" '. + {($k): (($v | tonumber? // 0) | round)}' <<<"$out")
+  done
+  echo "$out"
   ;;
 show)
   for c in $CLUSTERS; do

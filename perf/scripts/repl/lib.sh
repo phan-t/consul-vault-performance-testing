@@ -128,6 +128,48 @@ wait_healthy() {
   done
 }
 
+# sealed_ids <cluster> -> instance IDs of the nodes that report sealed.
+sealed_ids() {
+  local id ip
+  while read -r id ip; do
+    curl -s --max-time 5 --cacert "$VAULT_CACERT" --resolve "$(cl "$1" fqdn):8200:$ip" \
+      "https://$(cl "$1" fqdn):8200/v1/sys/seal-status" | jq -e '.sealed == false' >/dev/null 2>&1 || echo "$id"
+  done < <(nodes "$1")
+}
+
+# unseal_standbys <cluster>: after activation, update-primary, or a demote,
+# the standbys log "encryption keys have changed out from underneath us ...
+# must be unsealed again" and stay sealed: auto-unseal doesn't retry. A
+# restart unseals them with the new keys (seen in the second repl-dry run).
+unseal_standbys() {
+  local c=$1 ids
+  sleep 15
+  ids=$(sealed_ids "$c" | xargs)
+  if [ -n "$ids" ]; then
+    log "unseal: restarting Vault on sealed $c nodes: $ids"
+    event unseal_restart cluster "$c" nodes "$ids"
+    ssm_run "$(cl "$c" region)" 120 "systemctl restart vault && sleep 5 && systemctl is-active vault" $ids >&2
+  fi
+  wait_unsealed "$c" 600 || die "$c still has sealed nodes: $(sealed_ids "$c" | xargs)"
+}
+
+# wait_unsealed <cluster> <timeout_s>: every node reports sealed=false, then 25 s
+# for the NLB's health checks to catch up.
+wait_unsealed() {
+  local c=$1 timeout=$2 s ip sealed
+  s=$(now_s)
+  while :; do
+    sealed=0
+    for ip in $(node_ips "$c"); do
+      curl -s --max-time 5 --cacert "$VAULT_CACERT" --resolve "$(cl "$c" fqdn):8200:$ip" \
+        "https://$(cl "$c" fqdn):8200/v1/sys/seal-status" | jq -e '.sealed == false' >/dev/null 2>&1 || sealed=$((sealed + 1))
+    done
+    [ "$sealed" -eq 0 ] && { sleep 25; return 0; } # and the NLB's health checks to catch up
+    [ $(($(now_s) - s)) -ge "$timeout" ] && return 1
+    sleep 5
+  done
+}
+
 # nodes <cluster> -> "<instance id> <private ip>" per running node.
 nodes() {
   aws ec2 describe-instances --region "$(cl "$1" region)" \

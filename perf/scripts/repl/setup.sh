@@ -38,7 +38,14 @@ enable_primary() { # enable_primary <cluster> <dr|performance>
   local c=$1 t=$2
   if [ "$(mode "$c" "$t")" = "primary" ]; then return 0; fi
   step "enable $t primary on $c"
-  v "$c" write -f "sys/replication/$t/primary/enable" primary_cluster_addr="$(cl "$c" cluster_addr)" >/dev/null
+  wait_unsealed "$c" 600 || die "$c has sealed nodes"
+  # Retry a 503: a node the NLB still sends requests to may be sealed.
+  local i
+  for i in $(seq 1 10); do
+    v "$c" write -f "sys/replication/$t/primary/enable" primary_cluster_addr="$(cl "$c" cluster_addr)" >/dev/null && break
+    [ "$i" -eq 10 ] && die "enable $t primary on $c failed"
+    sleep 10
+  done
   sleep 10
   wait_healthy "$c" 300 || die "$c not healthy after enabling $t primary"
 }
@@ -89,6 +96,8 @@ POL
 wait_streaming() { # wait_streaming <cluster> <dr|performance>
   local secs
   secs=$(wait_state "$1" "$2" stream-wals 1800) || die "$1 ($2) not streaming WALs after 30 min: $(repl_status "$1")"
+  # Activation leaves the standbys sealed until they're restarted.
+  unseal_standbys "$1"
   event setup step "$1 $2 stream-wals" secs "$secs"
 }
 

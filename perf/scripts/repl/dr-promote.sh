@@ -68,6 +68,7 @@ reconnect() {
   log "update-primary $DR: $res"
   ok2xx "$res" || die "update-primary failed: $res"
   secs=$(wait_caught_up "$DR" dr "$P" 3600) || die "$DR not caught up 60 min after update-primary"
+  unseal_standbys "$DR"
   event dr_reconnect_done cluster "$DR" secs "$(($(now_s) - t0))"
 }
 

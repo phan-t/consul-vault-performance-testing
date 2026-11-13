@@ -153,13 +153,19 @@ prom_range() {
     --data-urlencode "start=$3" --data-urlencode "end=$4" --data-urlencode "step=$5" | jq -c .data.result
 }
 
-# guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] -> JSON:
-# leader elections and minimum Autopilot failure tolerance over a window (ok:
-# none, and tolerance >= 2 for Consul, >= the given value for Vault), plus the
-# hosts where a security scanner ran. Used per test (run-plan.sh) and per
-# stress step (stress-k6.sh, where a breach fails the step).
-guardrails() { # guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] -> JSON
-  local prom s e w vmin=${3:-2}
+# guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] [expect JSON] -> JSON:
+# leader elections and minimum Autopilot failure tolerance over a window, plus
+# the hosts where a security scanner ran. ok: no elections, and tolerance >= 2
+# for Consul and >= the given value for Vault. A test that causes elections on
+# purpose passes what it expects (issue #9), e.g.
+#   {"consul_elections": 3, "consul_min_failure_tolerance": 1, "vault_leader_changes": 1}
+# Up to that many elections are ok; more are a breach. consul_max_last_contact_ms
+# (the highest p99 leader last contact) is recorded to explain a low Consul
+# tolerance. Used per test (run-plan.sh) and per stress step (stress-k6.sh,
+# where a breach fails the step).
+guardrails() { # guardrails <start_ms> <end_ms> [vault min failure tolerance, default 2] [expect JSON] -> JSON
+  local prom s e w vmin=${3:-2} exp=${4:-}
+  [ -n "$exp" ] && [ "$exp" != null ] || exp='{}'
   prom=$(prom_url 2>/dev/null) || { echo null; return; }
   s=$(($1 / 1000)); e=$(($2 / 1000)); w=$((e - s))
   [ "$w" -gt 0 ] || { echo null; return; }
@@ -171,11 +177,14 @@ guardrails() { # guardrails <start_ms> <end_ms> [vault min failure tolerance, de
     --argjson ve "$(q "sum(changes(vault_core_active[${w}s])) / 2")" \
     --argjson cf "$(q "min(min_over_time(consul_autopilot_failure_tolerance[${w}s]))")" \
     --argjson vf "$(q "min(min_over_time(vault_autopilot_failure_tolerance[${w}s]))")" \
-    --argjson vmin "$vmin" \
+    --argjson lc "$(q "max(max_over_time(consul_raft_leader_lastContact{quantile=\"0.99\"}[${w}s]))")" \
+    --argjson vmin "$vmin" --argjson x "$exp" \
     '{consul_elections: ($ce | if . then (. | round) else . end), vault_leader_changes: ($ve | if . then (. | round) else . end),
-      consul_min_failure_tolerance: $cf, vault_min_failure_tolerance: $vf}
-     | .ok = ((.consul_elections // 0) == 0 and (.vault_leader_changes // 0) == 0
-              and (.consul_min_failure_tolerance // 2) >= 2 and (.vault_min_failure_tolerance // $vmin) >= $vmin)
+      consul_min_failure_tolerance: $cf, vault_min_failure_tolerance: $vf,
+      consul_max_last_contact_ms: ($lc | if . then (. | round) else . end)}
+     | if $x == {} then . else .expected = $x end
+     | .ok = ((.consul_elections // 0) <= ($x.consul_elections // 0) and (.vault_leader_changes // 0) <= ($x.vault_leader_changes // 0)
+              and (.consul_min_failure_tolerance // 2) >= ($x.consul_min_failure_tolerance // 2) and (.vault_min_failure_tolerance // $vmin) >= $vmin)
      | .scanner_hosts = $scan'
 }
 
@@ -207,6 +216,51 @@ server_latency() {
     --argjson vr "$(summary_stats "$p" 'vault_core_handle_request' '' "$s" "$e")" \
     '{vault_sign: $vs, vault_request: $vr}'
 }
+# go_runtime <prom> <start s> <end s>: the Go runtime on the Vault and Consul
+# servers (issue #6). Per role: the most goroutines on any server, and GC pause
+# p99 (the highest server's 0.99 quantile averaged over the window) and its
+# peak, in ms. GC pauses explain p99 outliers; goroutine growth shows a leak
+# before the heap does.
+go_runtime() {
+  local p=$1 s=$2 e=$3 w=$(($3 - $2)) r out='{}'
+  [ "$w" -gt 0 ] || { echo null; return; }
+  for r in vault consul; do
+    out=$(jq -c --arg r "$r" \
+      --argjson g "$(prom_num "$p" "max(max_over_time(${r}_runtime_num_goroutines{instance=~\"$r-.*\"}[${w}s]))" "$e")" \
+      --argjson gp "$(prom_num "$p" "max(avg_over_time((${r}_runtime_gc_pause_ns{instance=~\"$r-.*\",quantile=\"0.99\"} >= 0)[${w}s:15s])) / 1e6" "$e")" \
+      --argjson gm "$(prom_num "$p" "max(max_over_time(${r}_runtime_gc_pause_ns{instance=~\"$r-.*\",quantile=\"0.99\"}[${w}s])) / 1e6" "$e")" \
+      '.[$r] = {goroutines_max: $g, gc_pause_p99_ms: $gp, gc_pause_p99_max_ms: $gm}' <<<"$out")
+  done
+  echo "$out"
+}
+
+# vault_overload <prom> <start s> <end s>: Vault's adaptive overload protection
+# (issue #13). On by default with Integrated Storage since Vault 1.18: when its
+# write controller judges the cluster at capacity, it rejects writes at once
+# with 503 "overloaded, try again later", whatever Raft's commit time. Records
+# the controller's highest reject_fraction (0-1) and the 503 responses over the
+# window (vault.core.response_status_code, Vault 1.20+), so overload shedding
+# shows separately from other errors. Fields are null when a metric is missing.
+vault_overload() {
+  local p=$1 s=$2 e=$3 w=$(($3 - $2))
+  [ "$w" -gt 0 ] || { echo null; return; }
+  jq -n -c --argjson rf "$(prom_num "$p" "max(max_over_time(vault_wal_write_controller_reject_fraction[${w}s]))" "$e")" \
+    --argjson c "$(prom_num "$p" "sum(increase(vault_core_response_status_code{code=\"503\"}[${w}s]))" "$e")" \
+    '{reject_fraction_max: $rf, responses_503: (if $c then ($c | round) else null end)}'
+}
+
+# ca_expiry <prom> <time s>: Consul's CA expiry gauges at a moment (issue #6),
+# in hours until expiry: the active root's and the active signing CA's
+# (consul.mesh.active-root-ca.expiry, consul.mesh.active-signing-ca.expiry,
+# seconds in the metric). These are what production should alert on, and
+# before and after T13 they show what the rotation changed.
+ca_expiry() {
+  local p=$1 t=$2
+  jq -n -c --argjson r "$(prom_num "$p" "max(consul_mesh_active_root_ca_expiry) / 3600" "$t")" \
+    --argjson sg "$(prom_num "$p" "max(consul_mesh_active_signing_ca_expiry) / 3600" "$t")" \
+    '{root_h: $r, signing_h: $sg}'
+}
+
 # vault_storage <prom> <start s> <end s>: Raft's storage on the Vault nodes.
 #   store_logs     appending to Raft's log, fsync included (vault.raft.boltdb.storeLogs)
 #   bolt_write     BoltDB write transactions (vault.raft_storage.bolt.write.time)
@@ -264,8 +318,9 @@ server_cpu() {
 # soak_drift <prom> <start s> <end s> [edge s, default 900]: does anything on the
 # Vault and Consul servers grow over a long steady run? Per role, the server
 # with the largest growth between the window's first and last <edge> seconds
-# (means), for host memory used, the Go heap (runtime alloc_bytes) and
-# allocated file descriptors. Growth is in % of the first value.
+# (means), for host memory used, the Go heap (runtime alloc_bytes), goroutines
+# (runtime num_goroutines, issue #6) and allocated file descriptors. Growth is
+# in % of the first value.
 soak_drift() {
   local p=$1 s=$2 e=$3 edge=${4:-900}
   [ $((e - s)) -gt $((2 * edge)) ] || { echo null; return; }
@@ -288,8 +343,9 @@ soak_drift() {
     out=$(jq -c --arg r "$r" \
       --argjson mem "$(m '100 * (1 - node_memory_MemAvailable_bytes{SEL} / node_memory_MemTotal_bytes{SEL})' "$r")" \
       --argjson heap "$(m "${r}_runtime_alloc_bytes{SEL} / 1048576" "$r")" \
+      --argjson gr "$(m "${r}_runtime_num_goroutines{SEL}" "$r")" \
       --argjson fds "$(m 'node_filefd_allocated{SEL}' "$r")" \
-      '.[$r] = {mem_used_pct: $mem, heap_mb: $heap, fds: $fds}' <<<"$out")
+      '.[$r] = {mem_used_pct: $mem, heap_mb: $heap, goroutines: $gr, fds: $fds}' <<<"$out")
   done
   echo "$out"
 }

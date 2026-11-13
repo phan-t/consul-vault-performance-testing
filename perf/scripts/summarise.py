@@ -124,6 +124,25 @@ def main():
     md.append("\nk6 rates cover the whole k6 run (ramp + hold); vault-benchmark covers the measured run only. "
               "Combined rows sum throughput and report the worst node's percentiles.\n")
 
+    # Sampled leafs checked after each consul-leaf.js run (leaf-check.py, issue #7).
+    checks = []
+    for d in sorted(glob.glob(os.path.join(root, f"{run_id}-*"))):
+        lc = load(os.path.join(d, "leaf-check.json"))
+        if lc:
+            checks.append((os.path.basename(d), lc))
+    if checks:
+        md.append("## Leaf checks\n")
+        md.append("1 in LEAF_SAMPLE issued leafs, checked for the SPIFFE SAN, the TTL against Consul's LeafCertTTL, "
+                  "and the chain to Consul's roots (and to the mesh root, if given).\n")
+        md.append("| Run | Sampled | Invalid | SAN | TTL | Chain | Chain to mesh root |")
+        md.append("|---|---:|---:|---:|---:|---:|---:|")
+        for name, lc in checks:
+            b = lc.get("by_check", {})
+            mr = b.get("chain_to_mesh_root") if lc.get("mesh_root_checked") else "-"
+            md.append(f"| {name} | {lc.get('sampled')} | {'**' + str(lc['invalid']) + '**' if lc.get('invalid') else 0} | "
+                      f"{b.get('san')} | {b.get('ttl')} | {b.get('chain')} | {mr} |")
+        md.append("")
+
     for name, st in exports:
         phases = [p["name"] for p in st.get("phases", [])]
         md.append(f"## Server-side (Grafana export from `{name}`)\n")

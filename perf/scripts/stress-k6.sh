@@ -180,6 +180,8 @@ while [ "$rate" -le "$MAX" ]; do
     scpu=$(server_cpu "$PROM" "$s_start" "$t_end")
     slat=$(server_latency "$PROM" "$s_start" "$t_end" || echo null)
     vst=$(vault_storage "$PROM" "$s_start" "$t_end" || echo null)
+    grt=$(go_runtime "$PROM" "$s_start" "$t_end" || echo null)
+    ovl=$(vault_overload "$PROM" "$s_start" "$t_end" || echo null)
     guard=$(guardrails $((s_start * 1000)) $((t_end * 1000)) "${STEP_VAULT_MIN_FT:-2}" | jq -c 'del(.scanner_hosts)' 2>/dev/null || echo null)
     signs=$(prom_query "$PROM" "sum by (instance) (increase(${SIGN_METRIC}[${hold_s}s]))" "$t_end" |
       jq -c 'map({instance: .metric.instance, signs: (.value[1] | tonumber)})
@@ -199,17 +201,20 @@ while [ "$rate" -le "$MAX" ]; do
   fi
   # Leader cost per write: the steady-state write rate is the offered rate times the delivered fraction.
   step_json=$(jq -c --argjson cpu "$cpu" --argjson scpu "${scpu:-null}" --argjson cmax "$SERVER_CPU_MAX" --argjson guard "${guard:-null}" \
-    --argjson slat "${slat:-null}" --argjson vst "${vst:-null}" \
+    --argjson slat "${slat:-null}" --argjson vst "${vst:-null}" --argjson grt "${grt:-null}" --argjson ovl "${ovl:-null}" \
     --argjson signs "$signs" --argjson raft "${raft:-null}" --argjson lc "${lcost:-null}" \
     --argjson min "$MIN_ACHIEVED" '(.rate * .delivered) as $w
     | ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax) as $sat
     | . + {peak_cpu: $cpu, server_cpu_mean: $scpu, cpu_saturated: $sat, guardrails: $guard,
-           server_latency: $slat, vault_storage: $vst,
+           server_latency: $slat, vault_storage: $vst, go_runtime: $grt, vault_overload: $ovl,
            vu_starved: (.delivered < $min and .dropped > 0), sign_nodes: $signs, vault_raft: $raft,
            leader_cost: (if $lc and $w > 0 then $lc + {
              tx_bytes_per_write: (if $lc.tx_bytes_per_s then ($lc.tx_bytes_per_s / $w | round) else null end),
              cpu_ms_per_write: (if $lc.cpu_cores then ($lc.cpu_cores / $w * 1000 * 1000 | round / 1000) else null end)} else $lc end),
            pass: (.thresholds == "pass" and .delivered >= $min and ($sat | not) and ($guard.ok != false))}' <<<"$step_json")
+  # The sampled leafs' check (consul-leaf.js only, issue #7).
+  step_json=$(jq -c --argjson lc "$(jq -c '{sampled, invalid, by_check}' "$STEP_DIR/leaf-check.json" 2>/dev/null || echo null)" \
+    '. + {leaf_check: $lc}' <<<"$step_json")
   jq --argjson s "$step_json" '. + [$s]' "$OUT/steps.json" > "$OUT/steps.tmp" && mv "$OUT/steps.tmp" "$OUT/steps.json"
   echo "step: $step_json"
 
@@ -218,7 +223,7 @@ while [ "$rate" -le "$MAX" ]; do
     break
   fi
   if [ "$(jq -r .pass <<<"$step_json")" != true ]; then
-    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json"), server CPU $(jq -r '.server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end' <<<"$step_json")$(jq -r 'if .cpu_saturated then " (over '"$SERVER_CPU_MAX"'%)" else "" end' <<<"$step_json")$(jq -r 'if .vu_starved then ", VU-starved" else "" end' <<<"$step_json")$(jq -r 'if .guardrails.ok == false then ", guardrails \(.guardrails | del(.ok) | tojson)" else "" end' <<<"$step_json")"
+    stop_reason="step at RATE=$rate failed: thresholds $thr, delivered $(jq -r '.delivered * 1000 | round / 1000' <<<"$step_json"), server CPU $(jq -r '.server_cpu_mean | if . then "\(.instance) \(.cpu_pct)%" else "?" end' <<<"$step_json")$(jq -r 'if .cpu_saturated then " (over '"$SERVER_CPU_MAX"'%)" else "" end' <<<"$step_json")$(jq -r 'if .vu_starved then ", VU-starved" else "" end' <<<"$step_json")$(jq -r 'if .guardrails.ok == false then ", guardrails \(.guardrails | del(.ok) | tojson)" else "" end' <<<"$step_json")$(jq -r 'if (.vault_overload.responses_503 // 0) > 0 then ", Vault 503s \(.vault_overload.responses_503) (overload reject_fraction max \(.vault_overload.reject_fraction_max // "?"))" else "" end' <<<"$step_json")"
     break
   fi
   # Near the ceiling: finer steps, full holds.

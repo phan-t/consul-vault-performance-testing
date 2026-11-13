@@ -16,11 +16,12 @@
 #      use it and points IntermediatePKIPath at it. Consul creates a new signing
 #      CA under the same root. Watches WATCH (5m): did signing continue, and were
 #      cached leafs re-issued? (plan-1: switched in 15 s, 0 of 100,000 re-issued.)
-#   2. client agent check (issue #11): after the rotation a restarted client
-#      agent's auto_encrypt certificate, signed by the new signing CA, was
-#      rejected by every server ("tls: unknown certificate authority"). It
+#   2. client agent check (issue #11): in plan-1 a restarted client agent was
+#      rejected by every server ("tls: unknown certificate authority") until
+#      the servers restarted. plan-2 showed the trigger was a failed root
+#      rotation attempt, not the signing CA rotation, so this is a guard. It
 #      restarts the local agent and records whether it reconnects within
-#      AGENT_WAIT (90s); then restarts the Consul servers one at a time
+#      AGENT_WAIT (90s); if not, restarts the Consul servers one at a time
 #      (followers first, leader last, each until Autopilot is healthy), restarts
 #      the agent again and records how long it takes to reconnect.
 # ROTATIONS="signing root" also runs a root rotation (RootPKIPath to the next mesh

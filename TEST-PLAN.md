@@ -536,6 +536,15 @@ will likely move to 1,600/s. Each step records the Consul
 leader's connections to Vault (`consul_vault_connections_max`) and how signing
 is spread across Vault nodes.
 
+**Leaf correctness (issue #7).** Every `consul-leaf.js` run (here, and in the
+soak, the bursts, T13, and T16) logs 1 in `LEAF_SAMPLE` (1,000) issued leafs, and
+`run-k6.sh` checks them afterwards with `leaf-check.py`: the SPIFFE URI SAN
+names the requested service, the TTL matches Consul's `LeafCertTTL`, and the
+chain verifies to Consul's CA roots (after T13, through either signing CA).
+`MESH_ROOT_FILE` (`terraform output -raw mesh_root_ca_pem`) also checks the full
+chain to the offline mesh root. The counts are in each run's `leaf-check.json`,
+each stress step's `leaf_check`, and the run summary's "Leaf checks" table.
+
 ```bash
 consul-ca-limits.sh              # note the current limits (default 50/s, 0 concurrent)
 consul-ca-limits.sh 0 0          # remove them so the ceiling found is the system's, not the limiter's
@@ -663,7 +672,13 @@ It **warns** in RESULTS.md when, between the hold's first and last 15 minutes,
 any Vault or Consul server grows by more than 10%:
 - host memory used;
 - Go heap (`vault_runtime_alloc_bytes`, `consul_runtime_alloc_bytes`);
+- goroutines (`vault_runtime_num_goroutines`, `consul_runtime_num_goroutines`),
+  which show a leak before the heap does;
 - allocated file descriptors (`node_filefd_allocated`).
+
+The soak and every stress step also record the Go runtime per role
+(`go_runtime` in `stress.json`): the most goroutines on any server, and GC
+pause p99 (`*_runtime_gc_pause_ns`), which explains p99 outliers.
 
 These only warn, because a heap that grows and then levels off is normal.
 Read the Grafana memory panels before calling it a leak.
@@ -924,14 +939,15 @@ with the CSR limit set to the recommended 350/s, `ca-rotation-test.sh`:
    and were cached leafs re-issued? In plan-1, signing switched in 15 s and
    **0 of 100,000** were re-issued. Existing leafs still verify against the old
    signing CA and move to the new one at their normal renewal;
-3. **checks a client agent (issue #11):** in plan-1, after the rotation, a
-   restarted client agent's `auto_encrypt` certificate, now signed by the new
-   signing CA, was rejected by every server (`tls: unknown certificate
-   authority`). T13 restarts the local agent and records whether it reconnects
-   within 90 s (`AGENT_WAIT`). If it's locked out, it restarts the Consul
-   servers one at a time, followers first and the leader last, each until
-   Autopilot is healthy, which was the workaround in plan-1. Then it restarts
-   the agent again and records how long it takes to reconnect.
+3. **checks a client agent (issue #11):** in plan-1, a restarted client
+   agent was rejected by every server (`tls: unknown certificate authority`)
+   until the Consul servers restarted. plan-2 showed a signing CA rotation alone
+   doesn't cause this: each lock-out in plan-1 followed a failed root rotation
+   attempt. T13 still restarts the local agent and records whether it
+   reconnects within 90 s (`AGENT_WAIT`). If it's locked out, it restarts the
+   Consul servers one at a time, followers first and the leader last, each
+   until Autopilot is healthy, which was the workaround in plan-1. Then it
+   restarts the agent again and records how long it takes to reconnect.
 
 It records: when signing moved to the new CA, leafs re-issued (Vault's signs
 on Consul's intermediates minus the foreground's), the new leafs' failures,
@@ -1045,6 +1061,20 @@ workloads:
     fast (p50 56 ms), so its latency figures came from failed requests. The cause
     wasn't recorded. `vault-kv-write.js` now logs the first failures' status
     and body, so a failing payload run shows why.
+  - **Overload shedding (issue #13):** in raft-1, 47% of 32 KiB writes at
+    400/s failed with 503 "overloaded, try again later" while Raft commit time
+    stayed about 13 ms. That's Vault's adaptive overload protection, on by
+    default with Integrated Storage since Vault 1.18. Its write controller
+    rejects writes at once when it judges the cluster at capacity; it tunes
+    itself, and `adaptive_overload_protection { disable_write_controller =
+    true }` turns it off (not advised under load). Every stress step records
+    `vault_overload` in `stress.json`: the controller's highest
+    `vault_wal_write_controller_reject_fraction`, and the 503 responses
+    (`vault_core_response_status_code{code="503"}`). A failed step's stop
+    reason names them, so shedding shows separately from other errors.
+    Clients should retry these 503s with backoff and jitter; Vault's Go API
+    client retries 5xx twice by default (`VAULT_MAX_RETRIES`), and k6 doesn't
+    retry.
 - **No stored-certificate signing.** T2 already measures the cost of storing
   certificates. In T11, deleting the stored certificates between sizes took
   about 15 minutes per 18,000 and, when a delete was cancelled, hung the active
@@ -1531,7 +1561,8 @@ them on 2.1.1+ent:
 | T5 vs targets | T5 ≥ 350/s within p99 ≤ 1 s | `csr_max_per_second` can be raised to the target |
 | Burst vs targets | 20,000 in 60 s and 100,000 in 10 min arrive, p99 ≤ 1 s, with the limit set | The recommended limit absorbs the sized bursts |
 | T13 signing CA rotation | No re-issue, no new-leaf failures | Signing CA rotation is safe for sidecars |
-| T13 agent check | Restarted agent locked out until the servers restart | After a signing CA rotation, restart the Consul servers before any client agent restarts (issue #11) |
+| T13 agent check | Restarted agent reconnects | Signing CA rotation is safe for client agents (plan-2) |
+| T13 agent check | Restarted agent locked out until the servers restart | Not expected after a signing CA rotation alone. In plan-1 it followed a failed root rotation attempt (`RootPKIPath` changed, cross-sign refused): after one, restart the Consul servers, followers first and the leader last, before any client agent restarts (issue #11) |
 | T14 vs T3f | Consul leader gap ≫ Vault node gap | The Consul leader's CA setup dominates recovery |
 | T3f | Long gap, Consul waits for the frozen node | A hung Vault node stalls every sidecar's renewal until it recovers: weigh this in Vault health checks and timeouts |
 | T12 promotion vs T11 failover | Promotion ≈ Autopilot's two 10 s timers | Zone spares restore failure tolerance in about 20 s; a longer or missing promotion points at the Autopilot configuration |

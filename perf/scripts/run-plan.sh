@@ -244,7 +244,8 @@ stress_values() { # -> {last_pass, first_fail, stop_reason, knee, at_last_pass}
   # Invalid steps (load generator out of memory) are neither a pass nor a fail.
   jq -c '.last_pass_rate as $lp | {last_pass: $lp, first_fail: ([.steps[] | select((.pass | not) and (.invalid | not)) | .rate] | first),
           invalid_rate, stop_reason, knee: .knee_between,
-          at_last_pass: ([.steps[] | select(.rate == $lp)] | first | if . then {p99_ms, server_cpu_mean, server_latency, vault_storage} else null end)}' "$1"
+          at_last_pass: ([.steps[] | select(.rate == $lp)] | first | if . then {p99_ms, server_cpu_mean, server_latency, vault_storage, vault_overload} else null end),
+          first_fail_overload: ([.steps[] | select((.pass | not) and (.invalid | not))] | first | .vault_overload // null)}' "$1"
 }
 midpoint() { # midpoint <values-json> -> rate or empty
   jq -r 'if .last_pass and .first_fail then ((.last_pass + .first_fail) / 2 | floor)
@@ -459,7 +460,7 @@ t5r() { refine t5r t5 /opt/perf/k6/consul-leaf.js yes; }
 # (issue #8). Real agents and Dataplane servers hold far fewer. The servers
 # don't restart, so drift, CPU and server-side latency cover the whole soak.
 soak() {
-  local seg_s hold_s n i b c h dir rc segs='[]' prom s0 e0 s e drift lat scpu cache
+  local seg_s hold_s n i b c h dir rc segs='[]' prom s0 e0 s e drift lat scpu cache grt
   hold_s=$(to_secs "$SOAK_HOLD"); seg_s=$(to_secs "$SOAK_SEGMENT")
   [ "$seg_s" -gt 0 ] && [ "$seg_s" -lt "$hold_s" ] || seg_s=$hold_s
   n=$(((hold_s + seg_s - 1) / seg_s))
@@ -488,24 +489,25 @@ soak() {
   done
   limits_restore; trap - EXIT
   # The whole soak: from the first segment's steady start to the last one's end.
-  drift=null; lat=null; scpu=null; cache=null
+  drift=null; lat=null; scpu=null; cache=null; grt=null
   s0=$(jq -r '.[0].window[0] // empty' <<<"$segs"); e0=$(jq -r '.[-1].window[1] // empty' <<<"$segs")
   if prom=$(prom_url 2>/dev/null) && [ -n "$s0" ] && [ -n "$e0" ]; then
     drift=$(soak_drift "$prom" "$s0" "$e0")
     lat=$(server_latency "$prom" "$s0" "$e0")
+    grt=$(go_runtime "$prom" "$s0" "$e0")
     scpu=$(server_cpu "$prom" "$s0" "$e0")
     # The agent's cache at its largest: what the segments keep bounded.
     cache=$(prom_num "$prom" "max(max_over_time(consul_leaf_certs_entries_count{instance=~\"$PERF_NODE.*\"}[$((e0 - s0))s]))" "$e0")
   fi
   sset '.values.soak' "$(jq -n -c --argjson segs "$segs" --argjson rate "$SOAK_RATE" --arg hold "$SOAK_HOLD" --arg seg "$SOAK_SEGMENT" \
     --argjson maxerr "$SOAK_MAX_ERROR_RATE" --argjson scpu "${scpu:-null}" --argjson cmax "$SOAK_CPU_MAX" \
-    --argjson drift "${drift:-null}" --argjson dmax "$SOAK_DRIFT_PCT" --argjson lat "${lat:-null}" --argjson cache "${cache:-null}" '
+    --argjson drift "${drift:-null}" --argjson dmax "$SOAK_DRIFT_PCT" --argjson lat "${lat:-null}" --argjson cache "${cache:-null}" --argjson grt "${grt:-null}" '
     ($segs | map(.requests) | add // 0) as $req | ($segs | map(.failed) | add // 0) as $fail
     | {rate: $rate, hold: $hold, segment: $seg, segments: $segs, requests: $req, failed: $fail,
        success_pct: (if $req > 0 then ((1 - $fail / $req) * 100 * 10000 | round / 10000) else null end),
        p99_ms: ($segs | map(.p99_ms) | max), delivered: ($segs | map(.delivered) | min),
        server_cpu_mean: $scpu, cpu_over: ($cmax > 0 and ($scpu.cpu_pct // 0) > $cmax),
-       server_latency: $lat, agent_cache_max: $cache, drift: $drift,
+       server_latency: $lat, go_runtime: $grt, agent_cache_max: $cache, drift: $drift,
        drift_warnings: [($drift // {}) | to_entries[] | .key as $r | .value | to_entries[]
          | select((.value.growth_pct // 0) > $dmax) | "\($r) \(.key) +\(.value.growth_pct)% (\(.value.instance))"]}
     | .pass = (($segs | all(.pass)) and $req > 0 and ($fail / $req) < $maxerr and (.cpu_over | not))')"
@@ -574,8 +576,11 @@ t14() {
   set -e
   limits_restore; trap - EXIT
   [ "$rc" -eq 0 ] || return 1
-  sset '.values.t14' "$(jq -c '{new_leader_s, max_gap_s, recovered_s, first_leaf_after_leader_s, failed_leafs,
-      repeats: [.repeats[] | {old_leader, new_leader, new_leader_s, max_gap_s, failed_leafs, recovered_s, first_leaf_after_leader_s}]}' \
+  # Each repeat freezes the Consul leader on purpose: one election each, and one
+  # server down drops Consul's failure tolerance to 1 (issue #9).
+  sset '.values.t14' "$(jq -c --argjson n "$T14_REPEATS" '{new_leader_s, max_gap_s, recovered_s, first_leaf_after_leader_s, failed_leafs,
+      repeats: [.repeats[] | {old_leader, new_leader, new_leader_s, max_gap_s, failed_leafs, recovered_s, first_leaf_after_leader_s}],
+      expected_guardrails: {consul_elections: $n, consul_min_failure_tolerance: 1}}' \
     "$RESULTS_DIR/$PLAN-t14-$PERF_NODE-t14/t14.json")"
 }
 
@@ -589,14 +594,17 @@ t15() {
   limits_restore; trap - EXIT
   [ "$rc" -eq 0 ] || return 1
   # A restart lowers Vault's failure tolerance by 1 on purpose, and restarting the
-  # active node hands leadership over (expected).
-  sset '.values.t15' "$(jq -c '. + {expected_failure_tolerance: 1}' "$RESULTS_DIR/$PLAN-t15-$PERF_NODE-t15/t15.json")"
+  # active node hands leadership over (expected: plan-1 flagged that one change).
+  sset '.values.t15' "$(jq -c '. + {expected_failure_tolerance: 1, expected_guardrails: {vault_leader_changes: 1}}' "$RESULTS_DIR/$PLAN-t15-$PERF_NODE-t15/t15.json")"
 }
 
 # t13: signing CA rotation under load, with the CSR limit set to
 # BURST_CSR_RATE and T13_CACHED leafs cached on the agent. Last in the plan: it
 # leaves the CA rotated.
 t13() {
+  local prom ca0=null ca1=null
+  # Consul's CA expiry gauges before and after (issue #6): what the rotation changed.
+  prom=$(prom_url 2>/dev/null) && ca0=$(ca_expiry "$prom" "$(date +%s)")
   limits_remove; trap limits_restore EXIT
   set +e
   RUN_ID="$PLAN-t13" RATE="$T13_RATE" CACHED="$T13_CACHED" PREFILL_RATE="$TARGET_RATE" CSR_LIMIT="$BURST_CSR_RATE" \
@@ -605,7 +613,10 @@ t13() {
   set -e
   limits_restore; trap - EXIT
   [ "$rc" -eq 0 ] || return 1
-  sset '.values.t13' "$(jq -c . "$RESULTS_DIR/$PLAN-t13-$PERF_NODE-t13/t13.json")"
+  # The gauges update on Consul's next metrics interval: wait for one scrape.
+  [ -n "$prom" ] && sleep 30 && ca1=$(ca_expiry "$prom" "$(date +%s)")
+  sset '.values.t13' "$(jq -c --argjson a "${ca0:-null}" --argjson b "${ca1:-null}" '. + {ca_expiry_before: $a, ca_expiry_after: $b}' \
+    "$RESULTS_DIR/$PLAN-t13-$PERF_NODE-t13/t13.json")"
 }
 
 raft_nonvoters() { # count of Vault Raft non-voters
@@ -980,8 +991,10 @@ run_test() { # run_test <id> <description>
   s=$(now_ms)
   if ( "$id" ); then st=done; else st=failed; fi
   e=$(now_ms)
-  # A test may narrow its guardrail window (T11: after the resize, before the failover) and expect another failure tolerance.
-  g=$(guardrails "$(sget ".values[\"$id\"].measure_start_ms // $s")" "$(sget ".values[\"$id\"].measure_end_ms // $e")" "$(sget ".values[\"$id\"].expected_failure_tolerance")")
+  # A test may narrow its guardrail window (T11: after the resize, before the failover), expect another
+  # Vault failure tolerance, and expect elections it causes on purpose (.expected_guardrails, issue #9).
+  g=$(guardrails "$(sget ".values[\"$id\"].measure_start_ms // $s")" "$(sget ".values[\"$id\"].measure_end_ms // $e")" \
+    "$(sget ".values[\"$id\"].expected_failure_tolerance")" "$(sget ".values[\"$id\"].expected_guardrails // {}" | jq -c .)")
   # Raft data before and after every test: what each test leaves behind (T2's stored certificates).
   rd=$(prom=$(prom_url 2>/dev/null) && vault_storage "$prom" $((s / 1000)) $((e / 1000)) | jq -c '{data_mb, data_growth_mb}' || echo null)
   sset ".tests[\"$id\"]" "$(jq -n -c --arg st "$st" --argjson s "$s" --argjson e "$e" --argjson g "$g" --argjson rd "${rd:-null}" \

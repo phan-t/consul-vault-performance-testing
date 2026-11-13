@@ -86,6 +86,11 @@ if [ -f "$OUT/loadgen-memory-abort" ]; then rc=98; fi
 echo "load generator lowest MemAvailable during k6: $(cat "$OUT/loadgen-mem-min-pct" 2>/dev/null || echo "?")%"
 T3=$(now_ms)
 annotate_end "$AID" "$T3"
+# Leafs consul-leaf.js sampled: SPIFFE SAN, TTL, and chain (issue #7). A
+# result, not a failure: leaf-check.json goes in the run's results.
+if grep -q LEAFSAMPLE "$OUT/k6.log" 2>/dev/null; then
+  python3 /opt/perf/scripts/leaf-check.py "$OUT" || echo "leaf check couldn't run" >&2
+fi
 
 # Steady state starts after the ramp (arrival-rate scripts only).
 if [ "$NAME" = "consul-register-burst" ]; then T2=$T1; else T2=$((T1 + $(to_secs "$RAMP") * 1000)); fi

@@ -8,7 +8,12 @@
 // misses and a real signing request is made. Note the agent keeps each issued
 // leaf in its cache (and renews it near expiry), so very long runs grow agent
 // memory - restart the agent between large runs.
+//
+// LEAF_SAMPLE (default 1000; 0 = off): 1 in that many issued leafs is logged as
+// "LEAFSAMPLE <service> <base64 CertPEM>", and run-k6.sh checks them afterwards
+// with leaf-check.py: SPIFFE SAN, TTL, and chain (issue #7).
 import http from 'k6/http';
+import encoding from 'k6/encoding';
 import { check } from 'k6';
 import exec from 'k6/execution';
 import { Counter } from 'k6/metrics';
@@ -18,6 +23,7 @@ const ADDR = env('CONSUL_HTTP_ADDR', 'http://127.0.0.1:8500');
 const TOKEN = env('CONSUL_HTTP_TOKEN', '');
 const RUN_ID = env('RUN_ID', `${Date.now()}`);
 const NODE = env('PERF_NODE', 'lg');
+const LEAF_SAMPLE = parseInt(env('LEAF_SAMPLE', '1000'), 10);
 
 const rateLimited = new Counter('consul_csr_rate_limited');
 
@@ -42,10 +48,13 @@ export default function () {
     rateLimited.add(1);
   }
 
-  check(res, {
+  const ok = check(res, {
     'status 200': (r) => r.status === 200,
     'has CertPEM': (r) => r.status === 200 && String(r.json('CertPEM')).startsWith('-----BEGIN CERTIFICATE'),
   });
+  if (ok && LEAF_SAMPLE > 0 && exec.scenario.iterationInTest % LEAF_SAMPLE === 0) {
+    console.log(`LEAFSAMPLE ${svc} ${encoding.b64encode(String(res.json('CertPEM')))}`);
+  }
 }
 
 export function handleSummary(data) {
